@@ -1,5 +1,4 @@
-//! End to end: reference server, a real relay and the proxy, over real
-//! sockets. Buy (test money) → withdraw → open → stream → close → change,
+//! End to end: reference server and the proxy, over real sockets. Buy (test money) → withdraw → open → stream → close → change,
 //! then read the server's whole database and try to link.
 
 use futures::StreamExt;
@@ -9,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unlinkable_core::{Family, Wallet};
-use unlinkable_gateway::{ohttp::OhttpKeys, signer::KeyStore};
+use unlinkable_gateway::signer::KeyStore;
 use unlinkable_proxy::serve::{Proxy, Settings};
 use unlinkable_proxy::{connect, Options};
 
@@ -17,7 +16,6 @@ const VALUES: [i64; 10] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 
 struct Stack {
     server: String,
-    relay: String,
     backend: Arc<unlinkable_reference_server::MemoryBackend>,
 }
 
@@ -29,7 +27,7 @@ async fn listen() -> (tokio::net::TcpListener, String) {
 
 async fn start_stack() -> Stack {
     let keys = KeyStore::new(&VALUES, None).unwrap();
-    let ref_server = unlinkable_reference_server::build(keys, OhttpKeys::ephemeral(), Duration::from_secs(3600));
+    let ref_server = unlinkable_reference_server::build(keys, Duration::from_secs(3600));
     let backend = ref_server.backend.clone();
     let (l, server) = listen().await;
     tokio::spawn(async move {
@@ -37,14 +35,7 @@ async fn start_stack() -> Stack {
             .await
             .unwrap()
     });
-    let relay = unlinkable_relay::Relay::from_specs(&[format!("ref={server}")]).unwrap();
-    let (l, relay_origin) = listen().await;
-    tokio::spawn(async move { axum::serve(l, relay.router()).await.unwrap() });
-    Stack {
-        server,
-        relay: format!("{relay_origin}/ref"),
-        backend,
-    }
+    Stack { server, backend }
 }
 
 fn temp_wallet() -> PathBuf {
@@ -107,17 +98,16 @@ async fn read_stream(resp: reqwest::Response) -> (String, Duration) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chat_through_the_relay_cannot_be_tied_to_the_account_that_paid_for_it() {
+async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
     let stack = start_stack().await;
     let api_key = new_account(&stack.server, 2_000).await;
     let opts = Options {
         server: stack.server.clone(),
-        relay: Some(stack.relay.clone()),
         wallet: Some(temp_wallet()),
         pins: Vec::new(),
     };
 
-    // Withdraw $5 into the wallet, through the relay.
+    // Withdraw $5 into the wallet.
     {
         let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
         let client = connect(&opts, &mut wallet).await.unwrap();
@@ -220,9 +210,7 @@ async fn a_chat_through_the_relay_cannot_be_tied_to_the_account_that_paid_for_it
     let session_requests: Vec<&Value> = requests.iter().filter(|r| r["credential"] == "session").collect();
     assert!(session_requests.len() >= 5, "{requests:?}");
     for r in &session_requests {
-        assert_eq!(r["via_ohttp"], true, "every session request came through the relay: {r}");
-        assert_eq!(r["peer"], "0.0.0.0", "no client address reached the app: {r}");
-        assert_eq!(r["had_cookie"], false);
+        assert_eq!(r["had_cookie"], false, "{r}");
     }
     for r in requests.iter().filter(|r| r["credential"] == "account") {
         assert_eq!(r["path"], "/u/withdraw", "the account key is only ever used to withdraw: {r}");
@@ -265,7 +253,6 @@ async fn a_server_that_changes_its_keys_is_refused() {
     let wallet_path = temp_wallet();
     let opts = Options {
         server: stack.server.clone(),
-        relay: Some(stack.relay.clone()),
         wallet: Some(wallet_path.clone()),
         pins: Vec::new(),
     };
@@ -277,7 +264,6 @@ async fn a_server_that_changes_its_keys_is_refused() {
     let other = start_stack().await;
     let opts2 = Options {
         server: other.server.clone(),
-        relay: Some(other.relay.clone()),
         wallet: Some(wallet_path),
         pins: Vec::new(),
     };
@@ -295,7 +281,6 @@ async fn lost_answers_are_retried_safely_and_spent_vouchers_are_dropped() {
     let api_key = new_account(&stack.server, 1_000).await;
     let opts = Options {
         server: stack.server.clone(),
-        relay: Some(stack.relay.clone()),
         wallet: Some(temp_wallet()),
         pins: Vec::new(),
     };
@@ -336,44 +321,4 @@ async fn lost_answers_are_retried_safely_and_spent_vouchers_are_dropped() {
     assert_eq!(recovered, 100);
     assert_eq!(wallet.balance_cents(Family::Paid), 100);
     assert!(wallet.sessions().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_a_relay_the_server_sees_the_address_but_still_not_the_account() {
-    let stack = start_stack().await;
-    let api_key = new_account(&stack.server, 1_000).await;
-    let opts = Options {
-        server: stack.server.clone(),
-        relay: None,
-        wallet: Some(temp_wallet()),
-        pins: Vec::new(),
-    };
-    {
-        let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
-        let client = connect(&opts, &mut wallet).await.unwrap();
-        client.withdraw(&mut wallet, &api_key, 100).await.unwrap();
-    }
-    let (proxy, url) = start_proxy(&opts, Settings::default()).await;
-    let resp: Value = reqwest::Client::new()
-        .post(format!("{url}/v1/chat/completions"))
-        .json(&json!({"model": "echo", "messages": [{"role": "user", "content": "hi"}]}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(resp["choices"][0]["message"]["content"], "echo: hi");
-    proxy.close_all().await;
-    let db = stack.backend.dump();
-    let chat = db["requests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["path"] == "/v1/chat/completions")
-        .unwrap()
-        .clone();
-    assert_eq!(chat["via_ohttp"], false);
-    assert_eq!(chat["peer"], "127.0.0.1");
-    assert_eq!(chat["credential"], "session");
 }

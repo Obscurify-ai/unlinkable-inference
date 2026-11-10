@@ -2,7 +2,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use unlinkable_gateway::{ohttp::OhttpKeys, signer::KeyStore};
+use unlinkable_gateway::signer::KeyStore;
 
 /// Reference unlinkable-sessions server with an echo model and play money.
 /// `POST /test/accounts` makes an account; `GET /debug/db` dumps everything.
@@ -11,7 +11,7 @@ use unlinkable_gateway::{ohttp::OhttpKeys, signer::KeyStore};
 struct Args {
     #[arg(long, env = "LISTEN", default_value = "127.0.0.1:8250")]
     listen: SocketAddr,
-    /// Keep voucher and OHTTP keys here (otherwise they last for the process)
+    /// Keep voucher keys here (otherwise they last for the process)
     #[arg(long, env = "KEYS_DIR")]
     keys_dir: Option<PathBuf>,
     /// Sessions stop working after this many idle seconds
@@ -26,13 +26,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let keys = KeyStore::all(args.keys_dir.as_deref())?;
-    let ohttp = match &args.keys_dir {
-        Some(dir) => OhttpKeys::load_or_create(&dir.join("ohttp_seed"))?,
-        None => OhttpKeys::ephemeral(),
-    };
     let server = unlinkable_reference_server::build(
         keys,
-        ohttp,
         Duration::from_secs(args.idle_timeout_seconds),
     );
     eprintln!(

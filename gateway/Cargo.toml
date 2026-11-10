@@ -1,6 +1,6 @@
 [package]
 name = "unlinkable-gateway"
-description = "Server side of unlinkable sessions: session endpoints, voucher checks, OHTTP decapsulation"
+description = "Server side of unlinkable sessions: session endpoints and voucher checks"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition.workspace = true
@@ -12,13 +12,11 @@ unlinkable-core.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
-bhttp.workspace = true
 blind-rsa-signatures.workspace = true
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
 http.workspace = true
-ohttp.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

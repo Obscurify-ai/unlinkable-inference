@@ -1,14 +1,12 @@
 //! Server side of unlinkable sessions.
 //!
-//! - [`router`]: the session endpoints (`/u/*`). They read no cookie, no
-//!   account key (except `/u/withdraw`, which is the account moving its own
-//!   balance into a wallet) and no IP.
-//! - [`ohttp::wrap`]: an Oblivious HTTP gateway in front of any axum app.
+//! [`router`] serves the session endpoints (`/u/*`). They read no cookie and
+//! no account key (except `/u/withdraw`, which is the account moving its own
+//! balance into a wallet), and keep no IP.
 //!
 //! Storage and money live behind [`Backend`], keys behind [`Signer`], so the
 //! same code runs in the reference server and in a production server.
 
-pub mod ohttp;
 pub mod signer;
 
 pub use unlinkable_core as core;
@@ -183,23 +181,19 @@ pub trait Signer: Send + Sync + 'static {
 pub struct Gateway {
     pub backend: Arc<dyn Backend>,
     pub signer: Arc<dyn Signer>,
-    pub ohttp: Arc<ohttp::OhttpKeys>,
     pub keyset: Keyset,
 }
 
 impl Gateway {
-    pub fn new(backend: Arc<dyn Backend>, signer: Arc<dyn Signer>, ohttp: ohttp::OhttpKeys) -> Arc<Self> {
+    pub fn new(backend: Arc<dyn Backend>, signer: Arc<dyn Signer>) -> Arc<Self> {
         let keyset = Keyset {
             scheme: SCHEME.to_string(),
             paid: signer.public_keys(Family::Paid),
             promo: signer.public_keys(Family::Promo),
-            ohttp_key_config: unlinkable_core::b64(ohttp.encoded_config()),
-            ohttp_gateway_path: "/ohttp".to_string(),
         };
         Arc::new(Self {
             backend,
             signer,
-            ohttp: Arc::new(ohttp),
             keyset,
         })
     }

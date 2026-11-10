@@ -1,7 +1,7 @@
 //! The server's public keys, and pinning them.
 //!
 //! The one real attack on blind vouchers is a server handing one user a
-//! signing key (or OHTTP key) nobody else gets, so their vouchers or requests
+//! signing key nobody else gets, so their vouchers or requests
 //! stand out. So clients accept only keysets they have pinned: built into the
 //! release, published in the public repo, or (for self-hosted and dev servers)
 //! pinned on first use and never silently replaced.
@@ -41,10 +41,6 @@ pub struct Keyset {
     pub scheme: String,
     pub paid: Vec<VoucherKeyInfo>,
     pub promo: Vec<VoucherKeyInfo>,
-    /// OHTTP key configuration (RFC 9458 `application/ohttp-keys` entry), base64url
-    pub ohttp_key_config: String,
-    /// Path of the OHTTP gateway on the server, normally `/ohttp`
-    pub ohttp_gateway_path: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,10 +98,6 @@ impl Keyset {
         } else {
             None
         }
-    }
-
-    pub fn ohttp_config_bytes(&self) -> Option<Vec<u8>> {
-        crate::unb64(&self.ohttp_key_config)
     }
 }
 

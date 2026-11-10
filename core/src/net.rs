@@ -1,31 +1,21 @@
-//! Talking to a server: directly, or wrapped in Oblivious HTTP (RFC 9458,
-//! chunked) and posted to a relay so the server never sees this device's IP.
+//! Talking to a server over HTTPS.
+//!
+//! Hiding this device's IP address is left to the network it runs on (Tor, a
+//! VPN): nothing here depends on a third party. What this layer guarantees is
+//! that requests carry a session secret, never an account key or a cookie.
 
 use crate::blank::Blank;
 use crate::denominations::{blanks_for_any_amount_up_to, split, WITHDRAW_SIZES};
 use crate::keyset::Keyset;
-use crate::pipe::ChannelWriter;
 use crate::protocol::*;
 use crate::voucher::{Family, Voucher};
 use crate::wallet::{OpenSession, Pending, Wallet};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::{AsyncReadExt, AsyncWriteExt, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
-
-pub const OHTTP_CHUNKED_REQ: &str = "message/ohttp-chunked-req";
-pub const OHTTP_CHUNKED_RES: &str = "message/ohttp-chunked-res";
-
-/// How requests reach the server.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Route {
-    /// Straight to the server. Hides the account and the payment, not the IP.
-    Direct,
-    /// Encrypted to the server's OHTTP key and posted to this relay URL.
-    Relay(String),
-}
 
 /// One request as the server will see it.
 #[derive(Debug, Clone)]
@@ -83,16 +73,13 @@ impl Response {
     }
 }
 
-/// What left the device for one request, for the "what leaves this device"
-/// view and `unlinkable verify`.
+/// What the server received for one request, for the "what leaves this
+/// device" view.
 #[derive(Debug, Clone)]
 pub struct Observed {
-    /// Who saw the connection (and so this device's IP)
-    pub network_peer: String,
-    /// What that peer could read
-    pub peer_sees: String,
+    pub server: String,
     pub bytes_sent: usize,
-    /// What the server reads once it opens the request
+    /// Method, path, headers (credentials named, not shown) and body size
     pub server_sees: String,
 }
 
@@ -103,31 +90,21 @@ pub struct Transport {
     http: reqwest::Client,
     /// Server origin, e.g. `https://obscurify.ai`
     pub server: String,
-    pub route: Route,
-    ohttp_config: Option<Vec<u8>>,
     observer: Option<Observer>,
 }
 
 impl Transport {
-    pub fn new(server: &str, route: Route) -> Self {
+    /// Requests go out with no cookies and a generic user agent. Standard
+    /// proxy variables (`HTTPS_PROXY`, `ALL_PROXY`) are honoured.
+    pub fn new(server: &str) -> Self {
         Self {
             http: reqwest::Client::builder()
-                // No cookies, no default identifying headers beyond the
-                // library's user agent, which we replace.
                 .user_agent("unlinkable")
                 .build()
                 .expect("http client"),
             server: server.trim_end_matches('/').to_string(),
-            route,
-            ohttp_config: None,
             observer: None,
         }
-    }
-
-    /// The OHTTP key to encrypt to. Comes from a pinned keyset only.
-    pub fn with_keyset(mut self, keyset: &Keyset) -> Self {
-        self.ohttp_config = keyset.ohttp_config_bytes();
-        self
     }
 
     pub fn observe(mut self, observer: Observer) -> Self {
@@ -135,21 +112,7 @@ impl Transport {
         self
     }
 
-    fn authority(&self) -> String {
-        self.server
-            .split("://")
-            .nth(1)
-            .unwrap_or(&self.server)
-            .to_string()
-    }
-
-    fn note(&self, observed: Observed) {
-        if let Some(observer) = &self.observer {
-            observer(&observed);
-        }
-    }
-
-    fn describe_inner(req: &Request) -> String {
+    fn describe(req: &Request) -> String {
         let headers: Vec<String> = req
             .headers
             .iter()
@@ -176,25 +139,19 @@ impl Transport {
     }
 
     pub async fn send(&self, req: Request) -> Result<Response> {
-        match &self.route {
-            Route::Direct => self.send_direct(req).await,
-            Route::Relay(relay) => self.send_relay(relay, req).await,
-        }
-    }
-
-    async fn send_direct(&self, req: Request) -> Result<Response> {
         let url = format!("{}{}", self.server, req.path);
         let method = reqwest::Method::from_bytes(req.method.as_bytes())?;
         let mut builder = self.http.request(method, &url);
         for (k, v) in &req.headers {
             builder = builder.header(k, v);
         }
-        self.note(Observed {
-            network_peer: self.server.clone(),
-            peer_sees: "your IP address and the request below (TLS to the server)".into(),
-            bytes_sent: req.body.len(),
-            server_sees: Self::describe_inner(&req),
-        });
+        if let Some(observer) = &self.observer {
+            observer(&Observed {
+                server: self.server.clone(),
+                bytes_sent: req.body.len(),
+                server_sees: Self::describe(&req),
+            });
+        }
         let resp = builder.body(req.body).send().await?;
         let status = resp.status().as_u16();
         let headers = resp
@@ -206,118 +163,6 @@ impl Transport {
             status,
             headers,
             body: resp.bytes_stream().map_err(anyhow::Error::from).boxed(),
-        })
-    }
-
-    async fn send_relay(&self, relay: &str, req: Request) -> Result<Response> {
-        let config = self
-            .ohttp_config
-            .as_ref()
-            .ok_or_else(|| anyhow!("no pinned OHTTP key for this server"))?;
-        let client = ohttp::ClientRequest::from_encoded_config(config)
-            .map_err(|e| anyhow!("OHTTP key: {e}"))?;
-
-        let mut msg = bhttp::Message::request(
-            req.method.clone().into_bytes(),
-            b"https".to_vec(),
-            self.authority().into_bytes(),
-            req.path.clone().into_bytes(),
-        );
-        for (k, v) in &req.headers {
-            msg.put_header(k.to_ascii_lowercase().into_bytes(), v.clone().into_bytes());
-        }
-        msg.write_content(&req.body);
-        let mut plain = Vec::new();
-        msg.write_bhttp(bhttp::Mode::KnownLength, &mut plain)
-            .map_err(|e| anyhow!("binary HTTP: {e}"))?;
-
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-        let mut enc = client
-            .encapsulate_stream(ChannelWriter(Some(tx)))
-            .map_err(|e| anyhow!("OHTTP: {e}"))?;
-        enc.write_all(&plain).await?;
-        enc.close().await?;
-        let sealed: Vec<Bytes> = rx.collect().await;
-        let sealed = sealed.concat();
-
-        self.note(Observed {
-            network_peer: relay.to_string(),
-            peer_sees: "your IP address and an encrypted blob it cannot open".into(),
-            bytes_sent: sealed.len(),
-            server_sees: format!("the relay's IP, then: {}", Self::describe_inner(&req)),
-        });
-
-        let resp = self
-            .http
-            .post(relay)
-            .header("content-type", OHTTP_CHUNKED_REQ)
-            .body(sealed)
-            .send()
-            .await
-            .with_context(|| format!("relay {relay}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("relay answered {status}: {}", text.chars().take(200).collect::<String>());
-        }
-        let reader = Box::pin(resp.bytes_stream())
-            .map_err(std::io::Error::other)
-            .into_async_read();
-        let opened = enc
-            .response(reader)
-            .map_err(|e| anyhow!("OHTTP response: {e}"))?;
-        let mut message = <bhttp::Message as bhttp::stream::AsyncReadMessage>::async_read(opened);
-        let header = message
-            .header()
-            .await
-            .map_err(|e| anyhow!("binary HTTP response: {e}"))?;
-        let status = header
-            .control()
-            .status()
-            .map(|s| s.code())
-            .ok_or_else(|| anyhow!("response has no status"))?;
-        let headers = header
-            .iter()
-            .map(|f| {
-                (
-                    String::from_utf8_lossy(f.name()).to_string(),
-                    String::from_utf8_lossy(f.value()).to_string(),
-                )
-            })
-            .collect();
-
-        let (btx, brx) = futures::channel::mpsc::unbounded::<Result<Bytes>>();
-        tokio::spawn(async move {
-            let mut body = match message.body() {
-                Ok(body) => body,
-                Err(e) => {
-                    let _ = btx.unbounded_send(Err(anyhow!("binary HTTP body: {e}")));
-                    return;
-                }
-            };
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match body.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if btx
-                            .unbounded_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = btx.unbounded_send(Err(anyhow!("response stream: {e}")));
-                        break;
-                    }
-                }
-            }
-        });
-        Ok(Response {
-            status,
-            headers,
-            body: brx.boxed(),
         })
     }
 
@@ -341,13 +186,8 @@ impl Transport {
         }
     }
 
-    /// The keyset as the server serves it on this route. Through a relay that
-    /// offers it, the relay fetches it, so the server cannot pick a keyset by IP.
     pub async fn fetch_keyset(&self) -> Result<Keyset> {
-        let url = match &self.route {
-            Route::Direct => format!("{}/u/keys", self.server),
-            Route::Relay(relay) => format!("{}/keys", relay.trim_end_matches('/')),
-        };
+        let url = format!("{}/u/keys", self.server);
         let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
             bail!("{url} answered {}", resp.status());
@@ -405,7 +245,6 @@ pub fn usd_to_cents_floor(usd: &str) -> i64 {
 
 impl Client {
     pub fn new(transport: Transport, keyset: Keyset) -> Self {
-        let transport = transport.with_keyset(&keyset);
         Self { transport, keyset }
     }
 

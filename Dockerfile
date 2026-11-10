@@ -5,8 +5,8 @@ WORKDIR /src
 COPY . .
 ENV SOURCE_DATE_EPOCH=0 CARGO_INCREMENTAL=0 \
     RUSTFLAGS="--remap-path-prefix=/src=. --remap-path-prefix=/usr/local/cargo=cargo"
-RUN cargo build --locked --release -p unlinkable-proxy -p unlinkable-relay -p unlinkable-reference-server \
- && mkdir /out && cp target/release/unlinkable target/release/unlinkable-relay target/release/unlinkable-reference-server /out/ \
+RUN cargo build --locked --release -p unlinkable-proxy -p unlinkable-reference-server \
+ && mkdir /out && cp target/release/unlinkable target/release/unlinkable-reference-server /out/ \
  && cd /out && sha256sum * > SHA256SUMS
 
 FROM debian:bookworm-slim

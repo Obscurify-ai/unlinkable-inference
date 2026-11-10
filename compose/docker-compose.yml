@@ -1,4 +1,4 @@
-# The whole system on one machine: reference server, a relay and the proxy.
+# The whole system on one machine: reference server and the proxy.
 #   docker compose -f compose/docker-compose.yml up --build
 #   curl -s localhost:8250/test/accounts -H 'content-type: application/json' -d '{}'   # play money
 #   docker compose -f compose/docker-compose.yml exec proxy unlinkable withdraw 5 --api-key sk-test_…
@@ -10,19 +10,14 @@ services:
     build: ..
     command: unlinkable-reference-server --listen 0.0.0.0:8250
     ports: ["127.0.0.1:8250:8250"]
-  relay:
-    build: ..
-    command: unlinkable-relay --listen 0.0.0.0:8240 --target ref=http://server:8250
-    ports: ["127.0.0.1:8240:8240"]
   proxy:
     build: ..
     command: unlinkable serve --listen 0.0.0.0:8899
     environment:
       UNLINKABLE_SERVER: http://server:8250
-      UNLINKABLE_RELAY: http://relay:8240/ref
       UNLINKABLE_WALLET: /wallet/wallet.json
     volumes: ["wallet:/wallet"]
     ports: ["127.0.0.1:8899:8899"]
-    depends_on: [server, relay]
+    depends_on: [server]
 volumes:
   wallet: {}

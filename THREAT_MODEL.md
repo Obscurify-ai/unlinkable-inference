@@ -2,27 +2,28 @@
 
 ## The claim
 
-> The server cannot tell who sent a chat: not which account, not which
-> payment, not which IP.
+> The server cannot tell which account or payment a chat came from, or which
+> other chats it goes with.
 
-It does **not** claim the server cannot read a prompt. The server and the
-model see the text.
+It does **not** claim the server cannot read a prompt (the server and the
+model see the text), and it does not hide the IP address. Anyone can hide
+that with Tor or a VPN; what nobody could hide before was the account every
+request had to carry.
 
 ## Who is who
 
 - **Server**: honest-but-curious or malicious. Holds its whole database and
-  logs, runs whatever code it likes.
-- **Relay**: sees client IPs and ciphertext. Assumed not to collude with the
-  server.
+  logs, runs whatever code it likes. Nothing in this design depends on anyone
+  else.
 - **Client**: runs code the user can check (this repo; reproducible builds).
+- **The user's network**: Tor or a VPN if they want their address hidden.
 
-## What each party learns
+## What the server learns
 
-| | Account | Payment | IP | Content |
+| | Account | Payment | Address | Content |
 |---|---|---|---|---|
-| Server, at withdrawal | yes | the amount (fixed sizes) | relay's (or yours, direct) | blinded messages only |
-| Server, at session use | no | no | relay's | yes |
-| Relay | no | no | yes | no |
+| At withdrawal | yes | the amount (fixed sizes) | yes, unless hidden | blinded messages only |
+| At session use | no | no | yes, unless hidden | yes |
 
 What links a session to a withdrawal would have to be in what the server sees
 at both. At withdrawal it signs blinded messages; at spending it sees
@@ -31,18 +32,20 @@ no amount of computation ties one to the other. The reference server's
 `/debug/db` is the server's full view; `proxy/tests/e2e.rs` asserts the two
 share nothing.
 
+An address seen at both is a link. Someone who withdraws and chats from the
+same home IP has hidden their account from the chat but not themselves:
+use Tor or a VPN, or at least withdraw from a different network.
+
 ## What is protected, and how
 
 - **Account → chat**: sessions are paid with vouchers, not an account key.
   The session secret is random and used for nothing else.
 - **Payment → chat**: the existing blind vouchers, plus withdrawals from an
   account into the wallet in fixed sizes.
-- **IP → chat**: Oblivious HTTP through a relay.
 - **Chat → chat**: one session per conversation; turns within it are linked to
   each other only.
 - **Tagging a user with a unique key**: keysets are pinned; `unlinkable verify`
-  compares the keys the server gives you, the keys the relay fetches and the
-  published pins.
+  compares the keys the server gives you with your pins and the published pins.
 - **A website spending your wallet through the proxy**: the proxy refuses
   requests with a non-local Origin or Host and POSTs that are not JSON.
 
@@ -50,7 +53,7 @@ share nothing.
 
 - **Content**. A prompt that names you names you. A unique system prompt reused
   across sessions links them by content.
-- **Collusion** between the relay and the server. Tor assumes less.
+- **The address**. Hide it with Tor or a VPN.
 - **Timing**. A withdrawal immediately followed by a session of the same size,
   on a quiet server, is suggestive. Withdraw ahead of time; the wallet splits
   vouchers into session-sized pieces through anonymous exchanges.

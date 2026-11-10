@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::time::Duration;
 use unlinkable_core::keyset::Pins;
-use unlinkable_core::net::{Observed, Request, Route, Transport};
+use unlinkable_core::net::{Observed, Request, Transport};
 use unlinkable_core::{Family, Voucher, Wallet};
 use unlinkable_proxy::serve::{self, Mode, Settings};
 use unlinkable_proxy::{connect, dollars, lock_wallet, Options};
@@ -11,8 +11,9 @@ use unlinkable_proxy::{connect, dollars, lock_wallet, Options};
 /// Use AI models without the server being able to tell who sent each chat.
 ///
 /// Requests are paid from a wallet of blind-signed vouchers on this device,
-/// one session per conversation, and sent through a relay with Oblivious HTTP
-/// so the server never sees your IP. The server still reads each prompt.
+/// one session per conversation, with a session secret instead of your API
+/// key. The server still reads each prompt, and sees your IP address unless
+/// you hide it yourself (Tor, a VPN).
 ///
 /// Quick start:
 ///   unlinkable withdraw 5 --api-key sk-obs1_…   # move $5 into the wallet
@@ -25,10 +26,6 @@ struct Cli {
     /// Server origin
     #[arg(long, global = true, env = "UNLINKABLE_SERVER", default_value = "https://obscurify.ai")]
     server: String,
-    /// OHTTP relay URL. `none` sends directly: the server then sees your IP
-    /// (but still not your account or payment)
-    #[arg(long, global = true, env = "UNLINKABLE_RELAY")]
-    relay: Option<String>,
     /// Wallet file (default: ~/.local/share/unlinkable/<server>/wallet.json)
     #[arg(long, global = true, env = "UNLINKABLE_WALLET")]
     wallet: Option<std::path::PathBuf>,
@@ -84,8 +81,8 @@ enum Command {
         #[arg(long)]
         trust: bool,
     },
-    /// Check the server's keys directly, through the relay and against the
-    /// published pins, and show what each party receives
+    /// Check the server's keys against your pins and the published pins, and
+    /// show what the server receives
     Verify {
         /// Published pins to compare with
         #[arg(long)]
@@ -108,16 +105,11 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let relay = cli.relay.filter(|r| r != "none" && !r.is_empty());
     let opts = Options {
         server: cli.server.trim_end_matches('/').to_string(),
-        relay,
         wallet: cli.wallet,
         pins: cli.pins,
     };
-    if opts.relay.is_none() && !matches!(cli.command, Command::Wallet | Command::Export) {
-        eprintln!("unlinkable: no relay set (--relay or UNLINKABLE_RELAY). The server will see your IP address, though still not your account or payment.");
-    }
 
     match cli.command {
         Command::Serve {
@@ -257,25 +249,10 @@ async fn main() -> Result<()> {
 
 async fn verify(opts: &Options, published: Option<String>) -> Result<()> {
     let mut ok = true;
-    let direct = Transport::new(&opts.server, Route::Direct).fetch_keyset().await?;
-    direct.check()?;
-    let fp = direct.fingerprint();
-    println!("Keys straight from the server:   {fp}");
-    if let Some(relay) = &opts.relay {
-        match Transport::new(&opts.server, Route::Relay(relay.clone()))
-            .fetch_keyset()
-            .await
-        {
-            Ok(k) if k.fingerprint() == fp => {
-                println!("Keys fetched by the relay:       {} (same)", k.fingerprint())
-            }
-            Ok(k) => {
-                ok = false;
-                println!("Keys fetched by the relay:       {} (DIFFERENT: the server is serving you different keys)", k.fingerprint());
-            }
-            Err(e) => println!("Keys fetched by the relay:       not offered by this relay ({e})"),
-        }
-    }
+    let keyset = Transport::new(&opts.server).fetch_keyset().await?;
+    keyset.check()?;
+    let fp = keyset.fingerprint();
+    println!("Keys the server serves you:      {fp}");
     let wallet = Wallet::open(opts.wallet_path())?;
     let mut pins = Pins::builtin(&opts.host());
     pins.fingerprints.extend(opts.pins.iter().cloned());
@@ -284,7 +261,7 @@ async fn verify(opts: &Options, published: Option<String>) -> Result<()> {
     }
     if pins.fingerprints.is_empty() {
         println!("Pinned:                          nothing yet (pinned on first use)");
-    } else if pins.accepts(&direct) {
+    } else if pins.accepts(&keyset) {
         println!("Pinned:                          yes");
     } else {
         ok = false;
@@ -312,24 +289,20 @@ async fn verify(opts: &Options, published: Option<String>) -> Result<()> {
     }
 
     println!();
-    println!("What each party receives for one request (GET /v1/models):");
+    println!("What the server receives for one request:");
     let seen: std::sync::Arc<std::sync::Mutex<Vec<Observed>>> = Default::default();
     let log = seen.clone();
     let transport = opts
         .transport()
-        .with_keyset(&direct)
         .observe(std::sync::Arc::new(move |o: &Observed| log.lock().unwrap().push(o.clone())));
     let resp = transport.send(Request::get("/v1/models")).await?;
     let status = resp.status;
     let _ = resp.bytes().await;
     for o in seen.lock().unwrap().iter() {
-        println!("  {} receives: {} ({} bytes)", o.network_peer, o.peer_sees, o.bytes_sent);
-        println!("  {} receives: {}", opts.server, o.server_sees);
+        println!("  {}", o.server_sees);
     }
     println!("  answer: HTTP {status}");
-    if opts.relay.is_none() {
-        println!("\nNo relay is set, so the server sees your IP. Set --relay to hide it.");
-    }
+    println!("  (plus your IP address, unless Tor or a VPN hides it)");
     if !ok {
         bail!("verification failed");
     }

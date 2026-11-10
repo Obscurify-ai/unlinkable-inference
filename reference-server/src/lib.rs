@@ -2,7 +2,7 @@
 //! that speaks the OpenAI and Anthropic APIs, test accounts instead of real
 //! payments, and `GET /debug/db`, which dumps everything the server holds.
 //!
-//! Run it, use it through the proxy and relay, read the dump, and try to tie
+//! Run it, use it through the proxy, read the dump, and try to tie
 //! a session to the withdrawal that paid for it.
 
 use async_trait::async_trait;
@@ -24,7 +24,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unlinkable_core::protocol::{ChangeResponse, SessionStatus};
 use unlinkable_core::{sha256_hex, Family};
 use unlinkable_gateway::{
-    ohttp::{OhttpKeys, ViaOhttp},
     signer::KeyStore,
     Backend, Gateway, GatewayError, SignChange, Spend,
 };
@@ -77,9 +76,8 @@ pub struct WithdrawalRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestRow {
     pub path: String,
-    /// Peer address as the app saw it ("0.0.0.0" = arrived through OHTTP)
+    /// Peer address as the app saw it
     pub peer: String,
-    pub via_ohttp: bool,
     /// "session", "account", "none"
     pub credential: String,
     pub had_cookie: bool,
@@ -576,7 +574,6 @@ async fn record(State(app): State<App>, req: Request, next: Next) -> Response {
         app.backend.log(RequestRow {
             path,
             peer,
-            via_ohttp: req.extensions().get::<ViaOhttp>().is_some(),
             credential: credential.into(),
             had_cookie: req.headers().contains_key("cookie"),
             at: unix(),
@@ -595,11 +592,10 @@ pub struct Server {
 /// for (all of them in production use; tests can use fewer).
 pub fn build(
     keys: KeyStore,
-    ohttp: OhttpKeys,
     idle_timeout: Duration,
 ) -> Server {
     let backend = Arc::new(MemoryBackend::new(idle_timeout));
-    let gateway = Gateway::new(backend.clone(), Arc::new(keys), ohttp);
+    let gateway = Gateway::new(backend.clone(), Arc::new(keys));
     let app = App {
         backend: backend.clone(),
     };
@@ -613,7 +609,7 @@ pub fn build(
         .with_state(app.clone())
         .merge(unlinkable_gateway::router(gateway.clone()))
         .layer(middleware::from_fn_with_state(app, record));
-    let router = unlinkable_gateway::ohttp::wrap(gateway.ohttp.clone(), inner, &["/u/", "/v1/"]);
+    let router = inner;
     Server {
         router,
         backend,

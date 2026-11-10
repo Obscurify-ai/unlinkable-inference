@@ -1,9 +1,9 @@
 //! Client side of unlinkable sessions.
 //!
-//! A wallet of blind-signed vouchers pays for a session; the session secret,
-//! not an account key, authorises requests; and requests travel through an
-//! Oblivious HTTP relay so the server never sees the client's IP. See
-//! `SPEC.md` for the wire format and `THREAT_MODEL.md` for what this protects.
+//! A wallet of blind-signed vouchers pays for a session, and the session
+//! secret, not an account key, authorises requests. See `SPEC.md` for the
+//! wire format and `THREAT_MODEL.md` for what this protects (not the IP:
+//! that is the network's job, Tor or a VPN).
 //!
 //! Everything that makes requests unlinkable happens here, on the device: the
 //! server only ever sees blinded messages when it signs, and unblinded vouchers
@@ -12,7 +12,6 @@
 pub mod blank;
 pub mod denominations;
 pub mod keyset;
-pub mod pipe;
 pub mod protocol;
 pub mod voucher;
 pub mod wallet;

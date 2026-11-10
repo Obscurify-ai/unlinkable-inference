@@ -7,9 +7,9 @@ integer cents unless named `_usd`, which are exact decimal strings.
 
 - **Client**: holds the wallet. The proxy (`unlinkable`), and later the
   Android and web apps.
-- **Relay**: forwards sealed requests. Sees the client's IP, never the content.
-- **Server**: runs the gateway. Sees the content, never the client's IP when
-  a relay is used.
+- **Server**: runs the gateway. Sees each request's content and the address it
+  came from. Hiding that address is up to the client's network (Tor, a VPN);
+  the protocol does not depend on any third party.
 
 ## Vouchers
 
@@ -38,9 +38,7 @@ seen.
 ```json
 {"scheme": "RSABSSA-SHA384-PSS-Deterministic",
  "paid":  [{"denomination_cents": 1, "key_id": "…", "public_key_der": "…"}, …],
- "promo": […],
- "ohttp_key_config": "<one RFC 9458 key configuration>",
- "ohttp_gateway_path": "/ohttp"}
+ "promo": […]}
 ```
 
 Its **fingerprint** is `ks1-` + the first 32 hex characters of SHA-256 of the
@@ -52,7 +50,7 @@ obscurify.ai live in `keys/obscurify.ai.pins`.
 
 ## Endpoints
 
-None of them reads a cookie or an IP. Errors are
+None of them reads a cookie or stores an IP. Errors are
 `{"error": {"message", "type", "spent"?}}`.
 
 | Request | Auth | Body | Answer |
@@ -88,21 +86,3 @@ Rules:
   for stays in the account). A repeat with the same blanks gets the same answer.
 - Sessions refuse model requests after `idle_timeout_seconds` without one but
   can still be closed for a grace period (Obscurify: 7 days).
-
-## Oblivious HTTP
-
-RFC 9458 with X25519/HKDF-SHA256 and AES-128-GCM or ChaCha20-Poly1305, key id
-1. Streaming uses chunked OHTTP (draft-ietf-ohai-chunked-ohttp):
-`message/ohttp-chunked-req` / `message/ohttp-chunked-res`. Non-chunked
-`message/ohttp-req` / `message/ohttp-res` is also accepted.
-
-The inner request is RFC 9292 binary HTTP. The gateway answers chunked
-requests with an indeterminate-length binary HTTP response, one sealed chunk
-per body write, so server-sent events arrive as they are made. It drops
-`cookie`, `host`, `forwarded`, `x-forwarded-*`, `x-real-ip` and similar request
-headers, gives the app an unroutable peer address, and only routes paths
-under `/u/` and `/v1/`.
-
-A relay accepts `POST /<name>` with an OHTTP content type and forwards only the
-body and content type to `<gateway origin>/ohttp`. `GET /<name>/keys` returns
-the gateway's keyset as the relay fetched it.

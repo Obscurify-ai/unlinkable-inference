@@ -5,7 +5,7 @@ pub mod serve;
 use anyhow::{bail, Context as _, Result};
 use std::path::PathBuf;
 use unlinkable_core::keyset::{Keyset, Pins};
-use unlinkable_core::net::{Client, Route, Transport};
+use unlinkable_core::net::{Client, Transport};
 use unlinkable_core::Wallet;
 
 /// Where to find the server and how to reach it.
@@ -13,8 +13,6 @@ use unlinkable_core::Wallet;
 pub struct Options {
     /// Server origin, e.g. `https://obscurify.ai`
     pub server: String,
-    /// Relay URL, or `None` to go direct (hides account and payment, not IP)
-    pub relay: Option<String>,
     pub wallet: Option<PathBuf>,
     /// Extra keyset fingerprints to accept
     pub pins: Vec<String>,
@@ -30,13 +28,6 @@ impl Options {
             .to_string()
     }
 
-    pub fn route(&self) -> Route {
-        match &self.relay {
-            Some(r) => Route::Relay(r.clone()),
-            None => Route::Direct,
-        }
-    }
-
     pub fn wallet_path(&self) -> PathBuf {
         if let Some(p) = &self.wallet {
             return p.clone();
@@ -50,7 +41,7 @@ impl Options {
     }
 
     pub fn transport(&self) -> Transport {
-        Transport::new(&self.server, self.route())
+        Transport::new(&self.server)
     }
 }
 
@@ -78,24 +69,14 @@ pub fn lock_wallet(opts: &Options) -> Result<WalletLock> {
     Ok(WalletLock(file))
 }
 
-/// Fetch the server's keyset the way this route allows and check it against
-/// the pins. With no pins at all for this server, pin what we see now and
+/// Fetch the server's keyset and check it against the pins. With no pins at all for this server, pin what we see now and
 /// refuse anything different later (trust on first use).
 pub async fn trusted_keyset(opts: &Options, wallet: &mut Wallet) -> Result<Keyset> {
-    let transport = opts.transport();
-    let keyset = match transport.fetch_keyset().await {
-        Ok(k) => k,
-        Err(e) if opts.relay.is_some() => {
-            // A relay that does not pass keys through: fetch directly. The
-            // pin check below is what protects against a per-user key.
-            tracing::debug!("relay has no /keys ({e}); fetching keys directly");
-            Transport::new(&opts.server, Route::Direct)
-                .fetch_keyset()
-                .await
-                .context("fetching the server's keys")?
-        }
-        Err(e) => return Err(e.context("fetching the server's keys")),
-    };
+    let keyset = opts
+        .transport()
+        .fetch_keyset()
+        .await
+        .context("fetching the server's keys")?;
     keyset.check()?;
     let mut pins = Pins::builtin(&opts.host());
     pins.fingerprints.extend(opts.pins.iter().cloned());

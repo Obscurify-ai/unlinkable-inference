@@ -2,7 +2,7 @@
 //!
 //! Agents and SDKs talk to it as if it were the OpenAI or Anthropic API. For
 //! each conversation it opens a session paid with vouchers from the wallet,
-//! sends the request (through the relay, sealed with OHTTP), streams the
+//! sends the request with the session secret in place of any key, streams the
 //! answer back, and closes the session once the conversation goes quiet,
 //! putting the change back in the wallet. Whatever key the client sends stays
 //! here: it only names which session to use.
@@ -178,10 +178,7 @@ impl Proxy {
         let show = settings.show_traffic;
         client.transport = client.transport.clone().observe(Arc::new(move |o: &Observed| {
             if show {
-                eprintln!(
-                    "→ {} sees: {} ({} bytes)\n  server sees: {}",
-                    o.network_peer, o.peer_sees, o.bytes_sent, o.server_sees
-                );
+                eprintln!("→ {}: {}", o.server, o.server_sees);
             }
             let mut log = log.lock().unwrap();
             log.push_front((now(), o.clone()));
@@ -327,7 +324,7 @@ impl Proxy {
                 body: Vec::new(),
             };
             return match self.client.transport.send(req).await {
-                Ok(r) => relay_response(r),
+                Ok(r) => pass_through(r),
                 Err(e) => text(StatusCode::BAD_GATEWAY, &format!("{e:#}")),
             };
         }
@@ -392,7 +389,7 @@ impl Proxy {
                     .unwrap()
                     .insert(rev.to_string(), key.clone());
             }
-            let out = relay_response_tracked(response, entry.clone());
+            let out = pass_through_tracked(response, entry.clone());
             return out;
         }
     }
@@ -420,13 +417,11 @@ impl Proxy {
             .iter()
             .take(40)
             .map(|(at, o)| {
-                json!({"at": at, "network_peer": o.network_peer, "peer_sees": o.peer_sees,
-                       "bytes_sent": o.bytes_sent, "server_sees": o.server_sees})
+                json!({"at": at, "bytes_sent": o.bytes_sent, "server_sees": o.server_sees})
             })
             .collect();
         json!({
             "server": self.opts.server,
-            "relay": self.opts.relay,
             "keyset": self.client.keyset.fingerprint(),
             "wallet": {
                 "paid_cents": wallet.balance_cents(Family::Paid),
@@ -477,7 +472,7 @@ fn copy_headers(resp: &unlinkable_core::net::Response, out: &mut HeaderMap) {
     }
 }
 
-fn relay_response(resp: unlinkable_core::net::Response) -> Response {
+fn pass_through(resp: unlinkable_core::net::Response) -> Response {
     let mut headers = HeaderMap::new();
     copy_headers(&resp, &mut headers);
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -485,9 +480,9 @@ fn relay_response(resp: unlinkable_core::net::Response) -> Response {
     (status, headers, body).into_response()
 }
 
-/// Like [`relay_response`], keeping the session marked busy until the
+/// Like [`pass_through`], keeping the session marked busy until the
 /// stream ends, so it is never closed mid-answer.
-fn relay_response_tracked(resp: unlinkable_core::net::Response, entry: Arc<Entry>) -> Response {
+fn pass_through_tracked(resp: unlinkable_core::net::Response, entry: Arc<Entry>) -> Response {
     let mut headers = HeaderMap::new();
     copy_headers(&resp, &mut headers);
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -673,10 +668,10 @@ const usd=c=>'$'+(c/100).toFixed(2);
 async function load(){
  const s=await (await fetch('/_unlinkable/status')).json();
  $('summary').innerHTML=`Server <code>${esc(s.server)}</code><br>`+
-  (s.relay?`Relay <code>${esc(s.relay)}</code>: the server never sees your IP.`:`<span class="warn">No relay: the server sees your IP (not your account or payment).</span>`)+
+  `The server sees your IP address unless Tor or a VPN hides it. It never sees your account or how you paid.`+
   `<br>Keyset <code>${esc(s.keyset)}</code><br>Wallet ${usd(s.wallet.paid_cents)} paid, ${usd(s.wallet.promo_cents)} promo, in ${s.wallet.vouchers} vouchers`;
  $('sessions').innerHTML=s.sessions.length?s.sessions.map(x=>`${x.requests} request${x.requests==1?'':'s'}, open ${x.age_seconds}s, idle ${x.idle_seconds}s`).join('<br>'):'None. Sessions close after '+s.settings.idle_close_seconds+'s without a request; change goes back to the wallet.';
- $('traffic').innerHTML=s.traffic.map(t=>`<tr><td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><span class="peer">${esc(t.network_peer)}</span> sees ${esc(t.peer_sees)} (${t.bytes_sent} bytes)<br><span class="server">server sees</span> ${esc(t.server_sees)}</td></tr>`).join('')||'<tr><td>Nothing sent yet.</td></tr>';
+ $('traffic').innerHTML=s.traffic.map(t=>`<tr><td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><span class="server">server sees</span> ${esc(t.server_sees)}</td></tr>`).join('')||'<tr><td>Nothing sent yet.</td></tr>';
 }
 async function withdraw(){
  const r=await fetch('/_unlinkable/withdraw',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),amount_cents:+$('amt').value})});
