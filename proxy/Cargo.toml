@@ -1,0 +1,32 @@
+[package]
+name = "unlinkable-proxy"
+description = "Local proxy for unlinkable sessions: OpenAI and Anthropic endpoints on localhost, a voucher wallet, and an OHTTP relay between you and the server"
+license = "GPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "unlinkable"
+path = "src/main.rs"
+
+[dependencies]
+unlinkable-core = { path = "../core", features = ["net"] }
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+unlinkable-gateway.workspace = true
+unlinkable-relay.workspace = true
+unlinkable-reference-server.workspace = true
+reqwest = { workspace = true, features = ["json", "stream"] }

@@ -1,0 +1,338 @@
+use anyhow::{bail, Result};
+use clap::{Parser, Subcommand};
+use std::io::Read;
+use std::time::Duration;
+use unlinkable_core::keyset::Pins;
+use unlinkable_core::net::{Observed, Request, Route, Transport};
+use unlinkable_core::{Family, Voucher, Wallet};
+use unlinkable_proxy::serve::{self, Mode, Settings};
+use unlinkable_proxy::{connect, dollars, lock_wallet, Options};
+
+/// Use AI models without the server being able to tell who sent each chat.
+///
+/// Requests are paid from a wallet of blind-signed vouchers on this device,
+/// one session per conversation, and sent through a relay with Oblivious HTTP
+/// so the server never sees your IP. The server still reads each prompt.
+///
+/// Quick start:
+///   unlinkable withdraw 5 --api-key sk-obs1_…   # move $5 into the wallet
+///   unlinkable serve                             # localhost:8899
+///   ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=any claude
+///   OPENAI_BASE_URL=http://127.0.0.1:8899/v1 OPENAI_API_KEY=any …
+#[derive(Parser)]
+#[command(name = "unlinkable", version, verbatim_doc_comment)]
+struct Cli {
+    /// Server origin
+    #[arg(long, global = true, env = "UNLINKABLE_SERVER", default_value = "https://obscurify.ai")]
+    server: String,
+    /// OHTTP relay URL. `none` sends directly: the server then sees your IP
+    /// (but still not your account or payment)
+    #[arg(long, global = true, env = "UNLINKABLE_RELAY")]
+    relay: Option<String>,
+    /// Wallet file (default: ~/.local/share/unlinkable/<server>/wallet.json)
+    #[arg(long, global = true, env = "UNLINKABLE_WALLET")]
+    wallet: Option<std::path::PathBuf>,
+    /// Also accept this keyset fingerprint (repeatable)
+    #[arg(long = "pin", global = true, env = "UNLINKABLE_PINS", value_delimiter = ',')]
+    pins: Vec<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the local proxy: OpenAI and Anthropic APIs on localhost
+    Serve {
+        #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
+        listen: String,
+        /// What each new session starts with, in dollars
+        #[arg(long, default_value = "0.50")]
+        session_funding: String,
+        /// conversation: a session per conversation; key: per API key the
+        /// client sends; run: one session until idle
+        #[arg(long, default_value = "conversation")]
+        per: Mode,
+        /// Close a session after this many seconds without a request
+        #[arg(long, default_value_t = 300)]
+        idle_close: u64,
+        /// Print what leaves this device for every request
+        #[arg(long)]
+        show_traffic: bool,
+    },
+    /// Show the wallet
+    Wallet,
+    /// Move a fixed amount ($1, $5, $20, $50, $100) of account balance into
+    /// the wallet. Do it ahead of time, not right before you need it: the
+    /// server sees when the account withdraws.
+    Withdraw {
+        /// Dollars
+        amount: u32,
+        #[arg(long, env = "OBSCURIFY_API_KEY")]
+        api_key: String,
+    },
+    /// Add voucher codes (obv1.…) to the wallet; `-` reads them from stdin
+    Import { codes: Vec<String> },
+    /// Print every voucher, for a backup
+    Export,
+    /// Trade all vouchers for a fresh, standard set with the same total
+    Exchange,
+    /// Close sessions and finish operations a previous run left open
+    Recover,
+    /// Show the server's keyset and whether it is pinned
+    Keys {
+        /// Pin the keyset the server serves now, replacing the old pin
+        #[arg(long)]
+        trust: bool,
+    },
+    /// Check the server's keys directly, through the relay and against the
+    /// published pins, and show what each party receives
+    Verify {
+        /// Published pins to compare with
+        #[arg(long)]
+        published: Option<String>,
+    },
+}
+
+fn parse_dollars(text: &str) -> Result<i64> {
+    let cents = unlinkable_core::net::usd_to_cents_floor(text);
+    if cents <= 0 {
+        bail!("{text} is not an amount");
+    }
+    Ok(cents)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "unlinkable=info,unlinkable_proxy=info".into()))
+        .with_writer(std::io::stderr)
+        .init();
+    let cli = Cli::parse();
+    let relay = cli.relay.filter(|r| r != "none" && !r.is_empty());
+    let opts = Options {
+        server: cli.server.trim_end_matches('/').to_string(),
+        relay,
+        wallet: cli.wallet,
+        pins: cli.pins,
+    };
+    if opts.relay.is_none() && !matches!(cli.command, Command::Wallet | Command::Export) {
+        eprintln!("unlinkable: no relay set (--relay or UNLINKABLE_RELAY). The server will see your IP address, though still not your account or payment.");
+    }
+
+    match cli.command {
+        Command::Serve {
+            listen,
+            session_funding,
+            per,
+            idle_close,
+            show_traffic,
+        } => {
+            let _lock = lock_wallet(&opts)?;
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let client = connect(&opts, &mut wallet).await?;
+            match client.recover(&mut wallet).await {
+                Ok(0) => {}
+                Ok(c) => eprintln!("unlinkable: recovered {} from an earlier run", dollars(c)),
+                Err(e) => eprintln!("unlinkable: could not finish an earlier run's work yet: {e:#}"),
+            }
+            let settings = Settings {
+                funding_cents: parse_dollars(&session_funding)?,
+                mode: per,
+                idle_close: Duration::from_secs(idle_close),
+                show_traffic,
+            };
+            eprintln!(
+                "unlinkable: wallet {} ({}); proxy on http://{listen} (page: http://{listen}/_unlinkable)",
+                dollars(wallet.balance_cents(Family::Paid) + wallet.balance_cents(Family::Promo)),
+                wallet.path().display()
+            );
+            let proxy = serve::Proxy::new(client, wallet, settings, opts.clone());
+            let listener = tokio::net::TcpListener::bind(&listen).await?;
+            serve::run(listener, proxy, async {
+                let _ = tokio::signal::ctrl_c().await;
+                eprintln!("unlinkable: closing sessions…");
+            })
+            .await?;
+        }
+        Command::Wallet => {
+            let wallet = Wallet::open(opts.wallet_path())?;
+            println!("wallet   {}", wallet.path().display());
+            println!("paid     {}", dollars(wallet.balance_cents(Family::Paid)));
+            println!("promo    {}", dollars(wallet.balance_cents(Family::Promo)));
+            println!("vouchers {}", wallet.vouchers().len());
+            println!("sessions {} left open", wallet.sessions().len());
+            if !wallet.pending().is_empty() {
+                println!("pending  {} (run `unlinkable recover`)", wallet.pending().len());
+            }
+            println!("pinned   {}", wallet.pinned().unwrap_or("(nothing yet)"));
+        }
+        Command::Withdraw { amount, api_key } => {
+            let _lock = lock_wallet(&opts)?;
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let client = connect(&opts, &mut wallet).await?;
+            let cents = client.withdraw(&mut wallet, &api_key, amount as i64 * 100).await?;
+            println!(
+                "Added {} to the wallet. It now holds {}.",
+                dollars(cents),
+                dollars(wallet.balance_cents(Family::Paid))
+            );
+        }
+        Command::Import { codes } => {
+            let _lock = lock_wallet(&opts)?;
+            let mut codes = codes;
+            if codes.iter().any(|c| c == "-") {
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                codes = text.split_whitespace().map(str::to_string).collect();
+            }
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let client = connect(&opts, &mut wallet).await?;
+            let mut added = 0;
+            for code in &codes {
+                let Some(voucher) = Voucher::parse(code) else {
+                    bail!("not a voucher: {code}");
+                };
+                let Some(family) = unlinkable_core::blank::verify(&client.keyset, &voucher) else {
+                    bail!("{} did not sign {code}", opts.host());
+                };
+                added += voucher.denomination_cents;
+                wallet.add(family, [voucher]);
+            }
+            wallet.save()?;
+            println!("Added {}.", dollars(added));
+        }
+        Command::Export => {
+            let wallet = Wallet::open(opts.wallet_path())?;
+            for code in wallet.export() {
+                println!("{code}");
+            }
+        }
+        Command::Exchange => {
+            let _lock = lock_wallet(&opts)?;
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let client = connect(&opts, &mut wallet).await?;
+            for family in [Family::Paid, Family::Promo] {
+                let cents = client.exchange(&mut wallet, family).await?;
+                if cents > 0 {
+                    println!("Exchanged {} of {} vouchers.", dollars(cents), family.as_str());
+                }
+            }
+        }
+        Command::Recover => {
+            let _lock = lock_wallet(&opts)?;
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let client = connect(&opts, &mut wallet).await?;
+            let cents = client.recover(&mut wallet).await?;
+            println!("Recovered {}.", dollars(cents));
+        }
+        Command::Keys { trust } => {
+            let _lock = lock_wallet(&opts)?;
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let keyset = opts.transport().fetch_keyset().await?;
+            keyset.check()?;
+            let fp = keyset.fingerprint();
+            println!("server serves  {fp}");
+            println!("pinned         {}", wallet.pinned().unwrap_or("(nothing)"));
+            let builtin = Pins::builtin(&opts.host());
+            println!(
+                "built-in pins  {}",
+                if builtin.fingerprints.is_empty() {
+                    "(none for this server)".to_string()
+                } else {
+                    builtin.fingerprints.iter().cloned().collect::<Vec<_>>().join(", ")
+                }
+            );
+            if trust {
+                wallet.pin(Some(fp.clone()));
+                wallet.save()?;
+                println!("Pinned {fp}.");
+            }
+        }
+        Command::Verify { published } => {
+            verify(&opts, published).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn verify(opts: &Options, published: Option<String>) -> Result<()> {
+    let mut ok = true;
+    let direct = Transport::new(&opts.server, Route::Direct).fetch_keyset().await?;
+    direct.check()?;
+    let fp = direct.fingerprint();
+    println!("Keys straight from the server:   {fp}");
+    if let Some(relay) = &opts.relay {
+        match Transport::new(&opts.server, Route::Relay(relay.clone()))
+            .fetch_keyset()
+            .await
+        {
+            Ok(k) if k.fingerprint() == fp => {
+                println!("Keys fetched by the relay:       {} (same)", k.fingerprint())
+            }
+            Ok(k) => {
+                ok = false;
+                println!("Keys fetched by the relay:       {} (DIFFERENT: the server is serving you different keys)", k.fingerprint());
+            }
+            Err(e) => println!("Keys fetched by the relay:       not offered by this relay ({e})"),
+        }
+    }
+    let wallet = Wallet::open(opts.wallet_path())?;
+    let mut pins = Pins::builtin(&opts.host());
+    pins.fingerprints.extend(opts.pins.iter().cloned());
+    if let Some(p) = wallet.pinned() {
+        pins.fingerprints.insert(p.to_string());
+    }
+    if pins.fingerprints.is_empty() {
+        println!("Pinned:                          nothing yet (pinned on first use)");
+    } else if pins.accepts(&direct) {
+        println!("Pinned:                          yes");
+    } else {
+        ok = false;
+        println!("Pinned:                          NO: these keys are not the ones you pinned");
+    }
+    let published = published.or_else(|| {
+        (opts.host() == "obscurify.ai").then(|| {
+            "https://raw.githubusercontent.com/Obscurify-ai/unlinkable/main/keys/obscurify.ai.pins"
+                .to_string()
+        })
+    });
+    if let Some(url) = published {
+        match reqwest::get(&url).await {
+            Ok(r) if r.status().is_success() => {
+                let text = r.text().await.unwrap_or_default();
+                if text.lines().any(|l| l.trim() == fp) {
+                    println!("In the published pins:           yes ({url})");
+                } else {
+                    ok = false;
+                    println!("In the published pins:           NO ({url})");
+                }
+            }
+            _ => println!("In the published pins:           could not fetch {url}"),
+        }
+    }
+
+    println!();
+    println!("What each party receives for one request (GET /v1/models):");
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<Observed>>> = Default::default();
+    let log = seen.clone();
+    let transport = opts
+        .transport()
+        .with_keyset(&direct)
+        .observe(std::sync::Arc::new(move |o: &Observed| log.lock().unwrap().push(o.clone())));
+    let resp = transport.send(Request::get("/v1/models")).await?;
+    let status = resp.status;
+    let _ = resp.bytes().await;
+    for o in seen.lock().unwrap().iter() {
+        println!("  {} receives: {} ({} bytes)", o.network_peer, o.peer_sees, o.bytes_sent);
+        println!("  {} receives: {}", opts.server, o.server_sees);
+    }
+    println!("  answer: HTTP {status}");
+    if opts.relay.is_none() {
+        println!("\nNo relay is set, so the server sees your IP. Set --relay to hide it.");
+    }
+    if !ok {
+        bail!("verification failed");
+    }
+    println!("\nAll checks passed.");
+    Ok(())
+}

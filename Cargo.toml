@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["core", "gateway", "proxy", "reference-server", "relay"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+repository = "https://github.com/Obscurify-ai/unlinkable"
+
+[workspace.dependencies]
+unlinkable-core = { path = "core", default-features = false }
+unlinkable-gateway = { path = "gateway" }
+unlinkable-relay = { path = "relay" }
+unlinkable-reference-server = { path = "reference-server" }
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bhttp = { version = "0.8", features = ["stream"] }
+blind-rsa-signatures = "0.18"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+http = "1"
+ohttp = { version = "0.8", default-features = false, features = ["client", "server", "rust-hpke", "stream"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+# RSA key generation and blind signing are slow unoptimised; tests generate keys.
+[profile.dev.package."*"]
+opt-level = 3

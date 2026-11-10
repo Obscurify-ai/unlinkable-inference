@@ -1,0 +1,19 @@
+[package]
+name = "unlinkable-relay"
+description = "A minimal Oblivious HTTP relay: forwards sealed requests to fixed gateways, streams answers back, keeps no logs"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

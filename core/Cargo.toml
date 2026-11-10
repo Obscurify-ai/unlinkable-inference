@@ -1,0 +1,31 @@
+[package]
+name = "unlinkable-core"
+description = "Client side of unlinkable sessions: blind vouchers, wallet, sessions, Oblivious HTTP, key pinning"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+default = ["net"]
+# HTTP transport (direct and through an OHTTP relay). Off for WASM builds that
+# bring their own fetch.
+net = ["dep:reqwest", "dep:tokio"]
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+bhttp.workspace = true
+blind-rsa-signatures.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
+ohttp.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }

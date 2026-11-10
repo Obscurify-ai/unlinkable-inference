@@ -1,0 +1,23 @@
+[package]
+name = "unlinkable-reference-server"
+description = "Reference unlinkable-sessions server: gateway, in-memory backend, echo model, test payments, full database dump"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+unlinkable-core.workspace = true
+unlinkable-gateway.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

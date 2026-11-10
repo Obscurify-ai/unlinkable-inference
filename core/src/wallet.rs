@@ -1,0 +1,207 @@
+//! The wallet: vouchers held on this device, one file per server.
+//!
+//! Vouchers are bearer credit. Whoever has the file can spend them, and if the
+//! file is lost they are gone; `export` exists for backups. The file is
+//! written atomically with owner-only permissions.
+
+use crate::blank::Blank;
+use crate::voucher::{Family, Voucher};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Held {
+    pub family: Family,
+    pub voucher: Voucher,
+}
+
+/// Blanks sent to the server whose signatures have not come back yet. Kept
+/// on disk so a crash or lost response can be retried with the same blanks
+/// (the server answers a repeat with the same signatures).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pending {
+    pub id: String,
+    /// "close", "exchange" or "withdraw"
+    pub kind: String,
+    pub blanks: Vec<Blank>,
+    /// For close: the session secret; for exchange: the vouchers spent.
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub vouchers: Vec<String>,
+    #[serde(default)]
+    pub amount_cents: i64,
+}
+
+/// An open session, remembered so it can be closed after a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenSession {
+    pub secret: String,
+    pub family: Family,
+    pub opened_at: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct WalletFile {
+    #[serde(default)]
+    vouchers: Vec<Held>,
+    #[serde(default)]
+    pending: Vec<Pending>,
+    #[serde(default)]
+    sessions: Vec<OpenSession>,
+    /// Keyset fingerprint pinned on first use (servers without built-in pins)
+    #[serde(default)]
+    pinned: Option<String>,
+}
+
+pub struct Wallet {
+    path: PathBuf,
+    file: WalletFile,
+}
+
+impl Wallet {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let file = if path.exists() {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+        } else {
+            WalletFile::default()
+        };
+        Ok(Self { path, file })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+            restrict(dir, 0o700);
+        }
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.file)?)?;
+        restrict(&tmp, 0o600);
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    pub fn balance_cents(&self, family: Family) -> i64 {
+        self.file
+            .vouchers
+            .iter()
+            .filter(|h| h.family == family)
+            .map(|h| h.voucher.denomination_cents)
+            .sum()
+    }
+
+    pub fn vouchers(&self) -> &[Held] {
+        &self.file.vouchers
+    }
+
+    pub fn add(&mut self, family: Family, vouchers: impl IntoIterator<Item = Voucher>) {
+        for voucher in vouchers {
+            if !self.file.vouchers.iter().any(|h| h.voucher == voucher) {
+                self.file.vouchers.push(Held { family, voucher });
+            }
+        }
+    }
+
+    /// Take vouchers of one family worth at least `cents` (or everything
+    /// there is, if less), largest first. They leave the wallet; put them
+    /// back with [`Wallet::add`] if they are not spent.
+    pub fn take(&mut self, family: Family, cents: i64) -> Vec<Voucher> {
+        let mut mine: Vec<usize> = (0..self.file.vouchers.len())
+            .filter(|&i| self.file.vouchers[i].family == family)
+            .collect();
+        mine.sort_by_key(|&i| std::cmp::Reverse(self.file.vouchers[i].voucher.denomination_cents));
+        let mut chosen = Vec::new();
+        let mut left = cents;
+        // Largest that fit first, then the smallest that covers what is left.
+        for &i in &mine {
+            let v = self.file.vouchers[i].voucher.denomination_cents;
+            if left > 0 && v <= left {
+                chosen.push(i);
+                left -= v;
+            }
+        }
+        if left > 0 {
+            if let Some(&i) = mine
+                .iter()
+                .rev()
+                .find(|&&i| !chosen.contains(&i) && self.file.vouchers[i].voucher.denomination_cents >= left)
+            {
+                chosen.push(i);
+                left = 0;
+            }
+        }
+        if left > 0 {
+            for &i in &mine {
+                if !chosen.contains(&i) {
+                    chosen.push(i);
+                }
+            }
+        }
+        chosen.sort_unstable_by(|a, b| b.cmp(a));
+        chosen
+            .into_iter()
+            .map(|i| self.file.vouchers.remove(i).voucher)
+            .collect()
+    }
+
+    /// Remove specific vouchers (already spent elsewhere).
+    pub fn forget(&mut self, codes: &[String]) {
+        self.file
+            .vouchers
+            .retain(|h| !codes.contains(&h.voucher.encode()));
+    }
+
+    pub fn pending(&self) -> &[Pending] {
+        &self.file.pending
+    }
+
+    pub fn push_pending(&mut self, pending: Pending) {
+        self.file.pending.push(pending);
+    }
+
+    pub fn finish_pending(&mut self, id: &str) {
+        self.file.pending.retain(|p| p.id != id);
+    }
+
+    pub fn sessions(&self) -> &[OpenSession] {
+        &self.file.sessions
+    }
+
+    pub fn remember_session(&mut self, session: OpenSession) {
+        self.file.sessions.push(session);
+    }
+
+    pub fn forget_session(&mut self, secret: &str) {
+        self.file.sessions.retain(|s| s.secret != secret);
+    }
+
+    pub fn pinned(&self) -> Option<&str> {
+        self.file.pinned.as_deref()
+    }
+
+    pub fn pin(&mut self, fingerprint: Option<String>) {
+        self.file.pinned = fingerprint;
+    }
+
+    /// Every voucher as text, for a backup.
+    pub fn export(&self) -> Vec<String> {
+        self.file.vouchers.iter().map(|h| h.voucher.encode()).collect()
+    }
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn restrict(_: &Path, _: u32) {}
