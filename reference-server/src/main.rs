@@ -2,7 +2,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use unlinkable_gateway::signer::KeyStore;
+use unlinkable_gateway::signer::{KeyStore, PassKey};
 
 /// Reference unlinkable-sessions server with an echo model and play money.
 /// `POST /test/accounts` makes an account; `GET /debug/db` dumps everything.
@@ -25,7 +25,11 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
-    let keys = KeyStore::all(args.keys_dir.as_deref())?;
+    let pass = match &args.keys_dir {
+        Some(dir) => PassKey::load_or_create(&dir.join("pass_master.pem"))?,
+        None => PassKey::from_pem(&PassKey::generate()?)?,
+    };
+    let keys = KeyStore::all(args.keys_dir.as_deref())?.with_pass_key(pass);
     let server = unlinkable_reference_server::build(
         keys,
         Duration::from_secs(args.idle_timeout_seconds),

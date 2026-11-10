@@ -12,6 +12,7 @@
 pub mod blank;
 pub mod denominations;
 pub mod keyset;
+pub mod pass;
 pub mod protocol;
 pub mod voucher;
 pub mod wallet;

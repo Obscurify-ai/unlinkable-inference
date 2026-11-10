@@ -23,10 +23,19 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use unlinkable_core::{
     denominations::{pick_blanks, WITHDRAW_SIZES},
-    keyset::{Keyset, VoucherKeyInfo, SCHEME},
+    keyset::{Keyset, PassKeyInfo, VoucherKeyInfo, SCHEME},
+    pass::{current_period, Pass, TIERS},
     protocol::*,
     Family, Voucher,
 };
+
+/// A pass being used to open a session.
+#[derive(Debug, Clone)]
+pub struct PassUse {
+    pub hash: String,
+    pub tier: String,
+    pub period: String,
+}
 
 /// One voucher being spent: the hash of its message and its value.
 #[derive(Debug, Clone)]
@@ -130,14 +139,44 @@ pub trait Backend: Send + Sync + 'static {
     async fn enabled(&self) -> bool {
         true
     }
-    /// Spend `spends` and open a session holding their total. If a session
-    /// with `secret_hash` exists, return its status and spend nothing.
+    /// The smallest total a session can be opened with, in cents.
+    async fn min_session_cents(&self) -> i64 {
+        10
+    }
+    /// Spend `spends` (and `pass`, if given: answer 409 `pass_spent` if it was
+    /// used before) and open a session holding their total, with the pass's
+    /// tier. If a session with `secret_hash` exists, return its status and
+    /// spend nothing.
     async fn open_session(
         &self,
         secret_hash: &str,
         family: Family,
         spends: &[Spend],
+        pass: Option<&PassUse>,
     ) -> Result<SessionStatus, GatewayError>;
+    /// The tier and the passes left this month for the account `account_token`
+    /// authenticates.
+    async fn pass_allowance(
+        &self,
+        account_token: &str,
+        period: &str,
+    ) -> Result<PassAllowance, GatewayError> {
+        let _ = (account_token, period);
+        Err(GatewayError::unavailable())
+    }
+    /// Count `count` passes against the account's monthly allowance and record
+    /// `answer` under `request_digest`, atomically; a repeat with the same
+    /// digest gets the stored answer.
+    async fn record_passes(
+        &self,
+        account_token: &str,
+        count: i64,
+        request_digest: &str,
+        answer: &PassResponse,
+    ) -> Result<PassResponse, GatewayError> {
+        let _ = (account_token, count, request_digest, answer);
+        Err(GatewayError::unavailable())
+    }
     async fn topup(
         &self,
         secret_hash: &str,
@@ -176,6 +215,15 @@ pub trait Backend: Send + Sync + 'static {
 pub trait Signer: Send + Sync + 'static {
     fn public_keys(&self, family: Family) -> Vec<VoucherKeyInfo>;
     fn sign_blinded(&self, family: Family, cents: i64, blinded: &[u8]) -> anyhow::Result<Vec<u8>>;
+    /// The pass master key, if this server issues passes.
+    fn pass_key(&self) -> Option<PassKeyInfo> {
+        None
+    }
+    /// Sign a blinded pass for `tier` in `period`.
+    fn sign_pass(&self, tier: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let _ = (tier, period, blinded);
+        anyhow::bail!("this server does not issue passes")
+    }
 }
 
 pub struct Gateway {
@@ -190,6 +238,7 @@ impl Gateway {
             scheme: SCHEME.to_string(),
             paid: signer.public_keys(Family::Paid),
             promo: signer.public_keys(Family::Promo),
+            pass_key: signer.pass_key(),
         };
         Arc::new(Self {
             backend,
@@ -305,6 +354,104 @@ impl Gateway {
     }
 }
 
+impl Gateway {
+    /// A pass that opens a session: valid signature, this month.
+    fn check_pass(&self, code: &str) -> Result<PassUse, GatewayError> {
+        let pass = Pass::parse(code).ok_or_else(|| GatewayError::bad_request("That is not a pass."))?;
+        if pass.period != current_period() {
+            return Err(GatewayError::bad_request(format!(
+                "That pass is for {}; passes work in their own month.",
+                pass.period
+            )));
+        }
+        if !unlinkable_core::pass::verify(&self.keyset, &pass) {
+            return Err(GatewayError::bad_request("That pass has no valid signature."));
+        }
+        Ok(PassUse {
+            hash: pass.spent_hash(),
+            tier: pass.tier,
+            period: pass.period,
+        })
+    }
+}
+
+fn account_token(headers: &HeaderMap) -> Result<String, GatewayError> {
+    bearer(headers)
+        .filter(|t| !t.starts_with(unlinkable_core::SESSION_SECRET_PREFIX))
+        .ok_or_else(|| {
+            GatewayError::Status(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Send the account's API key.".into(),
+            )
+        })
+}
+
+async fn pass_allowance(State(gw): Gw, headers: HeaderMap) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        if gw.keyset.pass_key.is_none() {
+            return Err(GatewayError::unavailable());
+        }
+        gw.backend
+            .pass_allowance(&account_token(&headers)?, &current_period())
+            .await
+    };
+    respond(run.await, &[])
+}
+
+async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        if gw.keyset.pass_key.is_none() {
+            return Err(GatewayError::unavailable());
+        }
+        let token = account_token(&headers)?;
+        if req.blinded.is_empty() || req.blinded.len() > 100 {
+            return Err(GatewayError::bad_request("Ask for between 1 and 100 passes."));
+        }
+        if !TIERS.contains(&req.tier.as_str()) || req.period != current_period() {
+            return Err(GatewayError::bad_request("Ask for passes for this month."));
+        }
+        let mut digest = format!("passes|{}|{}", req.tier, req.period);
+        for b in &req.blinded {
+            digest.push('|');
+            digest.push_str(b);
+        }
+        let digest = unlinkable_core::sha256_hex(digest);
+        let allowance = gw.backend.pass_allowance(&token, &req.period).await?;
+        if allowance.tier != req.tier {
+            return Err(GatewayError::Status(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                format!("This account gets {} passes.", allowance.tier),
+            ));
+        }
+        // Signing first is safe: nothing counts until record_passes checks the
+        // allowance and stores the answer in one step.
+        let mut signatures = Vec::with_capacity(req.blinded.len());
+        for b in &req.blinded {
+            let blinded = unlinkable_core::unb64(b)
+                .ok_or_else(|| GatewayError::bad_request("Invalid blinded pass."))?;
+            let sig = gw
+                .signer
+                .sign_pass(&req.tier, &req.period, &blinded)
+                .map_err(|e| GatewayError::bad_request(format!("Cannot sign that pass: {e}")))?;
+            signatures.push(unlinkable_core::b64(sig));
+        }
+        let answer = PassResponse {
+            tier: req.tier.clone(),
+            period: req.period.clone(),
+            blind_signatures: signatures,
+            remaining: 0,
+        };
+        gw.backend
+            .record_passes(&token, req.blinded.len() as i64, &digest, &answer)
+            .await
+    };
+    respond(run.await, &[])
+}
+
 /// Digest of a request's blanks, so a repeat is recognised.
 fn blanks_digest(kind: &str, blanks: &[BlindedVoucher]) -> String {
     let mut text = kind.to_string();
@@ -368,8 +515,24 @@ async fn open(State(gw): Gw, Json(req): Json<OpenSessionRequest>) -> Response {
             return Err(GatewayError::bad_request("secret_hash must be SHA-256 hex."));
         }
         let (family, spends) = gw.spends(&req.vouchers)?;
+        let total: i64 = spends.iter().map(|s| s.cents).sum();
+        let min = gw.backend.min_session_cents().await;
+        if total < min {
+            return Err(GatewayError::bad_request(format!(
+                "A session needs at least {min}¢ of vouchers."
+            )));
+        }
+        let pass = match &req.pass {
+            Some(code) => Some(gw.check_pass(code)?),
+            None => None,
+        };
         gw.backend
-            .open_session(&req.secret_hash.to_ascii_lowercase(), family, &spends)
+            .open_session(
+                &req.secret_hash.to_ascii_lowercase(),
+                family,
+                &spends,
+                pass.as_ref(),
+            )
             .await
     };
     respond(run.await, &req.vouchers)
@@ -494,5 +657,6 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/u/sessions/close", post(close))
         .route("/u/exchange", post(exchange))
         .route("/u/withdraw", post(withdraw))
+        .route("/u/passes", get(pass_allowance).post(passes))
         .with_state(gateway)
 }

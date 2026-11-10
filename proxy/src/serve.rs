@@ -395,7 +395,9 @@ impl Proxy {
     }
 
     async fn status_json(&self) -> Value {
-        let wallet = self.wallet.lock().await;
+        let mut wallet = self.wallet.lock().await;
+        let period = unlinkable_core::pass::current_period();
+        let passes = wallet.passes(&period);
         let sessions: Vec<Value> = self
             .sessions
             .lock()
@@ -427,6 +429,8 @@ impl Proxy {
                 "paid_cents": wallet.balance_cents(Family::Paid),
                 "promo_cents": wallet.balance_cents(Family::Promo),
                 "vouchers": wallet.vouchers().len(),
+                "passes": passes.len(),
+                "pass_tier": passes.first().map(|p| p.tier.clone()),
             },
             "settings": {
                 "session_funding_cents": self.settings.funding_cents,
@@ -440,6 +444,11 @@ impl Proxy {
     async fn withdraw(&self, api_key: &str, cents: i64) -> Result<i64> {
         let mut wallet = self.wallet.lock().await;
         self.client.withdraw(&mut wallet, api_key, cents).await
+    }
+
+    async fn passes(&self, api_key: &str, count: i64) -> Result<usize> {
+        let mut wallet = self.wallet.lock().await;
+        self.client.get_passes(&mut wallet, api_key, count).await
     }
 
     async fn import(&self, codes: &[String]) -> Result<i64> {
@@ -594,6 +603,14 @@ async fn control(proxy: &Proxy, method: &str, path: &str, headers: &HeaderMap, b
                 Err(e) => text(StatusCode::BAD_REQUEST, &format!("{e:#}")),
             }
         }
+        ("POST", "/_unlinkable/passes") => {
+            let count = body["count"].as_i64().unwrap_or(30);
+            let key = body["api_key"].as_str().unwrap_or("");
+            match proxy.passes(key, count).await {
+                Ok(n) => Json(json!({"got": n})).into_response(),
+                Err(e) => text(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+            }
+        }
         ("POST", "/_unlinkable/import") => {
             let codes: Vec<String> = body["vouchers"]
                 .as_array()
@@ -659,6 +676,7 @@ button{background:#2d4f7c;border-color:#3d6aa5}
 <div class="dock">
 <input id="key" placeholder="account API key" size="18">
 <select id="amt"><option value="100">$1</option><option value="500" selected>$5</option><option value="2000">$20</option><option value="5000">$50</option><option value="10000">$100</option></select>
+<button onclick="passes()">Get passes</button>
 <button onclick="withdraw()">Withdraw into wallet</button>
 </div>
 <script>
@@ -669,13 +687,18 @@ async function load(){
  const s=await (await fetch('/_unlinkable/status')).json();
  $('summary').innerHTML=`Server <code>${esc(s.server)}</code><br>`+
   `The server sees your IP address unless Tor or a VPN hides it. It never sees your account or how you paid.`+
-  `<br>Keyset <code>${esc(s.keyset)}</code><br>Wallet ${usd(s.wallet.paid_cents)} paid, ${usd(s.wallet.promo_cents)} promo, in ${s.wallet.vouchers} vouchers`;
+  `<br>Keyset <code>${esc(s.keyset)}</code><br>Wallet ${usd(s.wallet.paid_cents)} paid, ${usd(s.wallet.promo_cents)} promo, in ${s.wallet.vouchers} vouchers`+
+  `<br>Passes this month: ${s.wallet.passes}${s.wallet.pass_tier?' ('+esc(s.wallet.pass_tier)+')':''}. Each new conversation uses one, so it gets your plan's models.`;
  $('sessions').innerHTML=s.sessions.length?s.sessions.map(x=>`${x.requests} request${x.requests==1?'':'s'}, open ${x.age_seconds}s, idle ${x.idle_seconds}s`).join('<br>'):'None. Sessions close after '+s.settings.idle_close_seconds+'s without a request; change goes back to the wallet.';
  $('traffic').innerHTML=s.traffic.map(t=>`<tr><td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><span class="server">server sees</span> ${esc(t.server_sees)}</td></tr>`).join('')||'<tr><td>Nothing sent yet.</td></tr>';
 }
 async function withdraw(){
  const r=await fetch('/_unlinkable/withdraw',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),amount_cents:+$('amt').value})});
  const j=await r.json(); alert(r.ok?'Added '+usd(j.withdrawn_cents)+' to the wallet':j.error.message); $('key').value=''; load();
+}
+async function passes(){
+ const r=await fetch('/_unlinkable/passes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),count:30})});
+ const j=await r.json(); alert(r.ok?'Got '+j.got+' passes':j.error.message); $('key').value=''; load();
 }
 load(); setInterval(load,4000);
 </script></body></html>"#;

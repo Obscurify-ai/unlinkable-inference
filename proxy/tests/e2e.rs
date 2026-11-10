@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unlinkable_core::{Family, Wallet};
-use unlinkable_gateway::signer::KeyStore;
+use unlinkable_gateway::signer::{KeyStore, PassKey};
 use unlinkable_proxy::serve::{Proxy, Settings};
 use unlinkable_proxy::{connect, Options};
 
@@ -26,7 +26,9 @@ async fn listen() -> (tokio::net::TcpListener, String) {
 }
 
 async fn start_stack() -> Stack {
-    let keys = KeyStore::new(&VALUES, None).unwrap();
+    // A fixed test pass key: generating one (safe primes) takes seconds.
+    let pass = PassKey::from_pem(include_str!("../../reference-server/testdata/test_pass_key.pem")).unwrap();
+    let keys = KeyStore::new(&VALUES, None).unwrap().with_pass_key(pass);
     let ref_server = unlinkable_reference_server::build(keys, Duration::from_secs(3600));
     let backend = ref_server.backend.clone();
     let (l, server) = listen().await;
@@ -49,9 +51,13 @@ fn rand_id() -> String {
 }
 
 async fn new_account(server: &str, cents: i64) -> String {
+    new_account_on(server, cents, "pay_as_you_go").await
+}
+
+async fn new_account_on(server: &str, cents: i64, tier: &str) -> String {
     let v: Value = reqwest::Client::new()
         .post(format!("{server}/test/accounts"))
-        .json(&json!({"balance_cents": cents}))
+        .json(&json!({"balance_cents": cents, "tier": tier}))
         .send()
         .await
         .unwrap()
@@ -238,7 +244,7 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
         let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
         assert_eq!(
             keys,
-            ["balance_usd", "closed_at", "family", "funded_cents", "opened_at", "secret_hash"],
+            ["balance_usd", "closed_at", "family", "funded_cents", "opened_at", "secret_hash", "tier"],
             "a session row holds nothing about who opened it"
         );
     }
@@ -321,4 +327,108 @@ async fn lost_answers_are_retried_safely_and_spent_vouchers_are_dropped() {
     assert_eq!(recovered, 100);
     assert_eq!(wallet.balance_cents(Family::Paid), 100);
     assert!(wallet.sessions().is_empty());
+}
+
+async fn chat(url: &str, model: &str, text: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{url}/v1/chat/completions"))
+        .json(&json!({"model": model, "messages": [{"role": "user", "content": text}]}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_gives_a_session_the_plan_models_without_naming_the_account() {
+    let stack = start_stack().await;
+    let pro = new_account_on(&stack.server, 2_000, "pro").await;
+    let opts = Options {
+        server: stack.server.clone(),
+        wallet: Some(temp_wallet()),
+        pins: Vec::new(),
+    };
+    let period = unlinkable_core::pass::current_period();
+    {
+        let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
+        let client = connect(&opts, &mut wallet).await.unwrap();
+        client.withdraw(&mut wallet, &pro, 500).await.unwrap();
+        // Asking for more than the month allows gets what is left.
+        let got = client.get_passes(&mut wallet, &pro, 3).await.unwrap();
+        assert_eq!(got, 3);
+        let got = client.get_passes(&mut wallet, &pro, 100).await.unwrap();
+        assert_eq!(got as i64, unlinkable_reference_server::PASSES_PER_MONTH - 3);
+        assert_eq!(client.get_passes(&mut wallet, &pro, 1).await.unwrap(), 0);
+        assert_eq!(wallet.passes(&period).len() as i64, unlinkable_reference_server::PASSES_PER_MONTH);
+        assert!(wallet.passes(&period).iter().all(|p| p.tier == "pro"));
+
+        // A pass opens one session. Putting a used one back (an old backup)
+        // gets it refused; the client drops it and uses the next one.
+        let before = wallet.passes(&period);
+        let session = client.open(&mut wallet, Family::Paid, 50).await.unwrap();
+        assert_eq!(client.status(&session).await.unwrap().tier.as_deref(), Some("pro"));
+        client.close(&mut wallet, &session).await.unwrap();
+        let after = wallet.passes(&period);
+        let spent: Vec<_> = before.into_iter().filter(|p| !after.contains(p)).collect();
+        assert_eq!(spent.len(), 1);
+        // Put the spent pass back, as if from an old backup, and make it the
+        // only one: the server refuses it and the session opens without a pass.
+        let mut solo = Wallet::open(temp_wallet()).unwrap();
+        solo.add(Family::Paid, wallet.take(Family::Paid, 50));
+        solo.add_passes(spent.clone());
+        let session = client.open(&mut solo, Family::Paid, 50).await.unwrap();
+        assert!(solo.passes(&period).is_empty(), "the spent pass was dropped");
+        assert_eq!(client.status(&session).await.unwrap().tier, None);
+        client.close(&mut solo, &session).await.unwrap();
+        wallet.add(Family::Paid, solo.take(Family::Paid, 1000));
+        assert_eq!(stack.backend.dump()["spent_passes"].as_array().unwrap().len(), 1);
+        wallet.save().unwrap();
+    }
+
+    let (proxy, url) = start_proxy(&opts, Settings::default()).await;
+    // A Pro-only model works in a session opened with a Pro pass.
+    let resp = chat(&url, "echo-pro", "plan model please").await;
+    assert_eq!(resp.status(), 200);
+    let st = status(&url).await;
+    assert_eq!(st["wallet"]["passes"], unlinkable_reference_server::PASSES_PER_MONTH - 2);
+    proxy.close_all().await;
+
+    // A pass works once.
+    let db = stack.backend.dump();
+    assert_eq!(db["spent_passes"].as_array().unwrap().len(), 2);
+    let tiers: Vec<&Value> = db["sessions"].as_array().unwrap().iter().map(|s| &s["tier"]).collect();
+    assert_eq!(tiers.iter().filter(|t| **t == "pro").count(), 2);
+    // The account row records how many passes it got, nothing about which
+    // sessions used them; the session row records the tier, nothing else.
+    let account_hash = unlinkable_core::sha256_hex(&pro);
+    assert_eq!(db.to_string().matches(&account_hash).count(), 2);
+    for p in db["spent_passes"].as_array().unwrap() {
+        let hash = p["hash"].as_str().unwrap();
+        assert_eq!(db.to_string().matches(hash).count(), 1, "a spent pass appears nowhere else");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_pass_plan_models_are_refused_and_tiny_sessions_are_too() {
+    let stack = start_stack().await;
+    let payg = new_account(&stack.server, 1_000).await;
+    let opts = Options {
+        server: stack.server.clone(),
+        wallet: Some(temp_wallet()),
+        pins: Vec::new(),
+    };
+    let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
+    let client = connect(&opts, &mut wallet).await.unwrap();
+    client.withdraw(&mut wallet, &payg, 100).await.unwrap();
+
+    // A session must hold at least 10¢: one of 5¢ is refused, and the
+    // vouchers come back.
+    let err = client.open(&mut wallet, Family::Paid, 5).await.unwrap_err();
+    assert!(err.to_string().contains("at least 10¢"), "{err}");
+    assert_eq!(wallet.balance_cents(Family::Paid), 100);
+
+    wallet.save().unwrap();
+    drop(wallet);
+    let (_proxy, url) = start_proxy(&opts, Settings { funding_cents: 20, ..Settings::default() }).await;
+    assert_eq!(chat(&url, "echo-pro", "x").await.status(), 403);
+    assert_eq!(chat(&url, "echo", "x").await.status(), 200);
 }

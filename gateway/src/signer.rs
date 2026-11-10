@@ -3,6 +3,12 @@
 //! their own [`crate::Signer`] instead.
 
 use crate::Signer;
+use blind_rsa_signatures::pbrsa::{
+    PartiallyBlindKeyPairSha384PSSDeterministic as PassKeyPair,
+    PartiallyBlindSecretKeySha384PSSDeterministic as PassSecretKey,
+};
+use std::sync::Mutex;
+use unlinkable_core::keyset::PassKeyInfo;
 use blind_rsa_signatures::{DefaultRng, KeyPairSha384PSSDeterministic, SecretKeySha384PSSDeterministic};
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,6 +16,71 @@ use unlinkable_core::{keyset::VoucherKeyInfo, Family, DENOMINATIONS};
 
 pub struct KeyStore {
     keys: HashMap<(Family, i64), (VoucherKeyInfo, KeyPairSha384PSSDeterministic)>,
+    pass: Option<PassKey>,
+}
+
+/// The pass master key (partially blind RSA, safe primes) and the per-month,
+/// per-tier keys derived from it.
+pub struct PassKey {
+    master: PassKeyPair,
+    info: PassKeyInfo,
+    derived: Mutex<HashMap<Vec<u8>, PassSecretKey>>,
+}
+
+impl PassKey {
+    pub fn from_pem(pem: &str) -> anyhow::Result<Self> {
+        let sk = PassSecretKey::from_pem(pem).map_err(|e| anyhow::anyhow!("pass key: {e}"))?;
+        let pk = sk.public_key().map_err(|e| anyhow::anyhow!("pass key: {e}"))?;
+        let der = pk.to_der().map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self {
+            master: PassKeyPair { pk, sk },
+            info: PassKeyInfo::new(&der),
+            derived: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Generate a new master key (safe primes: several seconds).
+    pub fn generate() -> anyhow::Result<String> {
+        let kp = PassKeyPair::generate(&mut DefaultRng, 2048)
+            .map_err(|e| anyhow::anyhow!("pass key generation failed: {e}"))?;
+        kp.sk.to_pem().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Load from `path`, creating it on first start.
+    pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
+        if !path.exists() {
+            tracing::warn!(path = %path.display(), "Creating a pass master key (takes a few seconds); back it up");
+            let pem = Self::generate()?;
+            std::fs::write(path, &pem)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Self::from_pem(&std::fs::read_to_string(path)?)
+    }
+
+    pub fn info(&self) -> PassKeyInfo {
+        self.info.clone()
+    }
+
+    pub fn sign(&self, tier: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(blinded.len() == 256, "blinded pass has the wrong length");
+        let meta = unlinkable_core::pass::metadata(tier, period);
+        let mut cache = self.derived.lock().unwrap();
+        if !cache.contains_key(&meta) {
+            let sk = self
+                .master
+                .derive_secret_key_for_metadata(&meta)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            cache.insert(meta.clone(), sk);
+        }
+        Ok(cache[&meta]
+            .blind_sign(blinded)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .0)
+    }
 }
 
 fn generate() -> anyhow::Result<KeyPairSha384PSSDeterministic> {
@@ -62,7 +133,13 @@ impl KeyStore {
             let der = pair.pk.to_der().map_err(|e| anyhow::anyhow!("{e}"))?;
             keys.insert((family, cents), (VoucherKeyInfo::new(cents, &der), pair));
         }
-        Ok(Self { keys })
+        Ok(Self { keys, pass: None })
+    }
+
+    /// Also issue passes, signed with this master key.
+    pub fn with_pass_key(mut self, pass: PassKey) -> Self {
+        self.pass = Some(pass);
+        self
     }
 
     /// Every value from 1¢ to $5,000.
@@ -94,5 +171,16 @@ impl Signer for KeyStore {
             .blind_sign(blinded)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .0)
+    }
+
+    fn pass_key(&self) -> Option<PassKeyInfo> {
+        self.pass.as_ref().map(PassKey::info)
+    }
+
+    fn sign_pass(&self, tier: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.pass
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no pass key"))?
+            .sign(tier, period, blinded)
     }
 }

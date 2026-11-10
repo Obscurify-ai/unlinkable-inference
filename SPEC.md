@@ -38,7 +38,8 @@ seen.
 ```json
 {"scheme": "RSABSSA-SHA384-PSS-Deterministic",
  "paid":  [{"denomination_cents": 1, "key_id": "…", "public_key_der": "…"}, …],
- "promo": […]}
+ "promo": […],
+ "pass_key": {"key_id": "…", "public_key_der": "…"}}
 ```
 
 Its **fingerprint** is `ks1-` + the first 32 hex characters of SHA-256 of the
@@ -61,8 +62,10 @@ None of them reads a cookie or stores an IP. Errors are
 | `POST /u/sessions/close` | session | `{"blanks": [blanks]}` | change |
 | `POST /u/exchange` | none | `{"vouchers": [codes], "blanks": [blanks]}` | change |
 | `POST /u/withdraw` | account API key | `{"amount_cents", "blanks": [blanks]}` | change |
+| `GET /u/passes` | account API key | | `{"tier", "period", "remaining"}` |
+| `POST /u/passes` | account API key | `{"tier", "period", "blinded": [b64]}` | `{"tier", "period", "blind_signatures", "remaining"}` |
 
-- **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed"}`.
+- **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed", "tier"?}`.
 - **Change**: `{"change_cents", "family", "signed": [{"index", "blind_signature"}], "forfeited_usd"}`;
   `index` points into the request's `blanks`.
 - **Session auth**: `Authorization: Bearer sk-unl1_<32 random bytes>`. The
@@ -71,10 +74,13 @@ None of them reads a cookie or stores an IP. Errors are
 
 Rules:
 
-- **Open** spends every voucher or none. Vouchers must share a family and not
+- **Open** needs at least the server's minimum (10¢ by default) and spends
+  every voucher or none. Vouchers must share a family and not
   repeat; up to 64. If any were spent before: 409 with `spent` = their indexes,
   and nothing is spent. A repeat open with the same `secret_hash` returns the
-  existing session and spends nothing.
+  existing session and spends nothing. With `"pass"`, the session gets the
+  pass's tier (its plan's models); a pass opens one session (409
+  `pass_spent` after that) and only in its own month.
 - **Close** signs the blanks that make up the standard split (largest first,
   1-2-5 steps) of the whole cents left; fractions of a cent are forfeited. So
   the client sends blanks able to hold any amount up to the balance: per power
@@ -86,3 +92,25 @@ Rules:
   for stays in the account). A repeat with the same blanks gets the same answer.
 - Sessions refuse model requests after `idle_timeout_seconds` without one but
   can still be closed for a grace period (Obscurify: 7 days).
+
+## Passes
+
+A pass proves "this session's holder has plan X this month" without saying
+which account. It is a partially blind RSA signature
+(draft-irtf-cfrg-partially-blind-rsa, SHA-384, PSS, deterministic) under the
+keyset's `pass_key`, with public metadata `unlinkable-pass:v1:<tier>:<YYYY-MM>`;
+the client blinds against the key derived for that metadata. Tiers:
+`pay_as_you_go`, `casual`, `pro`. Text form:
+`obp1.<tier>.<YYYY-MM>.<message>.<signature>`, message 32 random bytes; spent
+as SHA-256(message).
+
+An account asks with its API key for passes at its own tier, for the current
+month, up to a monthly allowance set by the server. The server learns how many
+passes an account took, never which sessions used them. A repeat request with
+the same blinded messages gets the same answer.
+
+## Abuse limits
+
+Servers should rate-limit `/u/*` per client address (Obscurify: in memory,
+per hour) and may set a higher session minimum. Neither involves storing the
+address.

@@ -19,6 +19,9 @@ pub struct OpenSessionRequest {
     /// SHA-256 (hex) of a session secret the client picked. The secret itself
     /// is only ever sent as the bearer token on later requests.
     pub secret_hash: String,
+    /// A pass (`obp1.…`) for this month: the session gets that tier's models
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,37 @@ pub struct SessionStatus {
     /// The session stops working after this long without a request
     pub idle_timeout_seconds: u64,
     pub closed: bool,
+    /// The plan tier a pass gave this session, if any
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+}
+
+/// `POST /u/passes` (bearer: the account's own API key): blind passes for
+/// this month at the account's tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PassRequest {
+    pub tier: String,
+    pub period: String,
+    /// base64url blinded messages
+    pub blinded: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PassResponse {
+    pub tier: String,
+    pub period: String,
+    /// Blind signatures, in request order (base64url)
+    pub blind_signatures: Vec<String>,
+    /// Passes this account can still get this month
+    pub remaining: i64,
+}
+
+/// `GET /u/passes` (bearer: account key): what the account may ask for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PassAllowance {
+    pub tier: String,
+    pub period: String,
+    pub remaining: i64,
 }
 
 /// `POST /u/sessions/topup` (bearer: session secret)

@@ -21,12 +21,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use unlinkable_core::protocol::{ChangeResponse, SessionStatus};
+use unlinkable_core::protocol::{ChangeResponse, PassAllowance, PassResponse, SessionStatus};
 use unlinkable_core::{sha256_hex, Family};
 use unlinkable_gateway::{
     signer::KeyStore,
-    Backend, Gateway, GatewayError, SignChange, Spend,
+    Backend, Gateway, GatewayError, PassUse, SignChange, Spend,
 };
+
+/// Passes each account gets per month.
+pub const PASSES_PER_MONTH: i64 = 10;
 
 /// Balances are kept in nanodollars (1e-9 USD).
 const NANO_PER_CENT: i64 = 10_000_000;
@@ -51,6 +54,7 @@ struct SessionRow {
     family: Family,
     funded_cents: i64,
     balance_nano: i64,
+    tier: Option<String>,
     opened_at: u64,
     closed_at: Option<u64>,
     #[serde(skip)]
@@ -62,6 +66,9 @@ struct SessionRow {
 #[derive(Debug, Clone, Serialize)]
 struct AccountRow {
     balance_cents: i64,
+    tier: String,
+    /// Passes issued per month
+    passes: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +94,8 @@ pub struct RequestRow {
 #[derive(Default)]
 struct Db {
     spent: HashMap<String, u64>,
+    spent_passes: HashMap<String, u64>,
+    pass_answers: HashMap<String, PassResponse>,
     sessions: HashMap<String, SessionRow>,
     accounts: HashMap<String, AccountRow>,
     answers: HashMap<String, ChangeResponse>,
@@ -114,6 +123,7 @@ impl MemoryBackend {
             family: row.family,
             idle_timeout_seconds: self.idle_timeout.as_secs(),
             closed: row.closed_at.is_some(),
+            tier: row.tier.clone(),
         }
     }
 
@@ -134,7 +144,8 @@ impl MemoryBackend {
     }
 
     /// A usable session for a model request: open and not idle too long.
-    fn usable(&self, secret_hash: &str) -> Result<(), GatewayError> {
+    /// Returns the tier its pass gave it.
+    fn usable(&self, secret_hash: &str) -> Result<Option<String>, GatewayError> {
         let mut db = self.db.lock().unwrap();
         let row = db
             .sessions
@@ -149,7 +160,7 @@ impl MemoryBackend {
             ));
         }
         row.last_used = Instant::now();
-        Ok(())
+        Ok(row.tier.clone())
     }
 
     fn charge(&self, secret_hash: &str, nano: i64) {
@@ -158,13 +169,16 @@ impl MemoryBackend {
         }
     }
 
-    pub fn create_account(&self, balance_cents: i64) -> String {
+    pub fn create_account(&self, balance_cents: i64, tier: &str) -> String {
         let token = format!("sk-test_{}", unlinkable_core::b64(rand::random::<[u8; 18]>()));
-        self.db
-            .lock()
-            .unwrap()
-            .accounts
-            .insert(sha256_hex(&token), AccountRow { balance_cents });
+        self.db.lock().unwrap().accounts.insert(
+            sha256_hex(&token),
+            AccountRow {
+                balance_cents,
+                tier: tier.to_string(),
+                passes: HashMap::new(),
+            },
+        );
         token
     }
 
@@ -186,11 +200,12 @@ impl MemoryBackend {
         let db = self.db.lock().unwrap();
         json!({
             "spent_vouchers": db.spent.iter().map(|(h, at)| json!({"hash": h, "at": at})).collect::<Vec<_>>(),
+            "spent_passes": db.spent_passes.iter().map(|(h, at)| json!({"hash": h, "at": at})).collect::<Vec<_>>(),
             "sessions": db.sessions.iter().map(|(h, s)| json!({
-                "secret_hash": h, "family": s.family, "funded_cents": s.funded_cents,
+                "secret_hash": h, "family": s.family, "funded_cents": s.funded_cents, "tier": s.tier,
                 "balance_usd": usd(s.balance_nano), "opened_at": s.opened_at, "closed_at": s.closed_at,
             })).collect::<Vec<_>>(),
-            "accounts": db.accounts.iter().map(|(h, a)| json!({"token_hash": h, "balance_cents": a.balance_cents})).collect::<Vec<_>>(),
+            "accounts": db.accounts.iter().map(|(h, a)| json!({"token_hash": h, "balance_cents": a.balance_cents, "tier": a.tier, "passes_issued": a.passes})).collect::<Vec<_>>(),
             "withdrawals": db.withdrawals,
             "signed_change": db.signed_change.iter().map(|(at, h)| json!({"at": at, "blinded_hashes": h})).collect::<Vec<_>>(),
             "requests": db.requests,
@@ -213,16 +228,30 @@ impl Backend for MemoryBackend {
         secret_hash: &str,
         family: Family,
         spends: &[Spend],
+        pass: Option<&PassUse>,
     ) -> Result<SessionStatus, GatewayError> {
         let mut db = self.db.lock().unwrap();
         if let Some(row) = db.sessions.get(secret_hash) {
             return Ok(self.status_of(row));
         }
+        if let Some(p) = pass {
+            if db.spent_passes.contains_key(&p.hash) {
+                return Err(GatewayError::Status(
+                    StatusCode::CONFLICT,
+                    "pass_spent",
+                    "That pass was used already.".into(),
+                ));
+            }
+        }
         let cents = Self::spend(&mut db, spends)?;
+        if let Some(p) = pass {
+            db.spent_passes.insert(p.hash.clone(), unix());
+        }
         let row = SessionRow {
             family,
             funded_cents: cents,
             balance_nano: cents * NANO_PER_CENT,
+            tier: pass.map(|p| p.tier.clone()),
             opened_at: unix(),
             closed_at: None,
             last_used: Instant::now(),
@@ -316,6 +345,54 @@ impl Backend for MemoryBackend {
         db.answers
             .insert(request_digest.to_string(), answer.clone());
         Ok(answer.clone())
+    }
+
+    async fn pass_allowance(
+        &self,
+        account_token: &str,
+        period: &str,
+    ) -> Result<PassAllowance, GatewayError> {
+        let db = self.db.lock().unwrap();
+        let account = db
+            .accounts
+            .get(&sha256_hex(account_token))
+            .ok_or_else(GatewayError::unauthorized)?;
+        Ok(PassAllowance {
+            tier: account.tier.clone(),
+            period: period.to_string(),
+            remaining: PASSES_PER_MONTH - account.passes.get(period).copied().unwrap_or(0),
+        })
+    }
+
+    async fn record_passes(
+        &self,
+        account_token: &str,
+        count: i64,
+        request_digest: &str,
+        answer: &PassResponse,
+    ) -> Result<PassResponse, GatewayError> {
+        let mut db = self.db.lock().unwrap();
+        if let Some(previous) = db.pass_answers.get(request_digest) {
+            return Ok(previous.clone());
+        }
+        let account = db
+            .accounts
+            .get_mut(&sha256_hex(account_token))
+            .ok_or_else(GatewayError::unauthorized)?;
+        let issued = account.passes.entry(answer.period.clone()).or_insert(0);
+        if *issued + count > PASSES_PER_MONTH {
+            return Err(GatewayError::Status(
+                StatusCode::TOO_MANY_REQUESTS,
+                "pass_limit",
+                format!("{} passes left this month.", PASSES_PER_MONTH - *issued),
+            ));
+        }
+        *issued += count;
+        let mut answer = answer.clone();
+        answer.remaining = PASSES_PER_MONTH - *issued;
+        db.pass_answers
+            .insert(request_digest.to_string(), answer.clone());
+        Ok(answer)
     }
 
     async fn withdraw(
@@ -453,8 +530,12 @@ async fn chat(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value
     let Some(session) = session_of(&headers) else {
         return GatewayError::unauthorized().into_response();
     };
-    if let Err(e) = app.backend.usable(&session) {
-        return e.into_response();
+    let tier = match app.backend.usable(&session) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(refusal) = plan_check(&body, tier.as_deref()) {
+        return refusal;
     }
     let words = reply_words(&body);
     app.backend.charge(&session, price(&body, &words));
@@ -482,8 +563,12 @@ async fn messages(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
     let Some(session) = session_of(&headers) else {
         return GatewayError::unauthorized().into_response();
     };
-    if let Err(e) = app.backend.usable(&session) {
-        return e.into_response();
+    let tier = match app.backend.usable(&session) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(refusal) = plan_check(&body, tier.as_deref()) {
+        return refusal;
     }
     let words = reply_words(&body);
     app.backend.charge(&session, price(&body, &words));
@@ -509,10 +594,23 @@ async fn messages(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
     .into_response()
 }
 
+/// `echo-pro` stands in for a model that needs a plan: only sessions opened
+/// with a Pro pass may use it.
+fn plan_check(body: &Value, tier: Option<&str>) -> Option<Response> {
+    (body["model"] == "echo-pro" && tier != Some("pro")).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": {"message": "echo-pro needs a Pro pass", "type": "permission_error"}})),
+        )
+            .into_response()
+    })
+}
+
 async fn models() -> Json<Value> {
     Json(json!({"object": "list", "data": [
         {"id": "echo", "object": "model"},
         {"id": "echo-slow", "object": "model"},
+        {"id": "echo-pro", "object": "model"},
     ]}))
 }
 
@@ -520,6 +618,12 @@ async fn models() -> Json<Value> {
 struct NewAccount {
     #[serde(default = "default_balance")]
     balance_cents: i64,
+    #[serde(default = "default_tier")]
+    tier: String,
+}
+
+fn default_tier() -> String {
+    "pay_as_you_go".into()
 }
 
 fn default_balance() -> i64 {
@@ -528,8 +632,11 @@ fn default_balance() -> i64 {
 
 /// Test payment: an account with play money.
 async fn create_account(State(app): State<App>, Json(req): Json<NewAccount>) -> Json<Value> {
-    let token = app.backend.create_account(req.balance_cents);
-    Json(json!({"api_key": token, "balance_cents": req.balance_cents}))
+    if !unlinkable_core::pass::TIERS.contains(&req.tier.as_str()) {
+        return Json(json!({"error": {"message": "tier is pay_as_you_go, casual or pro"}}));
+    }
+    let token = app.backend.create_account(req.balance_cents, &req.tier);
+    Json(json!({"api_key": token, "balance_cents": req.balance_cents, "tier": req.tier}))
 }
 
 async fn account(State(app): State<App>, headers: HeaderMap) -> Response {

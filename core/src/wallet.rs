@@ -5,6 +5,7 @@
 //! written atomically with owner-only permissions.
 
 use crate::blank::Blank;
+use crate::pass::{Pass, PassBlank};
 use crate::voucher::{Family, Voucher};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,9 @@ pub struct Pending {
     pub vouchers: Vec<String>,
     #[serde(default)]
     pub amount_cents: i64,
+    /// For "passes": the blinded passes awaiting signatures
+    #[serde(default)]
+    pub pass_blanks: Vec<PassBlank>,
 }
 
 /// An open session, remembered so it can be closed after a restart.
@@ -50,6 +54,8 @@ struct WalletFile {
     pending: Vec<Pending>,
     #[serde(default)]
     sessions: Vec<OpenSession>,
+    #[serde(default)]
+    passes: Vec<Pass>,
     /// Keyset fingerprint pinned on first use (servers without built-in pins)
     #[serde(default)]
     pinned: Option<String>,
@@ -157,6 +163,34 @@ impl Wallet {
         self.file
             .vouchers
             .retain(|h| !codes.contains(&h.voucher.encode()));
+    }
+
+    pub fn add_passes(&mut self, passes: impl IntoIterator<Item = Pass>) {
+        for pass in passes {
+            if !self.file.passes.contains(&pass) {
+                self.file.passes.push(pass);
+            }
+        }
+    }
+
+    /// Unused passes for `period`; older ones are dropped (they no longer work).
+    pub fn passes(&mut self, period: &str) -> Vec<Pass> {
+        self.file.passes.retain(|p| p.period.as_str() >= period);
+        self.file
+            .passes
+            .iter()
+            .filter(|p| p.period == period)
+            .cloned()
+            .collect()
+    }
+
+    /// Take one pass for `period`, the highest tier first.
+    pub fn take_pass(&mut self, period: &str) -> Option<Pass> {
+        let rank = |t: &str| crate::pass::TIERS.iter().position(|x| *x == t).unwrap_or(0);
+        let i = (0..self.file.passes.len())
+            .filter(|&i| self.file.passes[i].period == period)
+            .max_by_key(|&i| rank(&self.file.passes[i].tier))?;
+        Some(self.file.passes.remove(i))
     }
 
     pub fn pending(&self) -> &[Pending] {

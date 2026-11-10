@@ -44,6 +44,8 @@ use Tor or a VPN, or at least withdraw from a different network.
   account into the wallet in fixed sizes.
 - **Chat → chat**: one session per conversation; turns within it are linked to
   each other only.
+- **Plan → chat**: passes. The server sees "a Pro session", never which Pro
+  account; the crowd is everyone on that plan that month.
 - **Tagging a user with a unique key**: keysets are pinned; `unlinkable verify`
   compares the keys the server gives you with your pins and the published pins.
 - **A website spending your wallet through the proxy**: the proxy refuses
@@ -67,7 +69,9 @@ use Tor or a VPN, or at least withdraw from a different network.
 - **Abuse controls**. The server cannot ban a person in this mode, only refuse
   a session.
 
-## Out of scope for v1
+## Passes leak the tier
 
-Free models and models that need a plan: these need a blind per-period pass,
-not built yet. Sessions cover pay-as-you-go models and paid tools.
+A session opened with a pass shows its tier. On a plan with few users, or with
+an unusual number of sessions a month, that narrows things. The allowance is
+the same for everyone on a plan, and clients use a pass for every session
+they open, so pass counts carry no more than "has this plan".

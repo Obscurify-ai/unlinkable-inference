@@ -31,6 +31,23 @@ impl VoucherKeyInfo {
     }
 }
 
+/// The master key passes are signed under (tier and month are metadata).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassKeyInfo {
+    pub key_id: String,
+    /// DER SubjectPublicKeyInfo, base64url
+    pub public_key_der: String,
+}
+
+impl PassKeyInfo {
+    pub fn new(der: &[u8]) -> Self {
+        Self {
+            key_id: key_id_for(der),
+            public_key_der: crate::b64(der),
+        }
+    }
+}
+
 pub fn key_id_for(der: &[u8]) -> String {
     crate::sha256_hex(der)[..16].to_string()
 }
@@ -41,6 +58,9 @@ pub struct Keyset {
     pub scheme: String,
     pub paid: Vec<VoucherKeyInfo>,
     pub promo: Vec<VoucherKeyInfo>,
+    /// Partially blind RSA master key for passes, if the server issues them
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_key: Option<PassKeyInfo>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +88,15 @@ impl Keyset {
     pub fn check(&self) -> Result<(), KeysetError> {
         if self.scheme != SCHEME {
             return Err(KeysetError::Scheme(self.scheme.clone()));
+        }
+        if let Some(pass) = &self.pass_key {
+            let der = crate::unb64(&pass.public_key_der).unwrap_or_default();
+            if key_id_for(&der) != pass.key_id {
+                return Err(KeysetError::BadKeyId {
+                    key_id: pass.key_id.clone(),
+                    cents: 0,
+                });
+            }
         }
         for key in self.paid.iter().chain(&self.promo) {
             let der = crate::unb64(&key.public_key_der).unwrap_or_default();

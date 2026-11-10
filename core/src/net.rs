@@ -7,6 +7,7 @@
 use crate::blank::Blank;
 use crate::denominations::{blanks_for_any_amount_up_to, split, WITHDRAW_SIZES};
 use crate::keyset::Keyset;
+use crate::pass::{Pass, PassBlank};
 use crate::protocol::*;
 use crate::voucher::{Family, Voucher};
 use crate::wallet::{OpenSession, Pending, Wallet};
@@ -297,9 +298,24 @@ impl Client {
     /// Open a session worth at least `cents` from the wallet.
     pub async fn open(&self, wallet: &mut Wallet, family: Family, cents: i64) -> Result<Session> {
         self.break_up(wallet, family, cents).await?;
+        let period = crate::pass::current_period();
         for _attempt in 0..3 {
+            // A pass, if we hold one for this month, gives the session our
+            // plan's models. It is spent with the session.
+            let pass = if self.keyset.pass_key.is_some() {
+                wallet.take_pass(&period)
+            } else {
+                None
+            };
+            let put_back = |wallet: &mut Wallet, pass: &Option<Pass>| {
+                if let Some(p) = pass {
+                    wallet.add_passes([p.clone()]);
+                }
+            };
             let vouchers = wallet.take(family, cents);
             if vouchers.is_empty() {
+                put_back(wallet, &pass);
+                wallet.save()?;
                 bail!(
                     "the wallet has no {} vouchers; withdraw or import some first",
                     family.as_str()
@@ -316,6 +332,7 @@ impl Client {
             let req = OpenSessionRequest {
                 vouchers: codes.clone(),
                 secret_hash: crate::sha256_hex(&secret),
+                pass: pass.as_ref().map(Pass::encode),
             };
             match self
                 .transport
@@ -326,7 +343,14 @@ impl Client {
                     wallet.save()?;
                     return Ok(Session { secret, family });
                 }
+                Err(ApiError::Server { status: 409, body }) if body.error.kind == "pass_spent" => {
+                    // That pass was used already: drop it, nothing else was spent.
+                    wallet.add(family, vouchers);
+                    wallet.forget_session(&secret);
+                    wallet.save()?;
+                }
                 Err(ApiError::Server { status: 409, body }) if !body.error.spent.is_empty() => {
+                    put_back(wallet, &pass);
                     // Some were spent already (another device, an old backup).
                     // Nothing was spent this time: drop those, keep the rest.
                     let spent: Vec<String> = body
@@ -341,6 +365,7 @@ impl Client {
                     wallet.save()?;
                 }
                 Err(e @ ApiError::Server { .. }) => {
+                    put_back(wallet, &pass);
                     wallet.add(family, vouchers);
                     wallet.forget_session(&secret);
                     wallet.save()?;
@@ -356,6 +381,7 @@ impl Client {
                     {
                         Ok(_) => return Ok(Session { secret, family }),
                         Err(_) => {
+                            put_back(wallet, &pass);
                             wallet.add(family, vouchers);
                             wallet.forget_session(&secret);
                             wallet.save()?;
@@ -415,6 +441,7 @@ impl Client {
             secret: Some(session.secret.clone()),
             vouchers: Vec::new(),
             amount_cents: 0,
+            pass_blanks: Vec::new(),
         });
         wallet.save()?;
         let change = self.close_with(&session.secret, &blanks).await?;
@@ -457,6 +484,7 @@ impl Client {
             secret: Some(api_key.to_string()),
             vouchers: Vec::new(),
             amount_cents: cents,
+            pass_blanks: Vec::new(),
         });
         wallet.save()?;
         let change = self.withdraw_with(api_key, cents, &blanks).await?;
@@ -510,6 +538,7 @@ impl Client {
             secret: None,
             vouchers: codes.clone(),
             amount_cents: total,
+            pass_blanks: Vec::new(),
         });
         wallet.save()?;
         match self.exchange_with(&codes, &blanks).await {
@@ -544,11 +573,100 @@ impl Client {
             .await?)
     }
 
+    /// How many passes the account can still get this month, at which tier.
+    pub async fn pass_allowance(&self, api_key: &str) -> Result<PassAllowance> {
+        Ok(self
+            .transport
+            .json(Request::get("/u/passes").bearer(api_key))
+            .await?)
+    }
+
+    /// Get up to `count` passes for this month into the wallet. Do it ahead
+    /// of time: the server sees when the account asks.
+    pub async fn get_passes(&self, wallet: &mut Wallet, api_key: &str, count: i64) -> Result<usize> {
+        let allowance = self.pass_allowance(api_key).await?;
+        let count = count.min(allowance.remaining).max(0);
+        if count == 0 {
+            return Ok(0);
+        }
+        let blanks: Vec<PassBlank> = (0..count)
+            .map(|_| PassBlank::new(&self.keyset, &allowance.tier, &allowance.period))
+            .collect::<Result<_>>()?;
+        let id = crate::new_session_secret();
+        wallet.push_pending(Pending {
+            id: id.clone(),
+            kind: "passes".into(),
+            blanks: Vec::new(),
+            secret: Some(api_key.to_string()),
+            vouchers: Vec::new(),
+            amount_cents: 0,
+            pass_blanks: blanks.clone(),
+        });
+        wallet.save()?;
+        let answer = self.passes_with(api_key, &blanks).await?;
+        let passes = self.finish_passes(&blanks, &answer)?;
+        let got = passes.len();
+        wallet.add_passes(passes);
+        wallet.finish_pending(&id);
+        wallet.save()?;
+        Ok(got)
+    }
+
+    async fn passes_with(&self, api_key: &str, blanks: &[PassBlank]) -> Result<PassResponse> {
+        let first = blanks.first().ok_or_else(|| anyhow!("no passes asked for"))?;
+        let req = PassRequest {
+            tier: first.tier.clone(),
+            period: first.period.clone(),
+            blinded: blanks.iter().map(|b| crate::b64(&b.blinded)).collect(),
+        };
+        Ok(self
+            .transport
+            .json(Request::post_json("/u/passes", &req).bearer(api_key))
+            .await?)
+    }
+
+    fn finish_passes(&self, blanks: &[PassBlank], answer: &PassResponse) -> Result<Vec<Pass>> {
+        anyhow::ensure!(
+            answer.blind_signatures.len() == blanks.len(),
+            "the server signed a different number of passes"
+        );
+        blanks
+            .iter()
+            .zip(&answer.blind_signatures)
+            .map(|(b, sig)| {
+                b.finish(
+                    &self.keyset,
+                    &crate::unb64(sig).ok_or_else(|| anyhow!("signature is not base64url"))?,
+                )
+            })
+            .collect()
+    }
+
     /// Retry anything a crash or a lost response left half done, and close
     /// sessions a previous run left open. Returns cents recovered.
     pub async fn recover(&self, wallet: &mut Wallet) -> Result<i64> {
         let mut recovered = 0;
         for pending in wallet.pending().to_vec() {
+            if pending.kind == "passes" {
+                let answer = self
+                    .passes_with(pending.secret.as_deref().unwrap_or(""), &pending.pass_blanks)
+                    .await;
+                match answer {
+                    Ok(answer) => {
+                        let passes = self.finish_passes(&pending.pass_blanks, &answer)?;
+                        wallet.add_passes(passes);
+                        wallet.finish_pending(&pending.id);
+                    }
+                    Err(e) => match e.downcast_ref::<ApiError>() {
+                        Some(ApiError::Server { status: 400..=499, .. }) => {
+                            wallet.finish_pending(&pending.id);
+                        }
+                        _ => return Err(e),
+                    },
+                }
+                wallet.save()?;
+                continue;
+            }
             let result = match pending.kind.as_str() {
                 "close" => {
                     self.close_with(pending.secret.as_deref().unwrap_or(""), &pending.blanks)

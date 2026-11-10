@@ -67,6 +67,16 @@ enum Command {
         #[arg(long, env = "OBSCURIFY_API_KEY")]
         api_key: String,
     },
+    /// Get this month's passes for your plan (Casual or Pro), so sessions can
+    /// use your plan's models without saying which account they belong to.
+    /// One pass per session; get them ahead of time.
+    Passes {
+        /// How many (at most what is left this month)
+        #[arg(long, default_value_t = 30)]
+        count: i64,
+        #[arg(long, env = "OBSCURIFY_API_KEY")]
+        api_key: String,
+    },
     /// Add voucher codes (obv1.…) to the wallet; `-` reads them from stdin
     Import { codes: Vec<String> },
     /// Print every voucher, for a backup
@@ -147,11 +157,14 @@ async fn main() -> Result<()> {
             .await?;
         }
         Command::Wallet => {
-            let wallet = Wallet::open(opts.wallet_path())?;
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let period = unlinkable_core::pass::current_period();
+            let passes = wallet.passes(&period);
             println!("wallet   {}", wallet.path().display());
             println!("paid     {}", dollars(wallet.balance_cents(Family::Paid)));
             println!("promo    {}", dollars(wallet.balance_cents(Family::Promo)));
             println!("vouchers {}", wallet.vouchers().len());
+            println!("passes   {} for {period}", passes.len());
             println!("sessions {} left open", wallet.sessions().len());
             if !wallet.pending().is_empty() {
                 println!("pending  {} (run `unlinkable recover`)", wallet.pending().len());
@@ -167,6 +180,21 @@ async fn main() -> Result<()> {
                 "Added {} to the wallet. It now holds {}.",
                 dollars(cents),
                 dollars(wallet.balance_cents(Family::Paid))
+            );
+        }
+        Command::Passes { count, api_key } => {
+            let _lock = lock_wallet(&opts)?;
+            let mut wallet = Wallet::open(opts.wallet_path())?;
+            let client = connect(&opts, &mut wallet).await?;
+            let got = client.get_passes(&mut wallet, &api_key, count).await?;
+            let period = unlinkable_core::pass::current_period();
+            let held = wallet.passes(&period);
+            wallet.save()?;
+            println!(
+                "Got {got} pass{}. The wallet holds {} for {period} ({}).",
+                if got == 1 { "" } else { "es" },
+                held.len(),
+                held.first().map(|p| p.tier.as_str()).unwrap_or("none")
             );
         }
         Command::Import { codes } => {
