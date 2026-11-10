@@ -17,6 +17,7 @@ use unlinkable_core::{keyset::VoucherKeyInfo, Family, DENOMINATIONS};
 pub struct KeyStore {
     keys: HashMap<(Family, i64), (VoucherKeyInfo, KeyPairSha384PSSDeterministic)>,
     pass: Option<PassKey>,
+    dust: Option<Box<KeyStore>>,
 }
 
 /// The pass master key (partially blind RSA, safe primes) and the per-month,
@@ -133,7 +134,18 @@ impl KeyStore {
             let der = pair.pk.to_der().map_err(|e| anyhow::anyhow!("{e}"))?;
             keys.insert((family, cents), (VoucherKeyInfo::new(cents, &der), pair));
         }
-        Ok(Self { keys, pass: None })
+        Ok(Self {
+            keys,
+            pass: None,
+            dust: None,
+        })
+    }
+
+    /// Also give change below a cent, with these keys (values in millicents,
+    /// see `DUST_MILLICENTS`).
+    pub fn with_dust(mut self, dust: KeyStore) -> Self {
+        self.dust = Some(Box::new(dust));
+        self
     }
 
     /// Also issue passes, signed with this master key.
@@ -171,6 +183,20 @@ impl Signer for KeyStore {
             .blind_sign(blinded)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .0)
+    }
+
+    fn dust_keys(&self, family: Family) -> Vec<VoucherKeyInfo> {
+        self.dust
+            .as_ref()
+            .map(|d| d.public_keys(family))
+            .unwrap_or_default()
+    }
+
+    fn sign_dust(&self, family: Family, millicents: i64, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.dust
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no dust keys"))?
+            .sign_blinded(family, millicents, blinded)
     }
 
     fn pass_key(&self) -> Option<PassKeyInfo> {

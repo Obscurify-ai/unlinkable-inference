@@ -55,6 +55,18 @@ pub struct Settings {
     /// Close a session after this long without a request
     pub idle_close: Duration,
     pub show_traffic: bool,
+    /// The account's API key, for keeping the wallet and passes topped up.
+    /// Never sent with a chat. If unset, the proxy learns it from the first
+    /// `sk-obs1_` key a client sends.
+    pub account_key: Option<String>,
+    /// Withdraw when the wallet holds less than this many cents…
+    pub keep_cents: i64,
+    /// …this much (one of the fixed withdrawal sizes)
+    pub refill_cents: i64,
+    /// Fetch passes when fewer than this many are left this month
+    pub keep_passes: usize,
+    /// Client keys starting with this are taken to be the account's key
+    pub account_key_prefix: String,
 }
 
 impl Default for Settings {
@@ -64,6 +76,11 @@ impl Default for Settings {
             mode: Mode::Conversation,
             idle_close: Duration::from_secs(300),
             show_traffic: false,
+            account_key: None,
+            keep_cents: 200,
+            refill_cents: 500,
+            keep_passes: 10,
+            account_key_prefix: "sk-obs1_".into(),
         }
     }
 }
@@ -86,6 +103,9 @@ pub struct Proxy {
     opening: tokio::sync::Mutex<()>,
     settings: Settings,
     opts: Options,
+    account_key: Mutex<Option<String>>,
+    /// After a failed top-up, wait before trying again
+    refill_backoff: Mutex<Option<std::time::Instant>>,
 }
 
 fn now() -> u64 {
@@ -191,6 +211,8 @@ impl Proxy {
             threads: Mutex::new(HashMap::new()),
             traffic,
             opening: tokio::sync::Mutex::new(()),
+            account_key: Mutex::new(settings.account_key.clone()),
+            refill_backoff: Mutex::new(None),
             settings,
             opts,
         })
@@ -222,6 +244,65 @@ impl Proxy {
         }
     }
 
+    /// Keep the wallet and passes topped up from the account, in the
+    /// background, so customers never move money by hand. Withdrawals happen
+    /// when the wallet runs low, not when a session opens, so their timing
+    /// says little about any one conversation. `urgent` skips the backoff
+    /// (the wallet is empty and a request is waiting).
+    pub async fn refill(&self, urgent: bool) {
+        let Some(key) = self.account_key.lock().unwrap().clone() else {
+            return;
+        };
+        if !urgent {
+            if let Some(at) = *self.refill_backoff.lock().unwrap() {
+                if at.elapsed() < Duration::from_secs(600) {
+                    return;
+                }
+            }
+        }
+        let mut wallet = self.wallet.lock().await;
+        let mut failed = false;
+        if wallet.balance_cents(Family::Paid) < self.settings.keep_cents {
+            match self
+                .client
+                .withdraw(&mut wallet, &key, self.settings.refill_cents)
+                .await
+            {
+                Ok(c) => tracing::info!("topped up the wallet with {} from the account", dollars(c)),
+                Err(e) => {
+                    failed = true;
+                    tracing::warn!("could not top up the wallet: {e:#}");
+                }
+            }
+        }
+        if self.client.keyset.pass_key.is_some() {
+            let period = unlinkable_core::pass::current_period();
+            let held = wallet.passes(&period).len();
+            if held < self.settings.keep_passes {
+                match self.client.get_passes(&mut wallet, &key, 30).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("got {n} passes for this month"),
+                    Err(e) => {
+                        failed = true;
+                        tracing::warn!("could not get passes: {e:#}");
+                    }
+                }
+            }
+        }
+        let _ = wallet.save();
+        *self.refill_backoff.lock().unwrap() = failed.then(std::time::Instant::now);
+    }
+
+    fn learn_account_key(&self, headers: &HeaderMap) {
+        let key = client_key(headers);
+        if !self.settings.account_key_prefix.is_empty() && key.starts_with(&self.settings.account_key_prefix) {
+            let mut known = self.account_key.lock().unwrap();
+            if known.is_none() {
+                *known = Some(key);
+            }
+        }
+    }
+
     async fn entry(&self, key: &str) -> Result<Arc<Entry>> {
         if let Some(e) = self.sessions.lock().unwrap().get(key) {
             return Ok(e.clone());
@@ -231,11 +312,24 @@ impl Proxy {
             return Ok(e.clone());
         }
         let family = self.family_to_spend().await;
-        let session = {
+        let opened = {
             let mut wallet = self.wallet.lock().await;
             self.client
                 .open(&mut wallet, family, self.settings.funding_cents)
-                .await?
+                .await
+        };
+        let session = match opened {
+            Ok(s) => s,
+            Err(e) if e.to_string().contains("has no") => {
+                // Empty wallet and a request waiting: top up now rather
+                // than fail (the background refill should prevent this).
+                self.refill(true).await;
+                let mut wallet = self.wallet.lock().await;
+                self.client
+                    .open(&mut wallet, family, self.settings.funding_cents)
+                    .await?
+            }
+            Err(e) => return Err(e),
         };
         let entry = Arc::new(Entry {
             session,
@@ -329,6 +423,7 @@ impl Proxy {
             };
         }
 
+        self.learn_account_key(&headers);
         let json_body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         let key = self.session_key(path, &headers, &json_body);
         let has_thread = json_body["thread"]["rev"].is_string();
@@ -643,9 +738,14 @@ pub async fn run(
     let closer = proxy.clone();
     let ticker = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut n: u64 = 0;
         loop {
             tick.tick().await;
             closer.close_idle().await;
+            if n.is_multiple_of(12) {
+                closer.refill(false).await;
+            }
+            n += 1;
         }
     });
     axum::serve(listener, router(proxy.clone()))

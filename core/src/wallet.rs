@@ -95,12 +95,17 @@ impl Wallet {
         Ok(())
     }
 
+    /// Whole cents held (dust below a cent is not counted).
     pub fn balance_cents(&self, family: Family) -> i64 {
+        self.balance_millicents(family) / crate::denominations::MILLICENTS_PER_CENT
+    }
+
+    pub fn balance_millicents(&self, family: Family) -> i64 {
         self.file
             .vouchers
             .iter()
             .filter(|h| h.family == family)
-            .map(|h| h.voucher.denomination_cents)
+            .map(|h| h.voucher.value_millicents())
             .sum()
     }
 
@@ -117,15 +122,24 @@ impl Wallet {
     }
 
     /// Take vouchers of one family worth at least `cents` (or everything
-    /// there is, if less), largest first. They leave the wallet; put them
-    /// back with [`Wallet::add`] if they are not spent.
+    /// there is, if less), largest first, plus all the dust, so leftovers
+    /// below a cent are spent instead of piling up. They leave the wallet; put
+    /// them back with [`Wallet::add`] if they are not spent.
     pub fn take(&mut self, family: Family, cents: i64) -> Vec<Voucher> {
+        let dust: Vec<usize> = (0..self.file.vouchers.len())
+            .filter(|&i| self.file.vouchers[i].family == family && self.file.vouchers[i].voucher.dust)
+            .collect();
+        let dust_cents = dust
+            .iter()
+            .map(|&i| self.file.vouchers[i].voucher.value_millicents())
+            .sum::<i64>()
+            / crate::denominations::MILLICENTS_PER_CENT;
         let mut mine: Vec<usize> = (0..self.file.vouchers.len())
-            .filter(|&i| self.file.vouchers[i].family == family)
+            .filter(|&i| self.file.vouchers[i].family == family && !self.file.vouchers[i].voucher.dust)
             .collect();
         mine.sort_by_key(|&i| std::cmp::Reverse(self.file.vouchers[i].voucher.denomination_cents));
-        let mut chosen = Vec::new();
-        let mut left = cents;
+        let mut chosen = dust;
+        let mut left = cents - dust_cents;
         // Largest that fit first, then the smallest that covers what is left.
         for &i in &mine {
             let v = self.file.vouchers[i].voucher.denomination_cents;

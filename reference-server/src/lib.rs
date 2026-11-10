@@ -32,7 +32,7 @@ use unlinkable_gateway::{
 pub const PASSES_PER_MONTH: i64 = 10;
 
 /// Balances are kept in nanodollars (1e-9 USD).
-const NANO_PER_CENT: i64 = 10_000_000;
+const NANO_PER_MILLICENT: i64 = 10_000;
 /// Echo model price: $2 per million characters in and out.
 const NANO_PER_CHAR: i64 = 2_000;
 
@@ -52,8 +52,10 @@ fn unix() -> u64 {
 #[derive(Debug, Clone, Serialize)]
 struct SessionRow {
     family: Family,
-    funded_cents: i64,
+    funded_millicents: i64,
     balance_nano: i64,
+    /// What the session's requests cost, in nanodollars
+    spent_nano: i64,
     tier: Option<String>,
     opened_at: u64,
     closed_at: Option<u64>,
@@ -140,7 +142,7 @@ impl MemoryBackend {
         for s in spends {
             db.spent.insert(s.hash.clone(), now);
         }
-        Ok(spends.iter().map(|s| s.cents).sum())
+        Ok(spends.iter().map(|s| s.millicents).sum())
     }
 
     /// A usable session for a model request: open and not idle too long.
@@ -166,6 +168,7 @@ impl MemoryBackend {
     fn charge(&self, secret_hash: &str, nano: i64) {
         if let Some(row) = self.db.lock().unwrap().sessions.get_mut(secret_hash) {
             row.balance_nano -= nano;
+            row.spent_nano += nano;
         }
     }
 
@@ -202,7 +205,7 @@ impl MemoryBackend {
             "spent_vouchers": db.spent.iter().map(|(h, at)| json!({"hash": h, "at": at})).collect::<Vec<_>>(),
             "spent_passes": db.spent_passes.iter().map(|(h, at)| json!({"hash": h, "at": at})).collect::<Vec<_>>(),
             "sessions": db.sessions.iter().map(|(h, s)| json!({
-                "secret_hash": h, "family": s.family, "funded_cents": s.funded_cents, "tier": s.tier,
+                "secret_hash": h, "family": s.family, "funded_millicents": s.funded_millicents, "spent_nano": s.spent_nano, "tier": s.tier,
                 "balance_usd": usd(s.balance_nano), "opened_at": s.opened_at, "closed_at": s.closed_at,
             })).collect::<Vec<_>>(),
             "accounts": db.accounts.iter().map(|(h, a)| json!({"token_hash": h, "balance_cents": a.balance_cents, "tier": a.tier, "passes_issued": a.passes})).collect::<Vec<_>>(),
@@ -249,8 +252,9 @@ impl Backend for MemoryBackend {
         }
         let row = SessionRow {
             family,
-            funded_cents: cents,
-            balance_nano: cents * NANO_PER_CENT,
+            funded_millicents: cents,
+            balance_nano: cents * NANO_PER_MILLICENT,
+            spent_nano: 0,
             tier: pass.map(|p| p.tier.clone()),
             opened_at: unix(),
             closed_at: None,
@@ -280,8 +284,8 @@ impl Backend for MemoryBackend {
         }
         let cents = Self::spend(&mut db, spends)?;
         let row = db.sessions.get_mut(secret_hash).expect("checked above");
-        row.funded_cents += cents;
-        row.balance_nano += cents * NANO_PER_CENT;
+        row.funded_millicents += cents;
+        row.balance_nano += cents * NANO_PER_MILLICENT;
         row.last_used = Instant::now();
         let row = row.clone();
         Ok(self.status_of(&row))
@@ -319,9 +323,9 @@ impl Backend for MemoryBackend {
             };
         }
         let balance = row.balance_nano.max(0);
-        let cents = balance / NANO_PER_CENT;
-        let forfeited = usd(balance % NANO_PER_CENT);
-        let answer = sign(row.family, cents, forfeited)?;
+        // Rounded up to the next millicent: never more than the tokens.
+        let millicents = (balance + NANO_PER_MILLICENT - 1) / NANO_PER_MILLICENT;
+        let answer = sign(row.family, millicents)?;
         db.signed_change.push((unix(), blinded_hashes(&answer)));
         let row = db.sessions.get_mut(secret_hash).expect("present");
         row.balance_nano = 0;

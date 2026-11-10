@@ -26,8 +26,14 @@ random bytes chosen by the client, `key_id` is the first 8 bytes (16 hex
 characters) of SHA-256 of the key's DER SubjectPublicKeyInfo. The server
 records a spent voucher as SHA-256(message), hex, and nothing else.
 
+**Dust** vouchers carry values below a cent, in millicents (1/1000 of a
+cent): 1, 2, 5, 10, 20, 50, 100, 200, 500, one key each per family, listed in
+`dust_paid` / `dust_promo`. Text form `obd1.<millicents>.<key_id>.<message>.<signature>`.
+All amounts on the server are kept in millicents.
+
 A **blank** is a message the client blinded against one key:
-`{"denomination_cents", "key_id", "blinded_message"}`. The server returns a
+`{"denomination_cents", "key_id", "blinded_message", "dust"?}` (value in
+millicents when `dust` is true). The server returns a
 blind signature; the client unblinds it into a voucher the server has never
 seen.
 
@@ -39,6 +45,7 @@ seen.
 {"scheme": "RSABSSA-SHA384-PSS-Deterministic",
  "paid":  [{"denomination_cents": 1, "key_id": "…", "public_key_der": "…"}, …],
  "promo": […],
+ "dust_paid": [same, values in millicents], "dust_promo": […],
  "pass_key": {"key_id": "…", "public_key_der": "…"}}
 ```
 
@@ -81,13 +88,16 @@ Rules:
   existing session and spends nothing. With `"pass"`, the session gets the
   pass's tier (its plan's models); a pass opens one session (409
   `pass_spent` after that) and only in its own month.
-- **Close** signs the blanks that make up the standard split (largest first,
-  1-2-5 steps) of the whole cents left; fractions of a cent are forfeited. So
-  the client sends blanks able to hold any amount up to the balance: per power
-  of ten one 5, two 2s and one 1. A repeat close with the same blanks gets the
+- **Close** rounds the balance **up** to the next millicent (a session never
+  costs more than its tokens) and signs the standard split (largest first,
+  1-2-5 steps) of it: whole cents from the normal blanks, the rest from dust
+  blanks. So the client sends blanks able to hold any amount up to the
+  balance plus one cent (per power of ten one 5, two 2s and one 1) and dust
+  blanks for any amount under a cent (500, 200, 200, 100, 50, 20, 20, 10, 5,
+  2, 2, 1). Change: `{"change_cents", "dust_millicents", …}`. A repeat close with the same blanks gets the
   same answer; a different one gets 410.
-- **Exchange** and **withdraw** sign every blank; the blanks must add up to
-  exactly the vouchers' total, or the amount. Withdrawals are $1, $5, $20, $50
+- **Exchange** and **withdraw** sign every blank (dust or not); the blanks must
+  add up to exactly the vouchers' total, or the amount, in millicents. Withdrawals are $1, $5, $20, $50
   or $100 from the account's withdrawable balance (credit that was never paid
   for stays in the account). A repeat with the same blanks gets the same answer.
 - Sessions refuse model requests after `idle_timeout_seconds` without one but

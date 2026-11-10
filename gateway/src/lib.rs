@@ -22,7 +22,7 @@ use axum::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use unlinkable_core::{
-    denominations::{pick_blanks, WITHDRAW_SIZES},
+    denominations::{pick_blanks, pick_dust_blanks, MILLICENTS_PER_CENT, WITHDRAW_SIZES},
     keyset::{Keyset, PassKeyInfo, VoucherKeyInfo, SCHEME},
     pass::{current_period, Pass, TIERS},
     protocol::*,
@@ -41,7 +41,8 @@ pub struct PassUse {
 #[derive(Debug, Clone)]
 pub struct Spend {
     pub hash: String,
-    pub cents: i64,
+    /// Value in millicents (1/1000 of a cent)
+    pub millicents: i64,
 }
 
 #[derive(Debug)]
@@ -124,10 +125,11 @@ impl IntoResponse for GatewayError {
     }
 }
 
-/// Signs change: given the family and whole cents the session holds, sign
-/// the blanks that add up to it.
+/// Signs change: given the family and the millicents the session holds
+/// (its balance rounded up to the next millicent, in the customer's favour),
+/// sign/// the blanks that add up to it.
 pub type SignChange =
-    Box<dyn FnOnce(Family, i64, String) -> Result<ChangeResponse, GatewayError> + Send>;
+    Box<dyn FnOnce(Family, i64) -> Result<ChangeResponse, GatewayError> + Send>;
 
 /// Storage and money. Every method that spends vouchers or moves balance
 /// must do it atomically, and must answer a repeat of a request (same
@@ -184,8 +186,9 @@ pub trait Backend: Send + Sync + 'static {
         spends: &[Spend],
     ) -> Result<SessionStatus, GatewayError>;
     async fn status(&self, secret_hash: &str) -> Result<SessionStatus, GatewayError>;
-    /// Close: lock the session, call `sign` with its whole cents (and the
-    /// fraction of a cent forfeited, as a decimal string), store the answer
+    /// Close: lock the session, call `sign` with its balance in millicents,
+    /// rounded up (never down: a session must not cost more than its
+    /// tokens), store the answer
     /// under `request_digest`, and end the session.
     async fn close_session(
         &self,
@@ -215,6 +218,16 @@ pub trait Backend: Send + Sync + 'static {
 pub trait Signer: Send + Sync + 'static {
     fn public_keys(&self, family: Family) -> Vec<VoucherKeyInfo>;
     fn sign_blinded(&self, family: Family, cents: i64, blinded: &[u8]) -> anyhow::Result<Vec<u8>>;
+    /// Dust keys (values in millicents). Without them change below a cent
+    /// cannot be returned, so servers should have them.
+    fn dust_keys(&self, family: Family) -> Vec<VoucherKeyInfo> {
+        let _ = family;
+        Vec::new()
+    }
+    fn sign_dust(&self, family: Family, millicents: i64, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let _ = (family, millicents, blinded);
+        anyhow::bail!("this server has no dust keys")
+    }
     /// The pass master key, if this server issues passes.
     fn pass_key(&self) -> Option<PassKeyInfo> {
         None
@@ -238,6 +251,8 @@ impl Gateway {
             scheme: SCHEME.to_string(),
             paid: signer.public_keys(Family::Paid),
             promo: signer.public_keys(Family::Promo),
+            dust_paid: signer.dust_keys(Family::Paid),
+            dust_promo: signer.dust_keys(Family::Promo),
             pass_key: signer.pass_key(),
         };
         Arc::new(Self {
@@ -272,44 +287,59 @@ impl Gateway {
             }
             spends.push(Spend {
                 hash,
-                cents: voucher.denomination_cents,
+                millicents: voucher.value_millicents(),
             });
         }
         Ok((family.expect("at least one voucher"), spends))
     }
 
-    /// Sign the blanks that hold exactly `cents` of `family` (the standard
-    /// split, picked from blanks that can hold any amount up to a limit).
+    /// Sign the blanks that hold exactly `millicents` of `family`: whole
+    /// cents the standard way, the rest from dust blanks, each picked from
+    /// blanks that can hold any amount up to a limit.
     fn sign_change(
         &self,
         blanks: &[BlindedVoucher],
         family: Family,
-        cents: i64,
-        forfeited_usd: String,
+        millicents: i64,
     ) -> Result<ChangeResponse, GatewayError> {
-        let values: Vec<i64> = blanks.iter().map(|b| b.denomination_cents).collect();
-        let picked = pick_blanks(&values, cents).ok_or_else(|| {
+        let cents = millicents / MILLICENTS_PER_CENT;
+        let dust = millicents % MILLICENTS_PER_CENT;
+        let whole: Vec<usize> = (0..blanks.len()).filter(|&i| !blanks[i].dust).collect();
+        let small: Vec<usize> = (0..blanks.len()).filter(|&i| blanks[i].dust).collect();
+        let values = |idx: &[usize]| idx.iter().map(|&i| blanks[i].denomination_cents).collect::<Vec<_>>();
+        let cannot = || {
             GatewayError::bad_request(format!(
-                "These blanks cannot hold {cents}¢ of change. Send blanks for any amount up to the balance."
+                "These blanks cannot hold {cents}¢ and {dust} millicents of change. Send blanks for any amount up to the balance, and dust blanks for any amount below a cent."
             ))
-        })?;
-        self.sign_picked(blanks, picked, family, cents, forfeited_usd)
+        };
+        let mut picked: Vec<usize> = pick_blanks(&values(&whole), cents)
+            .ok_or_else(cannot)?
+            .into_iter()
+            .map(|k| whole[k])
+            .collect();
+        picked.extend(
+            pick_dust_blanks(&values(&small), dust)
+                .ok_or_else(cannot)?
+                .into_iter()
+                .map(|k| small[k]),
+        );
+        self.sign_picked(blanks, picked, family)
     }
 
-    /// Sign every blank, which must add up to exactly `cents`.
+    /// Sign every blank, which must add up to exactly `millicents`.
     fn sign_all(
         &self,
         blanks: &[BlindedVoucher],
         family: Family,
-        cents: i64,
+        millicents: i64,
     ) -> Result<ChangeResponse, GatewayError> {
-        let sum: i64 = blanks.iter().map(|b| b.denomination_cents).sum();
-        if sum != cents {
+        let sum: i64 = blanks.iter().map(blank_millicents).sum();
+        if sum != millicents {
             return Err(GatewayError::bad_request(format!(
-                "The blanks add up to {sum}¢, not {cents}¢."
+                "The blanks add up to {sum} millicents, not {millicents}."
             )));
         }
-        self.sign_picked(blanks, (0..blanks.len()).collect(), family, cents, "0".into())
+        self.sign_picked(blanks, (0..blanks.len()).collect(), family)
     }
 
     fn sign_picked(
@@ -317,15 +347,14 @@ impl Gateway {
         blanks: &[BlindedVoucher],
         picked: Vec<usize>,
         family: Family,
-        cents: i64,
-        forfeited_usd: String,
     ) -> Result<ChangeResponse, GatewayError> {
         let mut signed = Vec::with_capacity(picked.len());
+        let mut total = 0;
         for index in picked {
             let blank = &blanks[index];
             let key = self
                 .keyset
-                .key(family, blank.denomination_cents)
+                .key_for(family, blank.denomination_cents, blank.dust)
                 .ok_or_else(|| GatewayError::bad_request("Unsupported voucher value."))?;
             if key.key_id != blank.key_id {
                 return Err(GatewayError::Status(
@@ -336,21 +365,33 @@ impl Gateway {
             }
             let blinded = unlinkable_core::unb64(&blank.blinded_message)
                 .ok_or_else(|| GatewayError::bad_request("Invalid blinded message."))?;
-            let sig = self
-                .signer
-                .sign_blinded(family, blank.denomination_cents, &blinded)
-                .map_err(|e| GatewayError::bad_request(format!("Cannot sign that blank: {e}")))?;
+            let sig = if blank.dust {
+                self.signer.sign_dust(family, blank.denomination_cents, &blinded)
+            } else {
+                self.signer.sign_blinded(family, blank.denomination_cents, &blinded)
+            }
+            .map_err(|e| GatewayError::bad_request(format!("Cannot sign that blank: {e}")))?;
+            total += blank_millicents(blank);
             signed.push(SignedBlank {
                 index,
                 blind_signature: unlinkable_core::b64(sig),
             });
         }
         Ok(ChangeResponse {
-            change_cents: cents,
+            change_cents: total / MILLICENTS_PER_CENT,
+            dust_millicents: total % MILLICENTS_PER_CENT,
             family,
             signed,
-            forfeited_usd,
+            forfeited_usd: "0".into(),
         })
+    }
+}
+
+fn blank_millicents(blank: &BlindedVoucher) -> i64 {
+    if blank.dust {
+        blank.denomination_cents
+    } else {
+        blank.denomination_cents * MILLICENTS_PER_CENT
     }
 }
 
@@ -515,9 +556,9 @@ async fn open(State(gw): Gw, Json(req): Json<OpenSessionRequest>) -> Response {
             return Err(GatewayError::bad_request("secret_hash must be SHA-256 hex."));
         }
         let (family, spends) = gw.spends(&req.vouchers)?;
-        let total: i64 = spends.iter().map(|s| s.cents).sum();
+        let total: i64 = spends.iter().map(|s| s.millicents).sum();
         let min = gw.backend.min_session_cents().await;
-        if total < min {
+        if total < min * MILLICENTS_PER_CENT {
             return Err(GatewayError::bad_request(format!(
                 "A session needs at least {min}¢ of vouchers."
             )));
@@ -568,16 +609,8 @@ async fn close(State(gw): Gw, headers: HeaderMap, Json(req): Json<CloseRequest>)
             .close_session(
                 &hash,
                 &digest,
-                Box::new(move |family, cents, forfeited| {
-                    if cents == 0 {
-                        return Ok(ChangeResponse {
-                            change_cents: 0,
-                            family,
-                            signed: Vec::new(),
-                            forfeited_usd: forfeited,
-                        });
-                    }
-                    signer.sign_change(&blanks, family, cents, forfeited)
+                Box::new(move |family, millicents| {
+                    signer.sign_change(&blanks, family, millicents.max(0))
                 }),
             )
             .await
@@ -590,7 +623,7 @@ async fn exchange(State(gw): Gw, Json(req): Json<ExchangeRequest>) -> Response {
         ensure_enabled(&gw).await?;
         check_blank_count(&req.blanks)?;
         let (family, spends) = gw.spends(&req.vouchers)?;
-        let total: i64 = spends.iter().map(|s| s.cents).sum();
+        let total: i64 = spends.iter().map(|s| s.millicents).sum();
         // Signing first is safe: signatures count for nothing until the
         // backend spends the vouchers and records them in one step.
         let answer = gw.sign_all(&req.blanks, family, total)?;
@@ -617,7 +650,7 @@ async fn withdraw(State(gw): Gw, headers: HeaderMap, Json(req): Json<WithdrawReq
             ));
         }
         check_blank_count(&req.blanks)?;
-        let answer = gw.sign_all(&req.blanks, Family::Paid, req.amount_cents)?;
+        let answer = gw.sign_all(&req.blanks, Family::Paid, req.amount_cents * MILLICENTS_PER_CENT)?;
         gw.backend
             .withdraw(
                 &token,

@@ -28,7 +28,11 @@ async fn listen() -> (tokio::net::TcpListener, String) {
 async fn start_stack() -> Stack {
     // A fixed test pass key: generating one (safe primes) takes seconds.
     let pass = PassKey::from_pem(include_str!("../../reference-server/testdata/test_pass_key.pem")).unwrap();
-    let keys = KeyStore::new(&VALUES, None).unwrap().with_pass_key(pass);
+    let dust = KeyStore::new(&unlinkable_core::denominations::DUST_MILLICENTS, None).unwrap();
+    let keys = KeyStore::new(&VALUES, None)
+        .unwrap()
+        .with_pass_key(pass)
+        .with_dust(dust);
     let ref_server = unlinkable_reference_server::build(keys, Duration::from_secs(3600));
     let backend = ref_server.backend.clone();
     let (l, server) = listen().await;
@@ -209,6 +213,17 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
     let left = st["wallet"]["paid_cents"].as_i64().unwrap();
     assert!(st["sessions"].as_array().unwrap().is_empty());
     assert!(left > 400 && left < 500, "spent a little, kept the rest: {left}");
+    // Exactly the tokens, never more: what left the wallet is what the
+    // requests cost, rounded down to the millicent in the customer's favour.
+    let wallet_mc = Wallet::open(opts.wallet_path()).unwrap().balance_millicents(Family::Paid);
+    let charged_mc: i64 = stack.backend.dump()["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["spent_nano"].as_i64().unwrap() / 10_000)
+        .sum();
+    assert!(charged_mc > 0);
+    assert_eq!(500_000 - wallet_mc, charged_mc, "the wallet paid exactly for the tokens");
 
     // Now read everything the server has and try to link.
     let db = stack.backend.dump();
@@ -244,7 +259,7 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
         let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
         assert_eq!(
             keys,
-            ["balance_usd", "closed_at", "family", "funded_cents", "opened_at", "secret_hash", "tier"],
+            ["balance_usd", "closed_at", "family", "funded_millicents", "opened_at", "secret_hash", "spent_nano", "tier"],
             "a session row holds nothing about who opened it"
         );
     }
@@ -431,4 +446,48 @@ async fn without_a_pass_plan_models_are_refused_and_tiny_sessions_are_too() {
     let (_proxy, url) = start_proxy(&opts, Settings { funding_cents: 20, ..Settings::default() }).await;
     assert_eq!(chat(&url, "echo-pro", "x").await.status(), 403);
     assert_eq!(chat(&url, "echo", "x").await.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_chat() {
+    let stack = start_stack().await;
+    let key = new_account_on(&stack.server, 2_000, "pro").await;
+    let opts = Options {
+        server: stack.server.clone(),
+        wallet: Some(temp_wallet()),
+        pins: Vec::new(),
+    };
+    // Empty wallet, no setup: the client sends its usual key, as it would to
+    // the API directly.
+    let settings = Settings {
+        account_key_prefix: "sk-test_".into(),
+        ..Settings::default()
+    };
+    let (_proxy, url) = start_proxy(&opts, settings).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {key}"))
+        .json(&json!({"model": "echo-pro", "messages": [{"role": "user", "content": "hello"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the plan model works, with nothing set up");
+    let st = status(&url).await;
+    assert!(st["wallet"]["paid_cents"].as_i64().unwrap() > 400, "{st}");
+    assert!(st["wallet"]["passes"].as_i64().unwrap() > 0);
+    assert_eq!(stack.backend.account_balance(&key), Some(1_500));
+
+    let db = stack.backend.dump();
+    for r in db["requests"].as_array().unwrap() {
+        if r["credential"] == "account" {
+            assert!(
+                r["path"].as_str().unwrap().starts_with("/u/withdraw")
+                    || r["path"].as_str().unwrap().starts_with("/u/passes"),
+                "the account key only moves money and fetches passes: {r}"
+            );
+        }
+        if r["path"].as_str().unwrap().starts_with("/v1/") {
+            assert_eq!(r["credential"], "session", "{r}");
+        }
+    }
 }

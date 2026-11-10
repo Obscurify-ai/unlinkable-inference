@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 pub const VOUCHER_MESSAGE_LEN: usize = 32;
 const PREFIX: &str = "obv1";
+/// Dust vouchers: values in millicents, below a cent.
+const DUST_PREFIX: &str = "obd1";
 
 /// Which key family signed a voucher. Paid vouchers come from money; promo
 /// vouchers from promotional credit. They never mix: change comes back in the
@@ -32,13 +34,26 @@ pub struct Voucher {
     pub message: Vec<u8>,
     #[serde(with = "crate::voucher::b64bytes")]
     pub signature: Vec<u8>,
+    /// A dust voucher: `denomination_cents` is then in millicents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dust: bool,
 }
 
 impl Voucher {
+    /// The value in millicents (1/1000 of a cent).
+    pub fn value_millicents(&self) -> i64 {
+        if self.dust {
+            self.denomination_cents
+        } else {
+            self.denomination_cents * crate::denominations::MILLICENTS_PER_CENT
+        }
+    }
+
     /// The text form users copy and servers accept.
     pub fn encode(&self) -> String {
         format!(
-            "{PREFIX}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}",
+            if self.dust { DUST_PREFIX } else { PREFIX },
             self.denomination_cents,
             self.key_id,
             crate::b64(&self.message),
@@ -52,9 +67,11 @@ impl Voucher {
             return None;
         }
         let mut parts = code.split('.');
-        if parts.next()? != PREFIX {
-            return None;
-        }
+        let dust = match parts.next()? {
+            PREFIX => false,
+            DUST_PREFIX => true,
+            _ => return None,
+        };
         let denomination_cents: i64 = parts.next()?.parse().ok()?;
         let key_id = parts.next()?.to_string();
         let message = crate::unb64(parts.next()?)?;
@@ -67,6 +84,7 @@ impl Voucher {
             key_id,
             message,
             signature,
+            dust,
         })
     }
 

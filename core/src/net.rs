@@ -5,7 +5,9 @@
 //! that requests carry a session secret, never an account key or a cookie.
 
 use crate::blank::Blank;
-use crate::denominations::{blanks_for_any_amount_up_to, split, WITHDRAW_SIZES};
+use crate::denominations::{
+    blanks_for_any_amount_up_to, dust_blanks_for_any, split, MILLICENTS_PER_CENT, WITHDRAW_SIZES,
+};
 use crate::keyset::Keyset;
 use crate::pass::{Pass, PassBlank};
 use crate::protocol::*;
@@ -271,7 +273,7 @@ impl Client {
         let mine: Vec<i64> = wallet
             .vouchers()
             .iter()
-            .filter(|h| h.family == family)
+            .filter(|h| h.family == family && !h.voucher.dust)
             .map(|h| h.voucher.denomination_cents)
             .collect();
         let small: i64 = mine.iter().filter(|&&v| v <= cents).sum();
@@ -287,7 +289,7 @@ impl Client {
         let voucher = wallet
             .vouchers()
             .iter()
-            .find(|h| h.family == family && h.voucher.denomination_cents == big)
+            .find(|h| h.family == family && !h.voucher.dust && h.voucher.denomination_cents == big)
             .map(|h| h.voucher.clone())
             .expect("found above");
         wallet.forget(&[voucher.encode()]);
@@ -431,8 +433,14 @@ impl Client {
     /// Close a session and put its change in the wallet. Returns the change in cents.
     pub async fn close(&self, wallet: &mut Wallet, session: &Session) -> Result<i64> {
         let status = self.status(session).await?;
-        let max = usd_to_cents_floor(&status.balance_usd);
-        let blanks = Blank::many(&self.keyset, session.family, &blanks_for_any_amount_up_to(max))?;
+        // Change is the balance rounded up to the next 0.001¢: whole cents
+        // the standard way, the rest as dust. One cent more of whole-cent
+        // blanks covers the rounding.
+        let max = usd_to_cents_floor(&status.balance_usd) + 1;
+        let mut blanks = Blank::many(&self.keyset, session.family, &blanks_for_any_amount_up_to(max))?;
+        if !self.keyset.dust_paid.is_empty() {
+            blanks.extend(Blank::many_dust(&self.keyset, session.family, &dust_blanks_for_any())?);
+        }
         let id = crate::new_session_secret();
         wallet.push_pending(Pending {
             id: id.clone(),
@@ -509,12 +517,14 @@ impl Client {
     /// Trade every voucher of a family for a fresh set with the same total,
     /// split the standard way. Useful after many small change vouchers pile up.
     pub async fn exchange(&self, wallet: &mut Wallet, family: Family) -> Result<i64> {
-        let total = wallet.balance_cents(family);
+        let total = wallet.balance_millicents(family);
         if total == 0 {
             return Ok(0);
         }
-        let vouchers = wallet.take(family, total);
-        self.exchange_vouchers(wallet, family, vouchers, &split(total)).await
+        let vouchers = wallet.take(family, (total + MILLICENTS_PER_CENT - 1) / MILLICENTS_PER_CENT);
+        let blanks = Blank::for_amount(&self.keyset, family, total)?;
+        self.exchange_blanks(wallet, family, vouchers, blanks).await?;
+        Ok(total / MILLICENTS_PER_CENT)
     }
 
     /// Spend `vouchers` (already out of the wallet) for fresh ones of
@@ -526,10 +536,24 @@ impl Client {
         vouchers: Vec<Voucher>,
         values: &[i64],
     ) -> Result<i64> {
-        let total: i64 = vouchers.iter().map(|v| v.denomination_cents).sum();
-        anyhow::ensure!(values.iter().sum::<i64>() == total, "exchange must keep the total");
-        let codes: Vec<String> = vouchers.iter().map(Voucher::encode).collect();
         let blanks = Blank::many(&self.keyset, family, values)?;
+        self.exchange_blanks(wallet, family, vouchers, blanks).await
+    }
+
+    async fn exchange_blanks(
+        &self,
+        wallet: &mut Wallet,
+        family: Family,
+        vouchers: Vec<Voucher>,
+        blanks: Vec<Blank>,
+    ) -> Result<i64> {
+        let total: i64 = vouchers.iter().map(Voucher::value_millicents).sum();
+        let made: i64 = blanks
+            .iter()
+            .map(|b| if b.dust { b.denomination_cents } else { b.denomination_cents * MILLICENTS_PER_CENT })
+            .sum();
+        anyhow::ensure!(made == total, "exchange must keep the total");
+        let codes: Vec<String> = vouchers.iter().map(Voucher::encode).collect();
         let id = crate::new_session_secret();
         wallet.push_pending(Pending {
             id: id.clone(),

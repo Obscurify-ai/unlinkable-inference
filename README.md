@@ -25,21 +25,20 @@ never seen. Nothing depends on a third party.
 
 ```sh
 cargo install --path proxy
-unlinkable withdraw 5 --api-key sk-obs1_…           # do this ahead of time
 unlinkable serve                                     # http://127.0.0.1:8899
 ```
 
-Claude Code:
+Then use your usual key and change only the base URL. Claude Code:
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=anything \
+ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=sk-obs1_… \
 ANTHROPIC_MODEL=deepseek/deepseek-v4.1-flash claude
 ```
 
-OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, any API key. The
-key you give the proxy never leaves your machine; it only names a session
-(`--per key`), or is ignored in favour of one session per conversation
-(`--per conversation`, the default).
+OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, your usual key.
+The proxy uses that key for one thing: keeping the wallet (and this month's
+passes, on a plan) topped up in the background. Chats go out with a session
+secret instead and are charged exactly their tokens, down to 0.001¢.
 
 `http://127.0.0.1:8899/_unlinkable` shows what the server received for each
 request. To hide your IP address too, run the proxy behind Tor or a VPN

@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Blank {
     pub family: Family,
+    /// Cents, or millicents for dust
     pub denomination_cents: i64,
+    #[serde(default)]
+    pub dust: bool,
     pub key_id: String,
     #[serde(with = "crate::voucher::b64bytes")]
     pub message: Vec<u8>,
@@ -28,10 +31,19 @@ pub struct Blank {
     pub secret: Vec<u8>,
 }
 
-fn public_key(keyset: &Keyset, family: Family, cents: i64) -> Result<(String, PublicKeySha384PSSDeterministic)> {
-    let info = keyset
-        .key(family, cents)
-        .ok_or_else(|| anyhow!("no {} key for {cents}¢", family.as_str()))?;
+fn public_key(
+    keyset: &Keyset,
+    family: Family,
+    value: i64,
+    dust: bool,
+) -> Result<(String, PublicKeySha384PSSDeterministic)> {
+    let info = keyset.key_for(family, value, dust).ok_or_else(|| {
+        anyhow!(
+            "no {} key for {value}{}",
+            family.as_str(),
+            if dust { " millicents" } else { "¢" }
+        )
+    })?;
     let der = crate::unb64(&info.public_key_der).context("key is not base64url")?;
     let pk = PublicKeySha384PSSDeterministic::from_der(&der)
         .map_err(|e| anyhow!("bad voucher key: {e}"))?;
@@ -41,7 +53,16 @@ fn public_key(keyset: &Keyset, family: Family, cents: i64) -> Result<(String, Pu
 impl Blank {
     /// A fresh random voucher message, blinded against the key for `cents`.
     pub fn new(keyset: &Keyset, family: Family, cents: i64) -> Result<Self> {
-        let (key_id, pk) = public_key(keyset, family, cents)?;
+        Self::make(keyset, family, cents, false)
+    }
+
+    /// A dust blank, `millicents` below a cent.
+    pub fn new_dust(keyset: &Keyset, family: Family, millicents: i64) -> Result<Self> {
+        Self::make(keyset, family, millicents, true)
+    }
+
+    fn make(keyset: &Keyset, family: Family, value: i64, dust: bool) -> Result<Self> {
+        let (key_id, pk) = public_key(keyset, family, value, dust)?;
         let mut message = vec![0u8; VOUCHER_MESSAGE_LEN];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut message);
         let blinding = pk
@@ -49,7 +70,8 @@ impl Blank {
             .map_err(|e| anyhow!("blinding failed: {e}"))?;
         Ok(Self {
             family,
-            denomination_cents: cents,
+            denomination_cents: value,
+            dust,
             key_id,
             message,
             blinded: blinding.blind_message.0,
@@ -61,18 +83,39 @@ impl Blank {
         values.iter().map(|&c| Self::new(keyset, family, c)).collect()
     }
 
+    pub fn many_dust(keyset: &Keyset, family: Family, values: &[i64]) -> Result<Vec<Self>> {
+        values
+            .iter()
+            .map(|&m| Self::new_dust(keyset, family, m))
+            .collect()
+    }
+
+    /// Blanks for exactly `millicents`: whole cents the standard way, the rest
+    /// as dust.
+    pub fn for_amount(keyset: &Keyset, family: Family, millicents: i64) -> Result<Vec<Self>> {
+        use crate::denominations::{split, split_dust, MILLICENTS_PER_CENT};
+        let mut blanks = Self::many(keyset, family, &split(millicents / MILLICENTS_PER_CENT))?;
+        blanks.extend(Self::many_dust(
+            keyset,
+            family,
+            &split_dust(millicents % MILLICENTS_PER_CENT),
+        )?);
+        Ok(blanks)
+    }
+
     /// What is sent to the server: the blinded message only.
     pub fn to_wire(&self) -> BlindedVoucher {
         BlindedVoucher {
             denomination_cents: self.denomination_cents,
             key_id: self.key_id.clone(),
             blinded_message: crate::b64(&self.blinded),
+            dust: self.dust,
         }
     }
 
     /// Unblind the server's signature into a finished voucher, checking it.
     pub fn finish(&self, keyset: &Keyset, blind_signature: &[u8]) -> Result<Voucher> {
-        let (_, pk) = public_key(keyset, self.family, self.denomination_cents)?;
+        let (_, pk) = public_key(keyset, self.family, self.denomination_cents, self.dust)?;
         let blinding = BlindingResult {
             blind_message: BlindMessage(self.blinded.clone()),
             secret: Secret(self.secret.clone()),
@@ -86,6 +129,7 @@ impl Blank {
             key_id: self.key_id.clone(),
             message: self.message.clone(),
             signature: signature.0,
+            dust: self.dust,
         })
     }
 }
@@ -93,8 +137,11 @@ impl Blank {
 /// Check a finished voucher against a keyset (used by servers and by the
 /// wallet when importing codes).
 pub fn verify(keyset: &Keyset, voucher: &Voucher) -> Option<Family> {
-    let family = keyset.family_of(&voucher.key_id)?;
-    let (key_id, pk) = public_key(keyset, family, voucher.denomination_cents).ok()?;
+    let (family, dust) = keyset.kind_of(&voucher.key_id)?;
+    if dust != voucher.dust {
+        return None;
+    }
+    let (key_id, pk) = public_key(keyset, family, voucher.denomination_cents, dust).ok()?;
     (key_id == voucher.key_id
         && voucher.message.len() == VOUCHER_MESSAGE_LEN
         && pk

@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlindedVoucher {
+    /// Cents, or millicents for a dust blank
     pub denomination_cents: i64,
     pub key_id: String,
     /// base64url
     pub blinded_message: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dust: bool,
 }
 
 /// `POST /u/sessions`: no cookie, no API key.
@@ -105,8 +108,11 @@ pub struct SignedBlank {
 /// Answer to close, exchange and withdraw.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeResponse {
-    /// Total value signed, in cents
+    /// Whole cents signed
     pub change_cents: i64,
+    /// Plus this much dust, in millicents (below a cent)
+    #[serde(default)]
+    pub dust_millicents: i64,
     pub family: Family,
     pub signed: Vec<SignedBlank>,
     /// Fractions of a cent left behind at close (never paid out), USD

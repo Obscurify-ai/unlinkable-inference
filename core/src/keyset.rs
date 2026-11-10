@@ -58,6 +58,11 @@ pub struct Keyset {
     pub scheme: String,
     pub paid: Vec<VoucherKeyInfo>,
     pub promo: Vec<VoucherKeyInfo>,
+    /// Dust keys (values in millicents), if the server gives sub-cent change
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dust_paid: Vec<VoucherKeyInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dust_promo: Vec<VoucherKeyInfo>,
     /// Partially blind RSA master key for passes, if the server issues them
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_key: Option<PassKeyInfo>,
@@ -79,6 +84,8 @@ impl Keyset {
         let mut canonical = self.clone();
         canonical.paid.sort_by_key(|k| k.denomination_cents);
         canonical.promo.sort_by_key(|k| k.denomination_cents);
+        canonical.dust_paid.sort_by_key(|k| k.denomination_cents);
+        canonical.dust_promo.sort_by_key(|k| k.denomination_cents);
         let json = serde_json::to_vec(&canonical).expect("keyset serialises");
         format!("ks1-{}", &crate::sha256_hex(json)[..32])
     }
@@ -98,7 +105,13 @@ impl Keyset {
                 });
             }
         }
-        for key in self.paid.iter().chain(&self.promo) {
+        for key in self
+            .paid
+            .iter()
+            .chain(&self.promo)
+            .chain(&self.dust_paid)
+            .chain(&self.dust_promo)
+        {
             let der = crate::unb64(&key.public_key_der).unwrap_or_default();
             if key_id_for(&der) != key.key_id {
                 return Err(KeysetError::BadKeyId {
@@ -116,6 +129,31 @@ impl Keyset {
             Family::Promo => &self.promo,
         };
         keys.iter().find(|k| k.denomination_cents == cents)
+    }
+
+    /// The key for a dust value (millicents), or for a whole-cent value.
+    pub fn key_for(&self, family: Family, value: i64, dust: bool) -> Option<&VoucherKeyInfo> {
+        if !dust {
+            return self.key(family, value);
+        }
+        let keys = match family {
+            Family::Paid => &self.dust_paid,
+            Family::Promo => &self.dust_promo,
+        };
+        keys.iter().find(|k| k.denomination_cents == value)
+    }
+
+    /// Family and whether it is a dust key, by key id.
+    pub fn kind_of(&self, key_id: &str) -> Option<(Family, bool)> {
+        [
+            (&self.paid, Family::Paid, false),
+            (&self.promo, Family::Promo, false),
+            (&self.dust_paid, Family::Paid, true),
+            (&self.dust_promo, Family::Promo, true),
+        ]
+        .into_iter()
+        .find(|(keys, _, _)| keys.iter().any(|k| k.key_id == key_id))
+        .map(|(_, family, dust)| (family, dust))
     }
 
     /// Which family a voucher's key belongs to, by key id.

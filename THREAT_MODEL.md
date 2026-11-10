@@ -61,7 +61,13 @@ use Tor or a VPN, or at least withdraw from a different network.
   vouchers into session-sized pieces through anonymous exchanges.
 - **Denominations**. Change comes back in the standard split, so its values
   say how much was left; spending those exact values later is weakly
-  suggestive. `unlinkable exchange` trades them for a standard set.
+  suggestive. `unlinkable exchange` trades them for a standard set. Dust is
+  always spent with the next session, so dust in an opening says only "this
+  client had a session before".
+- **Automatic top-ups**. With the account key, the proxy withdraws when the
+  wallet runs low and fetches passes when they run low, in the background,
+  never at the moment a session opens (unless the wallet is empty). Without
+  Tor or a VPN the same address makes both, which links them.
 - **The web app**. Its scripts come from the server. The strong claim is the
   proxy and the Android app; the web gets published script hashes.
 - **Loss**. Vouchers are bearer credit. Lose the wallet file, lose them.

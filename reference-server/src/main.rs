@@ -29,7 +29,13 @@ async fn main() -> anyhow::Result<()> {
         Some(dir) => PassKey::load_or_create(&dir.join("pass_master.pem"))?,
         None => PassKey::from_pem(&PassKey::generate()?)?,
     };
-    let keys = KeyStore::all(args.keys_dir.as_deref())?.with_pass_key(pass);
+    let dust = KeyStore::new(
+        &unlinkable_core::denominations::DUST_MILLICENTS,
+        args.keys_dir.as_ref().map(|d| d.join("dust")).as_deref(),
+    )?;
+    let keys = KeyStore::all(args.keys_dir.as_deref())?
+        .with_pass_key(pass)
+        .with_dust(dust);
     let server = unlinkable_reference_server::build(
         keys,
         Duration::from_secs(args.idle_timeout_seconds),

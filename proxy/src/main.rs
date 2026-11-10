@@ -15,11 +15,11 @@ use unlinkable_proxy::{connect, dollars, lock_wallet, Options};
 /// key. The server still reads each prompt, and sees your IP address unless
 /// you hide it yourself (Tor, a VPN).
 ///
-/// Quick start:
-///   unlinkable withdraw 5 --api-key sk-obs1_…   # move $5 into the wallet
-///   unlinkable serve                             # localhost:8899
-///   ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=any claude
-///   OPENAI_BASE_URL=http://127.0.0.1:8899/v1 OPENAI_API_KEY=any …
+/// Quick start (the key is your usual Obscurify key; it only ever moves
+/// money into the wallet and is never sent with a chat):
+///   unlinkable serve                              # localhost:8899
+///   ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=sk-obs1_… claude
+///   OPENAI_BASE_URL=http://127.0.0.1:8899/v1 OPENAI_API_KEY=sk-obs1_… …
 #[derive(Parser)]
 #[command(name = "unlinkable", version, verbatim_doc_comment)]
 struct Cli {
@@ -55,6 +55,17 @@ enum Command {
         /// Print what leaves this device for every request
         #[arg(long)]
         show_traffic: bool,
+        /// The account's API key: keeps the wallet and this month's passes
+        /// topped up in the background. Never sent with a chat. Without it
+        /// the proxy uses the first sk-obs1_ key a client sends.
+        #[arg(long, env = "OBSCURIFY_API_KEY")]
+        api_key: Option<String>,
+        /// Top up when the wallet falls below this many dollars
+        #[arg(long, default_value = "2.00")]
+        keep: String,
+        /// Top up by this many dollars (1, 5, 20, 50 or 100)
+        #[arg(long, default_value_t = 5)]
+        refill: u32,
     },
     /// Show the wallet
     Wallet,
@@ -128,6 +139,9 @@ async fn main() -> Result<()> {
             per,
             idle_close,
             show_traffic,
+            api_key,
+            keep,
+            refill,
         } => {
             let _lock = lock_wallet(&opts)?;
             let mut wallet = Wallet::open(opts.wallet_path())?;
@@ -142,6 +156,11 @@ async fn main() -> Result<()> {
                 mode: per,
                 idle_close: Duration::from_secs(idle_close),
                 show_traffic,
+                account_key: api_key,
+                keep_cents: parse_dollars(&keep)?,
+                refill_cents: refill as i64 * 100,
+                keep_passes: 10,
+                account_key_prefix: "sk-obs1_".into(),
             };
             eprintln!(
                 "unlinkable: wallet {} ({}); proxy on http://{listen} (page: http://{listen}/_unlinkable)",

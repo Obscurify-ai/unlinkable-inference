@@ -61,3 +61,40 @@ pub fn pick_blanks(blanks: &[i64], cents: i64) -> Option<Vec<usize>> {
     }
     Some(picked)
 }
+
+/// Dust: values below a cent, in millicents (0.001¢ to 0.5¢). Change that is
+/// not a whole number of cents comes back in these, rounded up in the
+/// customer's favour to the next 0.001¢, so a session never costs more than
+/// its tokens.
+pub const DUST_MILLICENTS: [i64; 9] = [1, 2, 5, 10, 20, 50, 100, 200, 500];
+
+/// Split millicents below a cent into dust values, largest first.
+pub fn split_dust(mut millicents: i64) -> Vec<i64> {
+    let mut parts = Vec::new();
+    for &d in DUST_MILLICENTS.iter().rev() {
+        while millicents >= d {
+            parts.push(d);
+            millicents -= d;
+        }
+    }
+    parts
+}
+
+/// Dust blanks that can hold any amount from 0 to 999 millicents.
+pub fn dust_blanks_for_any() -> Vec<i64> {
+    vec![500, 200, 200, 100, 50, 20, 20, 10, 5, 2, 2, 1]
+}
+
+/// Like [`pick_blanks`] for dust.
+pub fn pick_dust_blanks(blanks: &[i64], millicents: i64) -> Option<Vec<usize>> {
+    let mut used = vec![false; blanks.len()];
+    let mut picked = Vec::new();
+    for part in split_dust(millicents) {
+        let i = (0..blanks.len()).find(|&i| !used[i] && blanks[i] == part)?;
+        used[i] = true;
+        picked.push(i);
+    }
+    Some(picked)
+}
+
+pub const MILLICENTS_PER_CENT: i64 = 1000;
