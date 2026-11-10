@@ -1,0 +1,108 @@
+# Unlinkable sessions: wire format
+
+Version 1. All JSON. Binary values are base64url without padding. Amounts are
+integer cents unless named `_usd`, which are exact decimal strings.
+
+## Parties
+
+- **Client**: holds the wallet. The proxy (`unlinkable`), and later the
+  Android and web apps.
+- **Relay**: forwards sealed requests. Sees the client's IP, never the content.
+- **Server**: runs the gateway. Sees the content, never the client's IP when
+  a relay is used.
+
+## Vouchers
+
+RFC 9474 blind RSA, `RSABSSA-SHA384-PSS-Deterministic`, 2048-bit keys. One key
+per value and per family:
+
+- values: 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000,
+  50000, 100000, 200000, 500000 cents;
+- families: `paid` (bought with money) and `promo` (promotional credit). A
+  session is funded by one family and its change comes back in that family.
+
+A voucher is `obv1.<cents>.<key_id>.<message>.<signature>`: `message` is 32
+random bytes chosen by the client, `key_id` is the first 8 bytes (16 hex
+characters) of SHA-256 of the key's DER SubjectPublicKeyInfo. The server
+records a spent voucher as SHA-256(message), hex, and nothing else.
+
+A **blank** is a message the client blinded against one key:
+`{"denomination_cents", "key_id", "blinded_message"}`. The server returns a
+blind signature; the client unblinds it into a voucher the server has never
+seen.
+
+## Keyset and pinning
+
+`GET /u/keys`:
+
+```json
+{"scheme": "RSABSSA-SHA384-PSS-Deterministic",
+ "paid":  [{"denomination_cents": 1, "key_id": "…", "public_key_der": "…"}, …],
+ "promo": […],
+ "ohttp_key_config": "<one RFC 9458 key configuration>",
+ "ohttp_gateway_path": "/ohttp"}
+```
+
+Its **fingerprint** is `ks1-` + the first 32 hex characters of SHA-256 of the
+JSON serialisation with both key lists sorted by value, fields in the order
+above. Clients accept a keyset only if its fingerprint is pinned (built into
+the release, given with `--pin`, or pinned on first use for servers with no
+built-in pins) and every `key_id` matches its key. Published pins for
+obscurify.ai live in `keys/obscurify.ai.pins`.
+
+## Endpoints
+
+None of them reads a cookie or an IP. Errors are
+`{"error": {"message", "type", "spent"?}}`.
+
+| Request | Auth | Body | Answer |
+|---|---|---|---|
+| `POST /u/sessions` | none | `{"vouchers": [codes], "secret_hash"}` | session status |
+| `GET /u/sessions/current` | session | | session status |
+| `POST /u/sessions/topup` | session | `{"vouchers": [codes]}` | session status |
+| `POST /u/sessions/close` | session | `{"blanks": [blanks]}` | change |
+| `POST /u/exchange` | none | `{"vouchers": [codes], "blanks": [blanks]}` | change |
+| `POST /u/withdraw` | account API key | `{"amount_cents", "blanks": [blanks]}` | change |
+
+- **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed"}`.
+- **Change**: `{"change_cents", "family", "signed": [{"index", "blind_signature"}], "forfeited_usd"}`;
+  `index` points into the request's `blanks`.
+- **Session auth**: `Authorization: Bearer sk-unl1_<32 random bytes>`. The
+  client picks the secret and sends only `secret_hash` = SHA-256(secret), hex,
+  when opening. The same secret is the API key for model and tool requests.
+
+Rules:
+
+- **Open** spends every voucher or none. Vouchers must share a family and not
+  repeat; up to 64. If any were spent before: 409 with `spent` = their indexes,
+  and nothing is spent. A repeat open with the same `secret_hash` returns the
+  existing session and spends nothing.
+- **Close** signs the blanks that make up the standard split (largest first,
+  1-2-5 steps) of the whole cents left; fractions of a cent are forfeited. So
+  the client sends blanks able to hold any amount up to the balance: per power
+  of ten one 5, two 2s and one 1. A repeat close with the same blanks gets the
+  same answer; a different one gets 410.
+- **Exchange** and **withdraw** sign every blank; the blanks must add up to
+  exactly the vouchers' total, or the amount. Withdrawals are $1, $5, $20, $50
+  or $100 from the account's withdrawable balance (credit that was never paid
+  for stays in the account). A repeat with the same blanks gets the same answer.
+- Sessions refuse model requests after `idle_timeout_seconds` without one but
+  can still be closed for a grace period (Obscurify: 7 days).
+
+## Oblivious HTTP
+
+RFC 9458 with X25519/HKDF-SHA256 and AES-128-GCM or ChaCha20-Poly1305, key id
+1. Streaming uses chunked OHTTP (draft-ietf-ohai-chunked-ohttp):
+`message/ohttp-chunked-req` / `message/ohttp-chunked-res`. Non-chunked
+`message/ohttp-req` / `message/ohttp-res` is also accepted.
+
+The inner request is RFC 9292 binary HTTP. The gateway answers chunked
+requests with an indeterminate-length binary HTTP response, one sealed chunk
+per body write, so server-sent events arrive as they are made. It drops
+`cookie`, `host`, `forwarded`, `x-forwarded-*`, `x-real-ip` and similar request
+headers, gives the app an unroutable peer address, and only routes paths
+under `/u/` and `/v1/`.
+
+A relay accepts `POST /<name>` with an OHTTP content type and forwards only the
+body and content type to `<gateway origin>/ohttp`. `GET /<name>/keys` returns
+the gateway's keyset as the relay fetched it.

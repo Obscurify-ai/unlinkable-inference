@@ -114,6 +114,17 @@ const DROPPED_RESPONSE_HEADERS: &[&str] = &[
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
+/// POST endpoints (and anything under them) forwarded to the server.
+const FORWARDED_POSTS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/embeddings",
+    "/v1/images",
+    "/v1/tools",
+];
+
 fn text(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -552,6 +563,17 @@ async fn handle(State(proxy): State<Arc<Proxy>>, req: Request) -> Response {
     } else {
         format!("/v1{path}")
     };
+    // Only API calls go out (and only they open sessions): a browser's
+    // favicon request or a typo must not spend the wallet.
+    let route = path.split('?').next().unwrap_or("");
+    let api = match method.as_str() {
+        "GET" => route == "/v1/models" || route.starts_with("/v1/models/"),
+        "POST" => FORWARDED_POSTS.iter().any(|p| route == *p || route.starts_with(&format!("{p}/"))),
+        _ => false,
+    };
+    if !api {
+        return text(StatusCode::NOT_FOUND, "not an API path this proxy forwards");
+    }
     proxy.forward(&method, &path, parts.headers, body).await
 }
 
@@ -653,7 +675,7 @@ async function load(){
  $('summary').innerHTML=`Server <code>${esc(s.server)}</code><br>`+
   (s.relay?`Relay <code>${esc(s.relay)}</code>: the server never sees your IP.`:`<span class="warn">No relay: the server sees your IP (not your account or payment).</span>`)+
   `<br>Keyset <code>${esc(s.keyset)}</code><br>Wallet ${usd(s.wallet.paid_cents)} paid, ${usd(s.wallet.promo_cents)} promo, in ${s.wallet.vouchers} vouchers`;
- $('sessions').innerHTML=s.sessions.length?s.sessions.map(x=>`${x.requests} requests, open ${x.age_seconds}s, idle ${x.idle_seconds}s`).join('<br>'):'None. Sessions close after '+s.settings.idle_close_seconds+'s without a request; change goes back to the wallet.';
+ $('sessions').innerHTML=s.sessions.length?s.sessions.map(x=>`${x.requests} request${x.requests==1?'':'s'}, open ${x.age_seconds}s, idle ${x.idle_seconds}s`).join('<br>'):'None. Sessions close after '+s.settings.idle_close_seconds+'s without a request; change goes back to the wallet.';
  $('traffic').innerHTML=s.traffic.map(t=>`<tr><td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><span class="peer">${esc(t.network_peer)}</span> sees ${esc(t.peer_sees)} (${t.bytes_sent} bytes)<br><span class="server">server sees</span> ${esc(t.server_sees)}</td></tr>`).join('')||'<tr><td>Nothing sent yet.</td></tr>';
 }
 async function withdraw(){

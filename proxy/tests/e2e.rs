@@ -202,6 +202,11 @@ async fn a_chat_through_the_relay_cannot_be_tied_to_the_account_that_paid_for_it
         .unwrap();
     assert_eq!(refused.status(), 403);
 
+    // A browser's favicon request is answered here and opens no session.
+    let favicon = http.get(format!("{url}/favicon.ico")).send().await.unwrap();
+    assert_eq!(favicon.status(), 404);
+    assert_eq!(status(&url).await["sessions"].as_array().unwrap().len(), 2);
+
     // Close everything: change comes back to the wallet.
     proxy.close_all().await;
     let st = status(&url).await;
