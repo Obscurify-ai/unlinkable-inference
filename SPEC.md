@@ -73,7 +73,7 @@ None of them reads a cookie or stores an IP. Errors are
 | `POST /u/passes` | account API key | `{"tier", "period", "blinded": [b64]}` | `{"tier", "period", "blind_signatures", "remaining"}` |
 
 - **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed", "tier"?}`.
-- **Change**: `{"change_cents", "family", "signed": [{"index", "blind_signature"}], "forfeited_usd"}`;
+- **Change**: `{"change_cents", "family", "signed": [{"index", "blind_signature"}]}`;
   `index` points into the request's `blanks`.
 - **Session auth**: `Authorization: Bearer sk-unl1_<32 random bytes>`. The
   client picks the secret and sends only `secret_hash` = SHA-256(secret), hex,
@@ -101,7 +101,7 @@ Rules:
   or $100 from the account's withdrawable balance (credit that was never paid
   for stays in the account). A repeat with the same blanks gets the same answer.
 - Sessions refuse model requests after `idle_timeout_seconds` without one but
-  can still be closed for a grace period (Obscurify: 7 days).
+  can always be closed for change: an open session's balance is never taken.
 
 ## Passes
 
