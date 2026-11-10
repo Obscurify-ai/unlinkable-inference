@@ -35,6 +35,10 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=sk-obs1_… \
 ANTHROPIC_MODEL=deepseek/deepseek-v4.1-flash claude
 ```
 
+pi: copy `integrations/pi/unlinkable.ts` to `~/.pi/agent/extensions/`. It
+starts the proxy when needed and adds an `obscurify-private` provider with the
+same models as your `obscurify` one; the normal provider stays.
+
 OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, your usual key.
 The proxy uses that key for one thing: keeping the wallet (and this month's
 passes, on a plan) topped up in the background. Chats go out with a session

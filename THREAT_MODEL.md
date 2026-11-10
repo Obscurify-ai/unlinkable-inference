@@ -71,7 +71,9 @@ use Tor or a VPN, or at least withdraw from a different network.
 - **The web app**. Its scripts come from the server. The strong claim is the
   proxy and the Android app; the web gets published script hashes.
 - **Loss**. Vouchers are bearer credit. Lose the wallet file, lose them.
-  `unlinkable export` makes a backup.
+  With the account key the proxy keeps the wallet small (it tops up $1 when
+  below 50¢), so a lost device costs at most about $1.50; the account balance
+  is untouched. `unlinkable export` makes a backup.
 - **Abuse controls**. The server cannot ban a person in this mode, only refuse
   a session.
 

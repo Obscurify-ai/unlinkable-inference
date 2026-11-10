@@ -280,7 +280,7 @@ impl Client {
         if small >= cents {
             return Ok(());
         }
-        let Some(&big) = mine.iter().filter(|&&v| v > 2 * cents).min() else {
+        let Some(&big) = mine.iter().filter(|&&v| v > cents).min() else {
             return Ok(());
         };
         let pieces = (big / cents).min(8);

@@ -77,8 +77,8 @@ impl Default for Settings {
             idle_close: Duration::from_secs(300),
             show_traffic: false,
             account_key: None,
-            keep_cents: 200,
-            refill_cents: 500,
+            keep_cents: 50,
+            refill_cents: 100,
             keep_passes: 10,
             account_key_prefix: "sk-obs1_".into(),
         }

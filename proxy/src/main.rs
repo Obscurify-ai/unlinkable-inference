@@ -61,10 +61,10 @@ enum Command {
         #[arg(long, env = "OBSCURIFY_API_KEY")]
         api_key: Option<String>,
         /// Top up when the wallet falls below this many dollars
-        #[arg(long, default_value = "2.00")]
+        #[arg(long, default_value = "0.50")]
         keep: String,
         /// Top up by this many dollars (1, 5, 20, 50 or 100)
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 1)]
         refill: u32,
     },
     /// Show the wallet

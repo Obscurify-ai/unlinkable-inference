@@ -473,9 +473,9 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
         .unwrap();
     assert_eq!(resp.status(), 200, "the plan model works, with nothing set up");
     let st = status(&url).await;
-    assert!(st["wallet"]["paid_cents"].as_i64().unwrap() > 400, "{st}");
+    assert!(st["wallet"]["paid_cents"].as_i64().unwrap() > 0, "{st}");
     assert!(st["wallet"]["passes"].as_i64().unwrap() > 0);
-    assert_eq!(stack.backend.account_balance(&key), Some(1_500));
+    assert_eq!(stack.backend.account_balance(&key), Some(1_900), "one $1 top-up");
 
     let db = stack.backend.dump();
     for r in db["requests"].as_array().unwrap() {
