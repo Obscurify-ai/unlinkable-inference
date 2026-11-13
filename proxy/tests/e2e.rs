@@ -491,3 +491,108 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
         }
     }
 }
+
+/// Claude Code without a base URL change: `unlinkable mcp` runs as one of the
+/// agent's MCP servers, `unlinkable key` is its apiKeyHelper, and the agent
+/// sends the session secret straight to the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session_secret() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 2_000).await;
+    let wallet = temp_wallet();
+    let listen = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let bin = env!("CARGO_BIN_EXE_unlinkable");
+    let mut mcp = tokio::process::Command::new(bin)
+        .args(["mcp", "--listen", &listen, "--api-key", &key])
+        .env("UNLINKABLE_SERVER", &stack.server)
+        .env("UNLINKABLE_WALLET", &wallet)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+
+    // The agent's MCP handshake: no tools.
+    let mut stdin = mcp.stdin.take().unwrap();
+    let mut lines = tokio::io::BufReader::new(mcp.stdout.take().unwrap()).lines();
+    for msg in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ] {
+        stdin.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
+    }
+    let init: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(init["result"]["serverInfo"]["name"], "unlinkable");
+    let tools: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(tools["result"]["tools"], json!([]));
+
+    let get_key = || async {
+        let out = tokio::process::Command::new(bin)
+            .args(["key", "--listen", &listen])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let secret = get_key().await;
+    assert!(secret.starts_with(unlinkable_core::SESSION_SECRET_PREFIX), "{secret}");
+
+    // Straight to the server, no proxy in the way. 150k characters cost 30¢
+    // of the session's 50¢.
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{}/v1/chat/completions", stack.server))
+        .bearer_auth(&secret)
+        .json(&json!({"model": "echo", "messages": [{"role": "user", "content": "x".repeat(150_000)}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let balance = || async {
+        let st: Value = http
+            .get(format!("{}/u/sessions/current", stack.server))
+            .bearer_auth(&secret)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        unlinkable_core::net::usd_to_cents_floor(st["balance_usd"].as_str().unwrap())
+    };
+    assert!(balance().await < 50);
+    // The MCP server sees the balance drop and tops the session up before a
+    // request runs short.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while balance().await < 50 {
+        assert!(Instant::now() < deadline, "the session was never topped up");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(get_key().await, secret, "the same session until it goes idle");
+
+    // The agent exits: the session closes and its change is back in the wallet.
+    drop(stdin);
+    let status = tokio::time::timeout(Duration::from_secs(30), mcp.wait()).await.unwrap().unwrap();
+    assert!(status.success());
+    let w = Wallet::open(wallet).unwrap();
+    assert!(w.sessions().is_empty(), "no session left open");
+    assert!(w.balance_cents(Family::Paid) > 0);
+
+    let db = stack.backend.dump();
+    assert!(db["sessions"].as_array().unwrap().iter().all(|s| !s["closed_at"].is_null()));
+    for r in db["requests"].as_array().unwrap() {
+        if r["path"].as_str().unwrap().starts_with("/v1/") {
+            assert_eq!(r["credential"], "session", "{r}");
+        }
+        if r["credential"] == "account" {
+            let path = r["path"].as_str().unwrap();
+            assert!(path.starts_with("/u/withdraw") || path.starts_with("/u/passes"), "{r}");
+        }
+    }
+}

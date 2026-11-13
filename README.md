@@ -25,19 +25,50 @@ never seen. Nothing depends on a third party.
 
 ```sh
 cargo install --path proxy
-unlinkable serve                                     # http://127.0.0.1:8899
 ```
 
-Then use your usual key and change only the base URL. Claude Code:
+**As an MCP server** (Claude Code, Codex, anything with MCP): the agent starts
+the proxy and stops it when it exits, closing its sessions. The server entry
+has no tools:
+
+```json
+{"mcpServers": {"unlinkable": {"command": "unlinkable", "args": ["mcp"],
+  "env": {"OBSCURIFY_API_KEY": "sk-obs1_…"}}}}
+```
+
+Claude Code then keeps talking to the server directly; only the key changes,
+to a session secret from the proxy. In `.claude/settings.json`:
+
+```json
+{"apiKeyHelper": "unlinkable key",
+ "env": {"ANTHROPIC_BASE_URL": "https://obscurify.ai"}}
+```
+
+One session lasts until Claude Code goes quiet for 5 minutes; the proxy tops
+it up as it runs low. Codex has no key helper, so it goes through the proxy
+instead, as a profile next to the normal one (`codex --profile private`):
+
+```toml
+[model_providers.obscurify-private]
+name = "Obscurify (unlinkable)"
+base_url = "http://127.0.0.1:8899/v1"
+env_key = "OBSCURIFY_API_KEY"
+
+[profiles.private]
+model_provider = "obscurify-private"
+```
+
+**pi**: copy `integrations/pi/unlinkable.ts` to `~/.pi/agent/extensions/`. It
+starts the proxy when needed and adds an `obscurify-private` provider with the
+same models as your `obscurify` one; the normal provider stays.
+
+**On its own**: `unlinkable serve` (http://127.0.0.1:8899), then use your
+usual key and change only the base URL, e.g. Claude Code:
 
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=sk-obs1_… \
 ANTHROPIC_MODEL=deepseek/deepseek-v4.1-flash claude
 ```
-
-pi: copy `integrations/pi/unlinkable.ts` to `~/.pi/agent/extensions/`. It
-starts the proxy when needed and adds an `obscurify-private` provider with the
-same models as your `obscurify` one; the normal provider stays.
 
 OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, your usual key.
 The proxy uses that key for one thing: keeping the wallet (and this month's

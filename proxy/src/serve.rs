@@ -106,6 +106,20 @@ pub struct Proxy {
     account_key: Mutex<Option<String>>,
     /// After a failed top-up, wait before trying again
     refill_backoff: Mutex<Option<std::time::Instant>>,
+    /// The helper session's last seen balance (see [`Proxy::helper_secret`])
+    helper_balance: Mutex<String>,
+}
+
+/// The session handed out by `/_unlinkable/key` for agents that talk to the
+/// server directly (Claude Code's `apiKeyHelper`).
+const HELPER: &str = "helper";
+
+/// The server no longer knows this session (expired or closed elsewhere).
+fn gone(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<unlinkable_core::net::ApiError>(),
+        Some(unlinkable_core::net::ApiError::Server { status: 401 | 404 | 410, .. })
+    )
 }
 
 fn now() -> u64 {
@@ -213,6 +227,7 @@ impl Proxy {
             opening: tokio::sync::Mutex::new(()),
             account_key: Mutex::new(settings.account_key.clone()),
             refill_backoff: Mutex::new(None),
+            helper_balance: Mutex::new(String::new()),
             settings,
             opts,
         })
@@ -345,6 +360,71 @@ impl Proxy {
         Ok(entry)
     }
 
+    /// The secret of the helper session, opening one if there is none or the
+    /// server has closed it. Agents that send it straight to the server
+    /// (Claude Code's `apiKeyHelper`) ask again after a 401.
+    pub async fn helper_secret(&self) -> Result<String> {
+        let existing = self.sessions.lock().unwrap().get(HELPER).cloned();
+        if let Some(entry) = existing {
+            match self.client.status(&entry.session).await {
+                Ok(st) if st.closed => self.retire_entry(HELPER).await,
+                Err(e) if gone(&e) => self.retire_entry(HELPER).await,
+                // Open, or the server is unreachable: keep it, never drop a
+                // session that may still hold money.
+                _ => return Ok(entry.session.secret.clone()),
+            }
+        }
+        Ok(self.entry(HELPER).await?.session.secret.clone())
+    }
+
+    /// The helper session's requests never pass through here, so watch its
+    /// balance instead: a change means it is in use (not idle), and a low
+    /// balance gets topped up before a request fails for want of money.
+    pub async fn watch_helper(&self) {
+        let Some(entry) = self.sessions.lock().unwrap().get(HELPER).cloned() else {
+            return;
+        };
+        let st = match self.client.status(&entry.session).await {
+            Ok(st) if !st.closed => st,
+            Ok(_) => return self.retire_entry(HELPER).await,
+            Err(e) if gone(&e) => return self.retire_entry(HELPER).await,
+            Err(_) => return,
+        };
+        let changed = {
+            let mut last = self.helper_balance.lock().unwrap();
+            let changed = *last != st.balance_usd;
+            *last = st.balance_usd.clone();
+            changed
+        };
+        if changed {
+            entry.last_used.store(now(), Ordering::SeqCst);
+        }
+        if unlinkable_core::net::usd_to_cents_floor(&st.balance_usd) < self.settings.funding_cents {
+            let mut wallet = self.wallet.lock().await;
+            if wallet.balance_cents(entry.session.family) < self.settings.funding_cents {
+                drop(wallet);
+                self.refill(true).await;
+                wallet = self.wallet.lock().await;
+            }
+            if let Err(e) = self
+                .client
+                .topup(&mut wallet, &entry.session, self.settings.funding_cents)
+                .await
+            {
+                tracing::warn!("could not top up the helper session: {e:#}");
+            }
+        }
+    }
+
+    /// Stop using a session the server no longer serves and close it, so
+    /// its change comes back (an expired session can still be closed; if
+    /// closing fails it stays in the wallet for `recover`).
+    async fn retire_entry(&self, key: &str) {
+        if let Some(old) = self.drop_entry(key) {
+            self.close_entry(&old).await;
+        }
+    }
+
     fn drop_entry(&self, key: &str) -> Option<Arc<Entry>> {
         self.sessions.lock().unwrap().remove(key)
     }
@@ -466,14 +546,10 @@ impl Proxy {
                     continue;
                 }
                 401 if !reopened && !has_thread => {
-                    // The server forgot the session (expired): start a new one.
+                    // The session expired: close it for its change, start a new one.
                     entry.busy.fetch_sub(1, Ordering::SeqCst);
                     reopened = true;
-                    if let Some(old) = self.drop_entry(&key) {
-                        let mut wallet = self.wallet.lock().await;
-                        wallet.forget_session(&old.session.secret);
-                        let _ = wallet.save();
-                    }
+                    self.retire_entry(&key).await;
                     continue;
                 }
                 _ => {}
@@ -690,6 +766,10 @@ async fn control(proxy: &Proxy, method: &str, path: &str, headers: &HeaderMap, b
     match (method, path) {
         ("GET", "/_unlinkable") | ("GET", "/_unlinkable/") => Html(PAGE).into_response(),
         ("GET", "/_unlinkable/status") => Json(proxy.status_json().await).into_response(),
+        ("GET", "/_unlinkable/key") => match proxy.helper_secret().await {
+            Ok(secret) => secret.into_response(),
+            Err(e) => text(StatusCode::PAYMENT_REQUIRED, &format!("{e:#}")),
+        },
         ("POST", "/_unlinkable/withdraw") => {
             let cents = body["amount_cents"].as_i64().unwrap_or(0);
             let key = body["api_key"].as_str().unwrap_or("");
@@ -741,6 +821,7 @@ pub async fn run(
         let mut n: u64 = 0;
         loop {
             tick.tick().await;
+            closer.watch_helper().await;
             closer.close_idle().await;
             if n.is_multiple_of(12) {
                 closer.refill(false).await;

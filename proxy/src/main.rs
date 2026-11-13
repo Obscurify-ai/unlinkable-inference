@@ -36,36 +36,50 @@ struct Cli {
     command: Command,
 }
 
+#[derive(clap::Args)]
+struct ServeArgs {
+    #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
+    listen: String,
+    /// What each new session starts with, in dollars
+    #[arg(long, default_value = "0.50")]
+    session_funding: String,
+    /// conversation: a session per conversation; key: per API key the
+    /// client sends; run: one session until idle
+    #[arg(long, default_value = "conversation")]
+    per: Mode,
+    /// Close a session after this many seconds without a request
+    #[arg(long, default_value_t = 300)]
+    idle_close: u64,
+    /// Print what leaves this device for every request
+    #[arg(long)]
+    show_traffic: bool,
+    /// The account's API key: keeps the wallet and this month's passes
+    /// topped up in the background. Never sent with a chat. Without it
+    /// the proxy uses the first sk-obs1_ key a client sends.
+    #[arg(long, env = "OBSCURIFY_API_KEY")]
+    api_key: Option<String>,
+    /// Top up when the wallet falls below this many dollars
+    #[arg(long, default_value = "0.50")]
+    keep: String,
+    /// Top up by this many dollars (1, 5, 20, 50 or 100)
+    #[arg(long, default_value_t = 1)]
+    refill: u32,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the local proxy: OpenAI and Anthropic APIs on localhost
-    Serve {
+    Serve(ServeArgs),
+    /// The proxy as an MCP server with no tools: add it to an agent's MCP
+    /// servers and the proxy runs while the agent does. If another proxy
+    /// already runs, it stays idle. Pair it with `unlinkable key` as Claude
+    /// Code's apiKeyHelper, or point the agent's base URL at the proxy.
+    Mcp(ServeArgs),
+    /// Print a session secret to use in place of an API key (for Claude
+    /// Code's apiKeyHelper; needs `unlinkable mcp` or `serve` running)
+    Key {
         #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
         listen: String,
-        /// What each new session starts with, in dollars
-        #[arg(long, default_value = "0.50")]
-        session_funding: String,
-        /// conversation: a session per conversation; key: per API key the
-        /// client sends; run: one session until idle
-        #[arg(long, default_value = "conversation")]
-        per: Mode,
-        /// Close a session after this many seconds without a request
-        #[arg(long, default_value_t = 300)]
-        idle_close: u64,
-        /// Print what leaves this device for every request
-        #[arg(long)]
-        show_traffic: bool,
-        /// The account's API key: keeps the wallet and this month's passes
-        /// topped up in the background. Never sent with a chat. Without it
-        /// the proxy uses the first sk-obs1_ key a client sends.
-        #[arg(long, env = "OBSCURIFY_API_KEY")]
-        api_key: Option<String>,
-        /// Top up when the wallet falls below this many dollars
-        #[arg(long, default_value = "0.50")]
-        keep: String,
-        /// Top up by this many dollars (1, 5, 20, 50 or 100)
-        #[arg(long, default_value_t = 1)]
-        refill: u32,
     },
     /// Show the wallet
     Wallet,
@@ -133,47 +147,31 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Command::Serve {
-            listen,
-            session_funding,
-            per,
-            idle_close,
-            show_traffic,
-            api_key,
-            keep,
-            refill,
-        } => {
-            let _lock = lock_wallet(&opts)?;
-            let mut wallet = Wallet::open(opts.wallet_path())?;
-            let client = connect(&opts, &mut wallet).await?;
-            match client.recover(&mut wallet).await {
-                Ok(0) => {}
-                Ok(c) => eprintln!("unlinkable: recovered {} from an earlier run", dollars(c)),
-                Err(e) => eprintln!("unlinkable: could not finish an earlier run's work yet: {e:#}"),
-            }
-            let settings = Settings {
-                funding_cents: parse_dollars(&session_funding)?,
-                mode: per,
-                idle_close: Duration::from_secs(idle_close),
-                show_traffic,
-                account_key: api_key,
-                keep_cents: parse_dollars(&keep)?,
-                refill_cents: refill as i64 * 100,
-                keep_passes: 10,
-                account_key_prefix: "sk-obs1_".into(),
-            };
-            eprintln!(
-                "unlinkable: wallet {} ({}); proxy on http://{listen} (page: http://{listen}/_unlinkable)",
-                dollars(wallet.balance_cents(Family::Paid) + wallet.balance_cents(Family::Promo)),
-                wallet.path().display()
-            );
-            let proxy = serve::Proxy::new(client, wallet, settings, opts.clone());
-            let listener = tokio::net::TcpListener::bind(&listen).await?;
+        Command::Serve(args) => {
+            let (proxy, listener, _lock) = start(&opts, args).await?;
             serve::run(listener, proxy, async {
                 let _ = tokio::signal::ctrl_c().await;
                 eprintln!("unlinkable: closing sessions…");
             })
             .await?;
+        }
+        Command::Mcp(args) => mcp(&opts, args).await?,
+        Command::Key { listen } => {
+            // The agent may ask before the MCP server has started the proxy.
+            let url = format!("http://{listen}/_unlinkable/key");
+            let mut last = String::new();
+            for _ in 0..60 {
+                match reqwest::get(&url).await {
+                    Ok(r) if r.status().is_success() => {
+                        println!("{}", r.text().await?);
+                        return Ok(());
+                    }
+                    Ok(r) => last = r.text().await.unwrap_or_default(),
+                    Err(e) => last = e.to_string(),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            bail!("no session from the proxy at {listen}: {last}");
         }
         Command::Wallet => {
             let mut wallet = Wallet::open(opts.wallet_path())?;
@@ -289,6 +287,102 @@ async fn main() -> Result<()> {
         }
         Command::Verify { published } => {
             verify(&opts, published).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn start(
+    opts: &Options,
+    args: ServeArgs,
+) -> Result<(std::sync::Arc<serve::Proxy>, tokio::net::TcpListener, unlinkable_proxy::WalletLock)> {
+    let ServeArgs {
+        listen,
+        session_funding,
+        per,
+        idle_close,
+        show_traffic,
+        api_key,
+        keep,
+        refill,
+    } = args;
+    let lock = lock_wallet(opts)?;
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    let mut wallet = Wallet::open(opts.wallet_path())?;
+    let client = connect(opts, &mut wallet).await?;
+    match client.recover(&mut wallet).await {
+        Ok(0) => {}
+        Ok(c) => eprintln!("unlinkable: recovered {} from an earlier run", dollars(c)),
+        Err(e) => eprintln!("unlinkable: could not finish an earlier run's work yet: {e:#}"),
+    }
+    let settings = Settings {
+        funding_cents: parse_dollars(&session_funding)?,
+        mode: per,
+        idle_close: Duration::from_secs(idle_close),
+        show_traffic,
+        account_key: api_key,
+        keep_cents: parse_dollars(&keep)?,
+        refill_cents: refill as i64 * 100,
+        keep_passes: 10,
+        account_key_prefix: "sk-obs1_".into(),
+    };
+    eprintln!(
+        "unlinkable: wallet {} ({}); proxy on http://{listen} (page: http://{listen}/_unlinkable)",
+        dollars(wallet.balance_cents(Family::Paid) + wallet.balance_cents(Family::Promo)),
+        wallet.path().display()
+    );
+    Ok((serve::Proxy::new(client, wallet, settings, opts.clone()), listener, lock))
+}
+
+/// A minimal MCP server (stdio, JSON-RPC per line) with no tools: it exists so
+/// the agent starts and stops the proxy. Ends when the agent closes stdin.
+async fn mcp(opts: &Options, args: ServeArgs) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+    let rpc = tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let mut out = tokio::io::stdout();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(id) = msg.get("id").cloned() else {
+                continue; // a notification
+            };
+            let reply = match msg["method"].as_str().unwrap_or("") {
+                "initialize" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "unlinkable", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": "Runs the unlinkable proxy while the agent runs. It has no tools."
+                }}),
+                "tools/list" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}),
+                "ping" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                _ => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}}),
+            };
+            let mut bytes = reply.to_string().into_bytes();
+            bytes.push(b'\n');
+            if out.write_all(&bytes).await.is_err() || out.flush().await.is_err() {
+                break;
+            }
+        }
+        let _ = eof_tx.send(());
+    });
+    match start(opts, args).await {
+        Ok((proxy, listener, _lock)) => {
+            serve::run(listener, proxy, async {
+                tokio::select! {
+                    _ = eof_rx => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            })
+            .await?;
+        }
+        Err(e) => {
+            // Another agent's MCP server (or `unlinkable serve`) has it.
+            eprintln!("unlinkable: not starting a proxy here: {e:#}");
+            let _ = rpc.await;
         }
     }
     Ok(())
