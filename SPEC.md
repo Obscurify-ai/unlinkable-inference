@@ -54,7 +54,7 @@ JSON serialisation with both key lists sorted by value, fields in the order
 above. Clients accept a keyset only if its fingerprint is pinned (built into
 the release, given with `--pin`, or pinned on first use for servers with no
 built-in pins) and every `key_id` matches its key. Published pins for
-obscurify.ai live in `keys/obscurify.ai.pins`.
+obscurify.ai live in `core/keys/obscurify.ai.pins`.
 
 ## Endpoints
 
@@ -84,8 +84,10 @@ Rules:
 - **Open** needs at least the server's minimum (10¢ by default) and spends
   every voucher or none. Vouchers must share a family and not
   repeat; up to 64. If any were spent before: 409 with `spent` = their indexes,
-  and nothing is spent. A repeat open with the same `secret_hash` returns the
-  existing session and spends nothing. With `"pass"`, the session gets the
+  and nothing is spent. A repeat open with the same `secret_hash` (the same
+  vouchers, all spent by the first) returns the existing session and spends
+  nothing; with any voucher not yet spent it is someone else's secret: 409
+  `secret_taken`, nothing spent, pick another. With `"pass"`, the session gets the
   pass's tier (its plan's models); a pass opens one session (409
   `pass_spent` after that) and only in its own month.
 - **Close** rounds the balance **up** to the next millicent (a session never

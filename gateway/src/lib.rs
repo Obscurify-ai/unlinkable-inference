@@ -157,8 +157,9 @@ pub trait Backend: Send + Sync + 'static {
     }
     /// Spend `spends` (and `pass`, if given: answer 409 `pass_spent` if it was
     /// used before) and open a session holding their total, with the pass's
-    /// tier. If a session with `secret_hash` exists, return its status and
-    /// spend nothing.
+    /// tier. If a session with `secret_hash` exists: when every voucher in
+    /// `spends` is already spent (a retry), return its status and spend
+    /// nothing; otherwise answer 409 `secret_taken` (another device's secret).
     async fn open_session(
         &self,
         secret_hash: &str,

@@ -6,13 +6,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["privacy", "blind-signatures", "ecash", "llm", "anonymity"]
 
 [[bin]]
 name = "unlinkable"
 path = "src/main.rs"
 
 [dependencies]
-unlinkable-core = { path = "../core", features = ["net"] }
+unlinkable-core = { workspace = true, features = ["net"] }
 anyhow.workspace = true
 axum.workspace = true
 bytes.workspace = true

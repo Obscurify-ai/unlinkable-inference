@@ -238,7 +238,12 @@ impl Backend for MemoryBackend {
     ) -> Result<SessionStatus, GatewayError> {
         let mut db = self.db.lock().unwrap();
         if let Some(row) = db.sessions.get(secret_hash) {
-            return Ok(self.status_of(row));
+            // A retried open presents the vouchers the first one spent. Any
+            // unspent voucher means a different open with the same secret.
+            if spends.iter().all(|s| db.spent.contains_key(&s.hash)) {
+                return Ok(self.status_of(row));
+            }
+            return Err(GatewayError::Status(StatusCode::CONFLICT, "secret_taken", "That session secret is taken; pick another.".into()));
         }
         if let Some(p) = pass {
             if db.spent_passes.contains_key(&p.hash) {

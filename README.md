@@ -10,13 +10,52 @@ How it works, in one paragraph: your device holds a wallet of blind-signed
 vouchers. Each conversation opens a session paid with a few of them and uses a
 random session secret instead of an API key. When the conversation goes quiet
 the session closes and the change comes back as fresh vouchers the server has
-never seen. Nothing depends on a third party.
+never seen. Everything is derived from the account number, so a device that
+forgets it all gets the money back at the next sign-in. Nothing depends on a
+third party.
+
+![How unlinkable sessions work](https://raw.githubusercontent.com/Obscurify-ai/unlinkable/main/docs/how-it-works.svg)
+
+## Use it in an app
+
+The client logic is one Rust crate, `unlinkable-core`; browsers get the same
+code as WebAssembly in the npm package `@obscurify/unlinkable`.
+
+**Rust** (`cargo add unlinkable-core`):
+
+```rust
+use unlinkable_core::{manager::Manager, seed::account_keys};
+
+let keys = account_keys(&number)?;            // slow on purpose, ~1 s
+// sign in with keys.login_key; keep keys.seed on the device
+let mut m = Manager::connect(server, keys.seed, saved.as_deref()).await?;
+m.api_key = Some(api_key);                     // used only to top the wallet up
+m.start().await?;                              // brings back what a lost device left
+let secret = m.session(&conversation_id).await?; // send as Authorization: Bearer
+save(m.state());                               // after every call
+// 402: m.ran_out(&secret, attempt), retry. 401: m.expired(&secret), new session.
+// Every 30 s: m.tick().await (closes quiet sessions for their change, tops up).
+```
+
+**Browser** (`npm install @obscurify/unlinkable`):
+
+```js
+import * as unlinkable from '@obscurify/unlinkable';
+
+const { loginKey, seed } = await unlinkable.keys(number); // sign in with loginKey
+const u = await unlinkable.connect({ seed, apiKey });     // wallet kept in localStorage
+const res = await u.fetch('/v1/chat/completions', { method: 'POST', headers, body }, { chat: conversationId });
+```
+
+`u.fetch` sends the conversation's session secret with `credentials: 'omit'`,
+so no cookie goes with it, and tops the session up when it runs out.
 
 ## Parts
 
 | Crate | What | Licence |
 |---|---|---|
-| `core` | vouchers, blinding, wallet, sessions, key pinning | MIT or Apache-2.0 |
+| `core` | vouchers, blinding, wallet, sessions, key pinning, seed, `Manager` | MIT or Apache-2.0 |
+| `wasm` | `core` for browsers: npm `@obscurify/unlinkable` (`wasm/build.sh`) | MIT or Apache-2.0 |
 | `gateway` | session endpoints and voucher checks (axum) | MIT or Apache-2.0 |
 | `reference-server` | gateway + in-memory storage + echo model + play money + full DB dump | MIT or Apache-2.0 |
 | `proxy` | `unlinkable`: local OpenAI/Anthropic API, wallet CLI, `verify` | GPL-3.0-or-later |

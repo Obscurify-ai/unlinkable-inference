@@ -56,6 +56,20 @@ pub fn account_keys(number: &str) -> anyhow::Result<AccountKeys> {
     })
 }
 
+/// A new random 16-digit account number, made on the device so the server
+/// never learns it.
+pub fn new_account_number() -> String {
+    let mut digits = String::new();
+    while digits.len() < 16 {
+        let b: u8 = rand::random();
+        // 250..=255 are skipped so every digit is equally likely.
+        if b < 250 {
+            digits.push(char::from(b'0' + b % 10));
+        }
+    }
+    digits
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Seed(pub [u8; 32]);
 
@@ -65,8 +79,11 @@ impl std::fmt::Debug for Seed {
     }
 }
 
-/// How many sessions a device may open in one minute: recovery tries each.
-pub const SESSIONS_PER_MINUTE: u32 = 4;
+/// Session secrets per minute. A device picks one it isn't using; two devices
+/// on one account picking the same one is caught by the server (409
+/// `secret_taken`) and the second picks again. Recovery tries each: cheap,
+/// it's an HMAC apiece.
+pub const SESSIONS_PER_MINUTE: u32 = 64;
 
 impl Seed {
     /// 32 bytes for `parts` (length-prefixed, so parts cannot run together).

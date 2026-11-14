@@ -442,7 +442,7 @@ async fn verify(opts: &Options, published: Option<String>) -> Result<()> {
     }
     let published = published.or_else(|| {
         (opts.host() == "obscurify.ai").then(|| {
-            "https://raw.githubusercontent.com/Obscurify-ai/unlinkable/main/keys/obscurify.ai.pins"
+            "https://raw.githubusercontent.com/Obscurify-ai/unlinkable/main/core/keys/obscurify.ai.pins"
                 .to_string()
         })
     });

@@ -6,6 +6,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["privacy", "blind-signatures", "ecash", "llm", "anonymity"]
 
 [dependencies]
 unlinkable-core.workspace = true

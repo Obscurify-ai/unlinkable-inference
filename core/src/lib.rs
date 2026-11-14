@@ -20,6 +20,8 @@ pub mod wallet;
 
 #[cfg(feature = "net")]
 pub mod net;
+#[cfg(feature = "net")]
+pub mod manager;
 
 pub use blank::Blank;
 pub use denominations::{split, DENOMINATIONS, WITHDRAW_SIZES};

@@ -318,11 +318,20 @@ impl Client {
     }
 
     /// A secret for a new session: derived from (this minute, k) when seeded.
-    fn new_secret(&self) -> String {
+    /// A secret for a new session: from the seed, one of this minute's that
+    /// the wallet isn't already using.
+    fn new_secret(&self, wallet: &Wallet) -> String {
         match &self.seed {
             Some(seed) => {
-                let k = rand::random::<u32>() % crate::seed::SESSIONS_PER_MINUTE;
-                seed.session_secret(now() / 60, k)
+                let minute = now() / 60;
+                let free: Vec<String> = (0..crate::seed::SESSIONS_PER_MINUTE)
+                    .map(|k| seed.session_secret(minute, k))
+                    .filter(|s| !wallet.sessions().iter().any(|o| &o.secret == s))
+                    .collect();
+                match free.len() {
+                    0 => seed.session_secret(minute, rand::random::<u32>() % crate::seed::SESSIONS_PER_MINUTE),
+                    n => free[rand::random::<usize>() % n].clone(),
+                }
             }
             None => crate::new_session_secret(),
         }
@@ -443,7 +452,7 @@ impl Client {
                 );
             }
             let codes: Vec<String> = vouchers.iter().map(Voucher::encode).collect();
-            let secret = self.new_secret();
+            let secret = self.new_secret(wallet);
             wallet.remember_session(OpenSession {
                 secret: secret.clone(),
                 family,
@@ -463,6 +472,14 @@ impl Client {
                 Ok(_) => {
                     wallet.save()?;
                     return Ok(Session { secret, family });
+                }
+                Err(ApiError::Server { status: 409, body }) if body.error.kind == "secret_taken" => {
+                    // Another device on this account opened a session with
+                    // this secret: nothing was spent, pick another.
+                    put_back(wallet, &pass);
+                    wallet.add(family, vouchers);
+                    wallet.forget_session(&secret);
+                    wallet.save()?;
                 }
                 Err(ApiError::Server { status: 409, body }) if body.error.kind == "pass_spent" => {
                     // That pass was used already: drop it, nothing else was spent.

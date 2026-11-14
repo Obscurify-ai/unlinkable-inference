@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["privacy", "blind-signatures", "ecash", "llm", "anonymity"]
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

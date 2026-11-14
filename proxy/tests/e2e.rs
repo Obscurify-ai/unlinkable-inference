@@ -670,3 +670,100 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     let hashes: Vec<&str> = db["sessions"].as_array().unwrap().iter().map(|s| s["secret_hash"].as_str().unwrap()).collect();
     assert_eq!(hashes, vec![unlinkable_core::sha256_hex(&s3.secret)], "only the session whose change is still held");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_loses_nothing() {
+    use unlinkable_core::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 2_000).await;
+    let seed = unlinkable_core::seed::account_keys("7730 1945 2286 0413").unwrap().seed;
+    let chat = |secret: String| {
+        let server = stack.server.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{server}/v1/chat/completions"))
+                .bearer_auth(secret)
+                .json(&json!({"model": "echo", "messages": [{"role": "user", "content": "x".repeat(20_000)}]}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.start().await.unwrap();
+    assert!(m.summary().0 >= 50, "topped up at start");
+    let a = m.session("chat-a").await.unwrap();
+    let b = m.session("chat-b").await.unwrap();
+    assert_ne!(a, b, "one session per conversation");
+    assert_eq!(m.session("chat-a").await.unwrap(), a, "and it stays with the conversation");
+    assert_eq!(chat(a.clone()).await, 200);
+    assert_eq!(chat(b.clone()).await, 200);
+
+    // Saved state carries on in a restarted app: same conversation, same session.
+    let saved = m.state();
+    drop(m);
+    let mut m = Manager::connect(&stack.server, seed.clone(), Some(&saved)).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.start().await.unwrap();
+    assert_eq!(m.session("chat-a").await.unwrap(), a);
+
+    // Quiet conversations are closed for their change.
+    m.policy.idle_secs = 0;
+    m.tick().await;
+    let db = stack.backend.dump();
+    assert!(db["sessions"].as_array().unwrap().iter().all(|s| !s["closed_at"].is_null()), "{}", db["sessions"]);
+
+    // A new device with nothing saved ends up with the same money.
+    let had = m.wallet().balance_millicents(Family::Paid);
+    let mut fresh = Manager::connect(&stack.server, seed, None).await.unwrap();
+    fresh.api_key = Some(key);
+    fresh.policy.keep_cents = 0; // no top-up, to compare
+    fresh.start().await.unwrap();
+    assert_eq!(fresh.wallet().balance_millicents(Family::Paid), had);
+    two_devices_never_share_a_session(&stack.server, &new_account(&stack.server, 2_000).await).await;
+}
+
+/// Two devices on one account opening many sessions in the same minute pick
+/// some of the same secrets (64 a minute); the server refuses the second
+/// (`secret_taken`) and it picks again, so none is shared and nothing is lost.
+async fn two_devices_never_share_a_session(server: &str, key: &str) {
+    use unlinkable_core::manager::Manager;
+    let seed = unlinkable_core::seed::account_keys("1188 6021 4459 3307").unwrap().seed;
+    let mut phone = Manager::connect(server, seed.clone(), None).await.unwrap();
+    let mut laptop = Manager::connect(server, seed, None).await.unwrap();
+    let mut secrets = std::collections::HashSet::new();
+    for m in [&mut phone, &mut laptop] {
+        m.api_key = Some(key.to_string());
+        m.policy.funding_cents = 10;
+        m.policy.refill_cents = 500; // a fixed withdrawal size
+    }
+    for i in 0..20 {
+        for m in [&mut phone, &mut laptop] {
+            let s = m.session(&format!("chat-{i}")).await.unwrap();
+            assert!(secrets.insert(s), "a secret was handed out twice");
+        }
+    }
+    let held = |m: &Manager| m.wallet().balance_millicents(Family::Paid);
+    for m in [&mut phone, &mut laptop] {
+        let before = held(m);
+        m.policy.idle_secs = 0;
+        m.policy.keep_cents = 0;
+        m.tick().await;
+        // Sessions are funded with whole vouchers (50¢ pieces), at least 10¢ each.
+        assert!(held(m) >= before + 20 * 10_000, "every unused session's money comes back");
+        assert!(m.wallet().sessions().is_empty());
+    }
+}
+
+/// The same against a real server (spends nothing for good: every session closes unused):
+///   UNLINKABLE_SERVER=http://127.0.0.1:8230 UNLINKABLE_KEY=sk-obs1_… cargo test -p unlinkable-proxy --test e2e -- --ignored
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn against_a_real_server_two_devices_never_share_a_session() {
+    let server = std::env::var("UNLINKABLE_SERVER").expect("UNLINKABLE_SERVER");
+    let key = std::env::var("UNLINKABLE_KEY").expect("UNLINKABLE_KEY");
+    two_devices_never_share_a_session(&server, &key).await;
+}

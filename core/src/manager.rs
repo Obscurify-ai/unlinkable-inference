@@ -1,0 +1,205 @@
+//! What a chat app does with a wallet, so every app does it the same way: one
+//! session per conversation, opened on its first request and closed for its
+//! change once it has been quiet a while; the wallet topped up from the
+//! account at quiet moments; and everything a lost device left behind
+//! brought back at start.
+//!
+//! The app keeps the account number's seed and `Manager::state()` (save it
+//! after every call; a crash between saves loses nothing, `start` restores
+//! it from the seed) and sends `session(chat)` as `Authorization: Bearer`.
+//! On a 402 it calls `ran_out` and retries; on a 401, `expired` and asks for a
+//! new session.
+
+use crate::net::{Client, Session, Transport};
+use crate::seed::Seed;
+use crate::{unix_now, Family, Wallet};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug)]
+pub struct Policy {
+    /// What a session starts with.
+    pub funding_cents: i64,
+    /// Top the wallet up when it holds less than this...
+    pub keep_cents: i64,
+    /// ...by this much: one of `WITHDRAW_SIZES` (fixed, so withdrawals look alike).
+    pub refill_cents: i64,
+    /// Keep this many of this month's passes (on a plan), getting `pass_batch` at a time.
+    pub keep_passes: usize,
+    pub pass_batch: i64,
+    /// Close a conversation's session after this long without a request.
+    pub idle_secs: u64,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Policy { funding_cents: 50, keep_cents: 50, refill_cents: 100, keep_passes: 10, pass_batch: 30, idle_secs: 300 }
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct State {
+    #[serde(default)]
+    wallet: Option<serde_json::Value>,
+    /// conversation → (session secret, last used, Unix seconds)
+    #[serde(default)]
+    chats: BTreeMap<String, (String, u64)>,
+    /// held reply → the secret of the session that asked for it
+    #[serde(default)]
+    replies: BTreeMap<String, String>,
+}
+
+pub struct Manager {
+    client: Client,
+    wallet: Wallet,
+    chats: BTreeMap<String, (String, u64)>,
+    replies: BTreeMap<String, String>,
+    pub policy: Policy,
+    /// The account's API key, used only to top the wallet up. Without it the
+    /// wallet spends what it holds.
+    pub api_key: Option<String>,
+}
+
+impl Manager {
+    /// Connect to `server` with the account's seed and the state saved last
+    /// time (`None` on a new device). Pins the server's keys on first use and
+    /// refuses a server whose keys changed.
+    pub async fn connect(server: &str, seed: Seed, state: Option<&str>) -> Result<Self> {
+        let st: State = match state.filter(|s| !s.trim().is_empty()) {
+            Some(s) => serde_json::from_str(s)?,
+            None => State::default(),
+        };
+        let mut wallet = match &st.wallet {
+            Some(w) => Wallet::from_json(&w.to_string())?,
+            None => Wallet::in_memory(),
+        };
+        let transport = Transport::new(server);
+        let keyset = transport.fetch_keyset().await?;
+        keyset.check()?;
+        let fp = keyset.fingerprint();
+        match wallet.pinned() {
+            Some(p) if p != fp => anyhow::bail!("the server's keys changed ({fp}, pinned {p})"),
+            Some(_) => {}
+            None => wallet.pin(Some(fp)),
+        }
+        Ok(Manager {
+            client: Client::new(transport, keyset).with_seed(seed),
+            wallet,
+            chats: st.chats,
+            replies: st.replies,
+            policy: Policy::default(),
+            api_key: None,
+        })
+    }
+
+    /// Everything to save, as JSON.
+    pub fn state(&self) -> String {
+        let wallet = serde_json::from_str(&self.wallet.to_json()).ok();
+        serde_json::to_string(&State { wallet, chats: self.chats.clone(), replies: self.replies.clone() }).unwrap_or_default()
+    }
+
+    /// At app start: sessions this device opened that no conversation uses
+    /// any more are closed for their change; whatever a closed app or another
+    /// device left behind (an open session, change not collected, the whole
+    /// wallet after a wipe) comes back; then the wallet is topped up.
+    /// Resolves to the cents recovered.
+    pub async fn start(&mut self) -> Result<i64> {
+        let in_use: Vec<String> = self.chats.values().map(|(s, _)| s.clone()).chain(self.replies.values().cloned()).collect();
+        for open in self.wallet.sessions().to_vec() {
+            if !in_use.contains(&open.secret) {
+                let _ = self.client.close(&mut self.wallet, &Session { secret: open.secret, family: open.family }).await;
+            }
+        }
+        let got = self.client.restore(&mut self.wallet, self.api_key.as_deref()).await?;
+        self.refill().await;
+        Ok(got)
+    }
+
+    /// The session secret for conversation `chat`, opening one if it has none.
+    pub async fn session(&mut self, chat: &str) -> Result<String> {
+        if let Some((secret, used)) = self.chats.get_mut(chat) {
+            *used = unix_now();
+            return Ok(secret.clone());
+        }
+        let cents = self.policy.funding_cents;
+        let opened = match self.client.open(&mut self.wallet, Family::Paid, cents).await {
+            Ok(s) => s,
+            Err(_) => {
+                self.refill().await;
+                self.client.open(&mut self.wallet, Family::Paid, cents).await?
+            }
+        };
+        self.chats.insert(chat.to_string(), (opened.secret.clone(), unix_now()));
+        Ok(opened.secret)
+    }
+
+    /// The secret of the session that asked for held reply `id`.
+    pub fn reply(&self, id: &str) -> Option<String> {
+        self.replies.get(id).cloned()
+    }
+
+    /// The server is holding a reply for this session: reading it later needs the same secret.
+    pub fn note_reply(&mut self, id: &str, secret: &str) {
+        self.replies.insert(id.to_string(), secret.to_string());
+    }
+
+    /// The session ran out of money (402): add more, doubling with each `attempt`.
+    pub async fn ran_out(&mut self, secret: &str, attempt: u32) -> Result<()> {
+        let session = Session { secret: secret.to_string(), family: Family::Paid };
+        let cents = self.policy.funding_cents << attempt.min(8);
+        if self.client.topup(&mut self.wallet, &session, cents).await.is_err() {
+            self.refill().await;
+            self.client.topup(&mut self.wallet, &session, cents).await?;
+        }
+        Ok(())
+    }
+
+    /// The server no longer takes this session (401): its conversation gets a new one.
+    pub fn expired(&mut self, secret: &str) {
+        self.chats.retain(|_, (s, _)| s != secret);
+    }
+
+    /// Call every 30 s or so: closes conversations' sessions that have been
+    /// quiet for `idle_secs` (their change comes back) and tops the wallet up.
+    pub async fn tick(&mut self) {
+        let now = unix_now();
+        let idle: Vec<String> = self
+            .chats
+            .iter()
+            .filter(|(_, (_, used))| now.saturating_sub(*used) >= self.policy.idle_secs)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for chat in idle {
+            if let Some((secret, _)) = self.chats.remove(&chat) {
+                self.replies.retain(|_, s| *s != secret);
+                // On failure the session stays in the wallet; `start` closes it next time.
+                let _ = self.client.close(&mut self.wallet, &Session { secret, family: Family::Paid }).await;
+            }
+        }
+        self.refill().await;
+    }
+
+    /// Top the wallet and passes up, and let the server forget records whose
+    /// money is fully spent. Failures wait for the next tick.
+    pub async fn refill(&mut self) {
+        let Some(key) = self.api_key.clone() else { return };
+        if self.wallet.balance_cents(Family::Paid) < self.policy.keep_cents {
+            let _ = self.client.withdraw(&mut self.wallet, &key, self.policy.refill_cents).await;
+        }
+        if self.wallet.passes(&crate::pass::current_period()).len() < self.policy.keep_passes {
+            let _ = self.client.get_passes(&mut self.wallet, &key, self.policy.pass_batch).await;
+        }
+        let _ = self.client.flush_done(&mut self.wallet, Some(&key)).await;
+    }
+
+    /// (cents in the wallet, this month's passes)
+    pub fn summary(&mut self) -> (i64, usize) {
+        let passes = self.wallet.passes(&crate::pass::current_period()).len();
+        (self.wallet.balance_cents(Family::Paid), passes)
+    }
+
+    pub fn wallet(&self) -> &Wallet {
+        &self.wallet
+    }
+}
