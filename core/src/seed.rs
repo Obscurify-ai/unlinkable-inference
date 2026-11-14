@@ -17,7 +17,7 @@ use blind_rsa_signatures::reexports::rsa::rand_core::{TryCryptoRng, TryRng};
 /// Argon2id cost: about a second in a browser, so guessing all 10^16 numbers
 /// is out of reach.
 const ARGON2_MEMORY_KIB: u32 = 64 * 1024;
-const ARGON2_PASSES: u32 = 2;
+const ARGON2_PASSES: u32 = 8;
 const MASTER_SALT: &[u8] = b"obscurify-account-v1";
 
 /// The two things the account number gives a device.

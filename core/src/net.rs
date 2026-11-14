@@ -90,6 +90,7 @@ pub type Observer = Arc<dyn Fn(&Observed) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Transport {
+    #[cfg(not(target_arch = "wasm32"))]
     http: reqwest::Client,
     /// Server origin, e.g. `https://obscurify.ai`
     pub server: String,
@@ -101,6 +102,7 @@ impl Transport {
     /// proxy variables (`HTTPS_PROXY`, `ALL_PROXY`) are honoured.
     pub fn new(server: &str) -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             http: reqwest::Client::builder()
                 .user_agent("unlinkable")
                 .build()
@@ -142,18 +144,59 @@ impl Transport {
     }
 
     pub async fn send(&self, req: Request) -> Result<Response> {
-        let url = format!("{}{}", self.server, req.path);
-        let method = reqwest::Method::from_bytes(req.method.as_bytes())?;
-        let mut builder = self.http.request(method, &url);
-        for (k, v) in &req.headers {
-            builder = builder.header(k, v);
-        }
         if let Some(observer) = &self.observer {
             observer(&Observed {
                 server: self.server.clone(),
                 bytes_sent: req.body.len(),
                 server_sees: Self::describe(&req),
             });
+        }
+        self.fetch(req).await
+    }
+
+    /// In a browser: `fetch` with credentials "omit", so the site's cookies
+    /// (the account's sign-in) never go with a session request.
+    #[cfg(target_arch = "wasm32")]
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        use wasm_bindgen::JsCast;
+        let js = |e: wasm_bindgen::JsValue| anyhow!("fetch: {e:?}");
+        let init = web_sys::RequestInit::new();
+        init.set_method(&req.method);
+        init.set_credentials(web_sys::RequestCredentials::Omit);
+        let headers = web_sys::Headers::new().map_err(js)?;
+        for (k, v) in &req.headers {
+            headers.set(k, v).map_err(js)?;
+        }
+        init.set_headers(&headers);
+        if !req.body.is_empty() {
+            init.set_body(&js_sys::Uint8Array::from(&req.body[..]));
+        }
+        let url = format!("{}{}", self.server, req.path);
+        let request = web_sys::Request::new_with_str_and_init(&url, &init).map_err(js)?;
+        let global = js_sys::global();
+        let promise = match global.dyn_ref::<web_sys::Window>() {
+            Some(window) => window.fetch_with_request(&request),
+            None => global.unchecked_ref::<web_sys::WorkerGlobalScope>().fetch_with_request(&request),
+        };
+        let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(promise).await.map_err(js)?.unchecked_into();
+        let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(js)?)
+            .await
+            .map_err(js)?;
+        let body = Bytes::from(js_sys::Uint8Array::new(&buf).to_vec());
+        Ok(Response {
+            status: resp.status(),
+            headers: Vec::new(),
+            body: futures::stream::once(async move { Ok(body) }).boxed(),
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        let url = format!("{}{}", self.server, req.path);
+        let method = reqwest::Method::from_bytes(req.method.as_bytes())?;
+        let mut builder = self.http.request(method, &url);
+        for (k, v) in &req.headers {
+            builder = builder.header(k, v);
         }
         let resp = builder.body(req.body).send().await?;
         let status = resp.status().as_u16();
@@ -190,12 +233,7 @@ impl Transport {
     }
 
     pub async fn fetch_keyset(&self) -> Result<Keyset> {
-        let url = format!("{}/u/keys", self.server);
-        let resp = self.http.get(&url).send().await?;
-        if !resp.status().is_success() {
-            bail!("{url} answered {}", resp.status());
-        }
-        Ok(resp.json().await?)
+        Ok(self.json(Request::get("/u/keys")).await?)
     }
 }
 
@@ -243,10 +281,7 @@ fn prefix(hash: &str) -> &str {
 }
 
 fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::unix_now()
 }
 
 /// Whole cents in a decimal USD string, rounded down.
@@ -983,7 +1018,8 @@ impl Client {
             for k in 0..crate::seed::SESSIONS_PER_MINUTE {
                 let secret = seed.session_secret(m, k);
                 let hash = crate::sha256_hex(&secret);
-                if !wanted.contains(prefix(&hash)) {
+                // A session this device still knows is in use, not stranded.
+                if !wanted.contains(prefix(&hash)) || wallet.sessions().iter().any(|s| s.secret == secret) {
                     continue;
                 }
                 let status = match self.status(&Session { secret: secret.clone(), family: Family::Paid }).await {

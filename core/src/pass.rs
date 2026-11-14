@@ -40,12 +40,7 @@ pub fn period_at(unix: u64) -> String {
 }
 
 pub fn current_period() -> String {
-    period_at(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    )
+    period_at(crate::unix_now())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

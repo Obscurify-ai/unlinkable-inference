@@ -30,6 +30,21 @@ pub use wallet::Wallet;
 /// Session secrets look like API keys so OpenAI and Anthropic SDKs accept them.
 pub const SESSION_SECRET_PREFIX: &str = "sk-unl1_";
 
+/// Seconds since 1970 (in a browser, from `Date.now()`: `SystemTime` panics there).
+pub fn unix_now() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
 /// SHA-256, hex.
 pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
     use sha2::Digest;
