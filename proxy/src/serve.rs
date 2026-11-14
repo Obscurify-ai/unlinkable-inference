@@ -304,6 +304,13 @@ impl Proxy {
                 }
             }
         }
+        if self.client.seed.is_some() {
+            // Let the server forget what is fully spent (at this quiet moment,
+            // not when a session opens).
+            if let Err(e) = self.client.flush_done(&mut wallet, Some(&key)).await {
+                tracing::warn!("could not mark spent records done: {e:#}");
+            }
+        }
         let _ = wallet.save();
         *self.refill_backoff.lock().unwrap() = failed.then(std::time::Instant::now);
     }

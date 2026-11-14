@@ -110,6 +110,24 @@ pub async fn connect(opts: &Options, wallet: &mut Wallet) -> Result<Client> {
     Ok(Client::new(opts.transport(), keyset))
 }
 
+/// The account's API key, from its login key (the number never leaves this
+/// device). Obscurify's `POST /generate_token`.
+pub async fn api_key_for(opts: &Options, login_key: &str) -> Result<String> {
+    let resp = opts
+        .transport()
+        .send(unlinkable_core::net::Request::post_json(
+            "/generate_token",
+            &serde_json::json!({ "account_key": login_key }),
+        ))
+        .await?;
+    let status = resp.status;
+    let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await?).unwrap_or_default();
+    match body["token"].as_str() {
+        Some(t) if status == 200 => Ok(t.to_string()),
+        _ => anyhow::bail!("signing in with the account number failed ({status}): {}", body["error"]),
+    }
+}
+
 pub fn dollars(cents: i64) -> String {
     format!("${}.{:02}", cents / 100, cents % 100)
 }

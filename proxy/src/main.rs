@@ -53,6 +53,11 @@ struct ServeArgs {
     /// Print what leaves this device for every request
     #[arg(long)]
     show_traffic: bool,
+    /// The account number. With it the wallet is seeded: everything in it can
+    /// be rebuilt from the number on any device, so nothing is lost with the
+    /// wallet file. Only a key derived from it is sent, never the number.
+    #[arg(long, env = "OBSCURIFY_ACCOUNT_NUMBER", hide_env_values = true)]
+    account_number: Option<String>,
     /// The account's API key: keeps the wallet and this month's passes
     /// topped up in the background. Never sent with a chat. Without it
     /// the proxy uses the first sk-obs1_ key a client sends.
@@ -81,6 +86,10 @@ enum Command {
         #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
         listen: String,
     },
+    /// Print the login key for an account number read from stdin: what
+    /// `POST /login` and `/generate_token` take as `account_key` instead of
+    /// the number, so the server never sees the number.
+    LoginKey,
     /// Show the wallet
     Wallet,
     /// Move a fixed amount ($1, $5, $20, $50, $100) of account balance into
@@ -156,6 +165,11 @@ async fn main() -> Result<()> {
             .await?;
         }
         Command::Mcp(args) => mcp(&opts, args).await?,
+        Command::LoginKey => {
+            let mut number = String::new();
+            std::io::stdin().read_to_string(&mut number)?;
+            println!("{}", unlinkable_core::seed::account_keys(&number)?.login_key);
+        }
         Command::Key { listen } => {
             // The agent may ask before the MCP server has started the proxy.
             let url = format!("http://{listen}/_unlinkable/key");
@@ -302,18 +316,36 @@ async fn start(
         per,
         idle_close,
         show_traffic,
-        api_key,
+        account_number,
+        mut api_key,
         keep,
         refill,
     } = args;
     let lock = lock_wallet(opts)?;
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     let mut wallet = Wallet::open(opts.wallet_path())?;
-    let client = connect(opts, &mut wallet).await?;
+    let mut client = connect(opts, &mut wallet).await?;
+    let keys = account_number
+        .as_deref()
+        .map(unlinkable_core::seed::account_keys)
+        .transpose()?;
+    if let Some(keys) = &keys {
+        if api_key.is_none() {
+            api_key = Some(unlinkable_proxy::api_key_for(opts, &keys.login_key).await?);
+        }
+        client.seed = Some(keys.seed.clone());
+    }
     match client.recover(&mut wallet).await {
         Ok(0) => {}
         Ok(c) => eprintln!("unlinkable: recovered {} from an earlier run", dollars(c)),
         Err(e) => eprintln!("unlinkable: could not finish an earlier run's work yet: {e:#}"),
+    }
+    if keys.is_some() {
+        match client.restore(&mut wallet, api_key.as_deref()).await {
+            Ok(0) => {}
+            Ok(c) => eprintln!("unlinkable: restored {} from the account number", dollars(c)),
+            Err(e) => eprintln!("unlinkable: could not restore the wallet yet: {e:#}"),
+        }
     }
     let settings = Settings {
         funding_cents: parse_dollars(&session_funding)?,
