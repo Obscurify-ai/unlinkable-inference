@@ -104,7 +104,7 @@ impl Transport {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             http: reqwest::Client::builder()
-                .user_agent("chaumian-sessions")
+                .user_agent("unlinkable-inference")
                 .build()
                 .expect("http client"),
             server: server.trim_end_matches('/').to_string(),

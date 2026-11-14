@@ -1,4 +1,4 @@
-//! Chaumian sessions: anonymous prepaid API sessions paid for with
+//! Unlinkable inference: anonymous prepaid API sessions paid for with
 //! blind-signed e-cash (David Chaum's scheme).
 //!
 //! A wallet of blind-signed vouchers pays for a session, and the session
@@ -34,7 +34,7 @@ pub use voucher::{Family, Voucher};
 pub use wallet::Wallet;
 
 /// Session secrets look like API keys so OpenAI and Anthropic SDKs accept them.
-pub const SESSION_SECRET_PREFIX: &str = "sk-chs1_";
+pub const SESSION_SECRET_PREFIX: &str = "sk-unl1_";
 
 /// Seconds since 1970 (in a browser, from `Date.now()`: `SystemTime` panics there).
 pub fn unix_now() -> u64 {

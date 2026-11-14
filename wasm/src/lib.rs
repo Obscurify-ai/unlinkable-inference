@@ -1,10 +1,10 @@
-//! Chaumian sessions in a web page: `chaumian_sessions::manager` as a
+//! Unlinkable inference in a web page: `unlinkable_inference::manager` as a
 //! WebAssembly module. `js/index.js` wraps it in a `fetch` that sends each
 //! conversation's session secret instead of the page's cookie.
 
 use futures::lock::Mutex;
 use std::rc::Rc;
-use chaumian_sessions::manager;
+use unlinkable_inference::manager;
 use wasm_bindgen::prelude::*;
 
 fn err(e: impl std::fmt::Display) -> JsValue {
@@ -14,7 +14,7 @@ fn err(e: impl std::fmt::Display) -> JsValue {
 /// `{login_key, seed}` (hex) for an account number. Slow on purpose.
 #[wasm_bindgen(js_name = accountKeys)]
 pub fn account_keys(number: &str) -> Result<JsValue, JsValue> {
-    let keys = chaumian_sessions::seed::account_keys(number).map_err(err)?;
+    let keys = unlinkable_inference::seed::account_keys(number).map_err(err)?;
     let obj = js_sys::Object::new();
     js_sys::Reflect::set(&obj, &"login_key".into(), &keys.login_key.into())?;
     js_sys::Reflect::set(&obj, &"seed".into(), &hex::encode(keys.seed.0).into())?;
@@ -24,7 +24,7 @@ pub fn account_keys(number: &str) -> Result<JsValue, JsValue> {
 /// A fresh random 16-digit account number, made on the device.
 #[wasm_bindgen(js_name = newAccountNumber)]
 pub fn new_account_number() -> String {
-    chaumian_sessions::seed::new_account_number()
+    unlinkable_inference::seed::new_account_number()
 }
 
 #[wasm_bindgen]
@@ -54,7 +54,7 @@ impl Manager {
             .map_err(err)?
             .try_into()
             .map_err(|_| err("the seed is 32 bytes"))?;
-        let mut m = manager::Manager::connect(&server, chaumian_sessions::seed::Seed(seed), state.as_deref()).await.map_err(err)?;
+        let mut m = manager::Manager::connect(&server, unlinkable_inference::seed::Seed(seed), state.as_deref()).await.map_err(err)?;
         m.api_key = api_key;
         Ok(Manager { inner: Rc::new(Mutex::new(m)) })
     }

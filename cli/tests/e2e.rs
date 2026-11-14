@@ -7,16 +7,16 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use chaumian_sessions::{Family, Wallet};
-use chaumian_sessions::server::signer::{KeyStore, PassKey};
-use chaumian_sessions_cli::serve::{Proxy, Settings};
-use chaumian_sessions_cli::{connect, Options};
+use unlinkable_inference::{Family, Wallet};
+use unlinkable_inference::server::signer::{KeyStore, PassKey};
+use unlinkable_inference_cli::serve::{Proxy, Settings};
+use unlinkable_inference_cli::{connect, Options};
 
 const VALUES: [i64; 10] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 
 struct Stack {
     server: String,
-    backend: Arc<chaumian_sessions_reference_server::MemoryBackend>,
+    backend: Arc<unlinkable_inference_reference_server::MemoryBackend>,
 }
 
 async fn listen() -> (tokio::net::TcpListener, String) {
@@ -28,12 +28,12 @@ async fn listen() -> (tokio::net::TcpListener, String) {
 async fn start_stack() -> Stack {
     // A fixed test pass key: generating one (safe primes) takes seconds.
     let pass = PassKey::from_pem(include_str!("../../reference-server/testdata/test_pass_key.pem")).unwrap();
-    let dust = KeyStore::new(&chaumian_sessions::denominations::DUST_MILLICENTS, None).unwrap();
+    let dust = KeyStore::new(&unlinkable_inference::denominations::DUST_MILLICENTS, None).unwrap();
     let keys = KeyStore::new(&VALUES, None)
         .unwrap()
         .with_pass_key(pass)
         .with_dust(dust);
-    let ref_server = chaumian_sessions_reference_server::build(keys, Duration::from_secs(3600));
+    let ref_server = unlinkable_inference_reference_server::build(keys, Duration::from_secs(3600));
     let backend = ref_server.backend.clone();
     let (l, server) = listen().await;
     tokio::spawn(async move {
@@ -46,12 +46,12 @@ async fn start_stack() -> Stack {
 
 fn temp_wallet() -> PathBuf {
     std::env::temp_dir()
-        .join(format!("chaumian-sessions-e2e-{}", rand_id()))
+        .join(format!("unlinkable-inference-e2e-{}", rand_id()))
         .join("wallet.json")
 }
 
 fn rand_id() -> String {
-    chaumian_sessions::sha256_hex(format!("{:?}{:?}", Instant::now(), std::thread::current().id()))[..12].to_string()
+    unlinkable_inference::sha256_hex(format!("{:?}{:?}", Instant::now(), std::thread::current().id()))[..12].to_string()
 }
 
 async fn new_account(server: &str, cents: i64) -> String {
@@ -77,12 +77,12 @@ async fn start_proxy(opts: &Options, settings: Settings) -> (Arc<Proxy>, String)
     let proxy = Proxy::new(client, wallet, settings, opts.clone());
     let (l, url) = listen().await;
     let p = proxy.clone();
-    tokio::spawn(async move { chaumian_sessions_cli::serve::run(l, p, std::future::pending()).await.unwrap() });
+    tokio::spawn(async move { unlinkable_inference_cli::serve::run(l, p, std::future::pending()).await.unwrap() });
     (proxy, url)
 }
 
 async fn status(proxy_url: &str) -> Value {
-    reqwest::get(format!("{proxy_url}/_chaumian/status"))
+    reqwest::get(format!("{proxy_url}/_unlinkable/status"))
         .await
         .unwrap()
         .json()
@@ -264,7 +264,7 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
         );
     }
     // The account's token hash appears only in the account and withdrawal rows.
-    let account_hash = chaumian_sessions::sha256_hex(&api_key);
+    let account_hash = unlinkable_inference::sha256_hex(&api_key);
     assert_eq!(dump_text.matches(&account_hash).count(), 2);
 }
 
@@ -319,7 +319,7 @@ async fn lost_answers_are_retried_safely_and_spent_vouchers_are_dropped() {
     // them is refused, nothing is spent, and the wallet forgets them.
     let mut restored = Wallet::open(temp_wallet()).unwrap();
     for code in &backup {
-        let v = chaumian_sessions::Voucher::parse(code).unwrap();
+        let v = unlinkable_inference::Voucher::parse(code).unwrap();
         restored.add(Family::Paid, [v]);
     }
     let err = client.open(&mut restored, Family::Paid, 100).await.unwrap_err();
@@ -362,7 +362,7 @@ async fn a_pass_gives_a_session_the_plan_models_without_naming_the_account() {
         wallet: Some(temp_wallet()),
         pins: Vec::new(),
     };
-    let period = chaumian_sessions::pass::current_period();
+    let period = unlinkable_inference::pass::current_period();
     {
         let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
         let client = connect(&opts, &mut wallet).await.unwrap();
@@ -371,9 +371,9 @@ async fn a_pass_gives_a_session_the_plan_models_without_naming_the_account() {
         let got = client.get_passes(&mut wallet, &pro, 3).await.unwrap();
         assert_eq!(got, 3);
         let got = client.get_passes(&mut wallet, &pro, 100).await.unwrap();
-        assert_eq!(got as i64, chaumian_sessions_reference_server::PASSES_PER_MONTH - 3);
+        assert_eq!(got as i64, unlinkable_inference_reference_server::PASSES_PER_MONTH - 3);
         assert_eq!(client.get_passes(&mut wallet, &pro, 1).await.unwrap(), 0);
-        assert_eq!(wallet.passes(&period).len() as i64, chaumian_sessions_reference_server::PASSES_PER_MONTH);
+        assert_eq!(wallet.passes(&period).len() as i64, unlinkable_inference_reference_server::PASSES_PER_MONTH);
         assert!(wallet.passes(&period).iter().all(|p| p.tier == "pro"));
 
         // A pass opens one session. Putting a used one back (an old backup)
@@ -404,7 +404,7 @@ async fn a_pass_gives_a_session_the_plan_models_without_naming_the_account() {
     let resp = chat(&url, "echo-pro", "plan model please").await;
     assert_eq!(resp.status(), 200);
     let st = status(&url).await;
-    assert_eq!(st["wallet"]["passes"], chaumian_sessions_reference_server::PASSES_PER_MONTH - 2);
+    assert_eq!(st["wallet"]["passes"], unlinkable_inference_reference_server::PASSES_PER_MONTH - 2);
     proxy.close_all().await;
 
     // A pass works once.
@@ -414,7 +414,7 @@ async fn a_pass_gives_a_session_the_plan_models_without_naming_the_account() {
     assert_eq!(tiers.iter().filter(|t| **t == "pro").count(), 2);
     // The account row records how many passes it got, nothing about which
     // sessions used them; the session row records the tier, nothing else.
-    let account_hash = chaumian_sessions::sha256_hex(&pro);
+    let account_hash = unlinkable_inference::sha256_hex(&pro);
     assert_eq!(db.to_string().matches(&account_hash).count(), 2);
     for p in db["spent_passes"].as_array().unwrap() {
         let hash = p["hash"].as_str().unwrap();
@@ -492,8 +492,8 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
     }
 }
 
-/// Claude Code without a base URL change: `chaumian-sessions mcp` runs as one of the
-/// agent's MCP servers, `chaumian-sessions key` is its apiKeyHelper, and the agent
+/// Claude Code without a base URL change: `unlinkable-inference mcp` runs as one of the
+/// agent's MCP servers, `unlinkable-inference key` is its apiKeyHelper, and the agent
 /// sends the session secret straight to the server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session_secret() {
@@ -505,11 +505,11 @@ async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().to_string()
     };
-    let bin = env!("CARGO_BIN_EXE_chaumian-sessions");
+    let bin = env!("CARGO_BIN_EXE_unlinkable-inference");
     let mut mcp = tokio::process::Command::new(bin)
         .args(["mcp", "--listen", &listen, "--api-key", &key])
-        .env("CHAUMIAN_SERVER", &stack.server)
-        .env("CHAUMIAN_WALLET", &wallet)
+        .env("UNLINKABLE_SERVER", &stack.server)
+        .env("UNLINKABLE_WALLET", &wallet)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -527,7 +527,7 @@ async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session
         stdin.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
     }
     let init: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-    assert_eq!(init["result"]["serverInfo"]["name"], "chaumian-sessions");
+    assert_eq!(init["result"]["serverInfo"]["name"], "unlinkable-inference");
     let tools: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert_eq!(tools["result"]["tools"], json!([]));
 
@@ -541,7 +541,7 @@ async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     };
     let secret = get_key().await;
-    assert!(secret.starts_with(chaumian_sessions::SESSION_SECRET_PREFIX), "{secret}");
+    assert!(secret.starts_with(unlinkable_inference::SESSION_SECRET_PREFIX), "{secret}");
 
     // Straight to the server, no proxy in the way. 150k characters cost 30¢
     // of the session's 50¢.
@@ -564,7 +564,7 @@ async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session
             .json()
             .await
             .unwrap();
-        chaumian_sessions::net::usd_to_cents_floor(st["balance_usd"].as_str().unwrap())
+        unlinkable_inference::net::usd_to_cents_floor(st["balance_usd"].as_str().unwrap())
     };
     assert!(balance().await < 50);
     // The MCP server sees the balance drop and tops the session up before a
@@ -602,10 +602,10 @@ async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session
 /// finished with are deleted from the server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number() {
-    use chaumian_sessions::net::{Client, Session, Transport};
+    use unlinkable_inference::net::{Client, Session, Transport};
     let stack = start_stack().await;
     let key = new_account(&stack.server, 2_000).await;
-    let keys = chaumian_sessions::seed::account_keys("4821 0937 5512 8846").unwrap();
+    let keys = unlinkable_inference::seed::account_keys("4821 0937 5512 8846").unwrap();
     let keyset = Transport::new(&stack.server).fetch_keyset().await.unwrap();
     let client = || Client::new(Transport::new(&stack.server), keyset.clone()).with_seed(keys.seed.clone());
     let a = client();
@@ -642,7 +642,7 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
         (nano + 999) / 1000
     };
     let had = wallet.balance_millicents(Family::Paid) + left_in_s2;
-    let passes_had = wallet.passes(&chaumian_sessions::pass::current_period()).len();
+    let passes_had = wallet.passes(&unlinkable_inference::pass::current_period()).len();
     assert_eq!(passes_had, 1, "two of three passes went into sessions");
     drop(wallet);
 
@@ -651,7 +651,7 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     let mut fresh = Wallet::in_memory();
     b.restore(&mut fresh, Some(&key)).await.unwrap();
     assert_eq!(fresh.balance_millicents(Family::Paid), had, "every millicent is back");
-    assert_eq!(fresh.passes(&chaumian_sessions::pass::current_period()).len(), passes_had);
+    assert_eq!(fresh.passes(&unlinkable_inference::pass::current_period()).len(), passes_had);
     assert!(b.status(&Session { secret: s2.secret.clone(), family: Family::Paid }).await.unwrap().closed);
     // Restoring again finds nothing new.
     b.restore(&mut fresh, Some(&key)).await.unwrap();
@@ -668,15 +668,15 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     b.flush_done(&mut fresh, Some(&key)).await.unwrap();
     let db = stack.backend.dump();
     let hashes: Vec<&str> = db["sessions"].as_array().unwrap().iter().map(|s| s["secret_hash"].as_str().unwrap()).collect();
-    assert_eq!(hashes, vec![chaumian_sessions::sha256_hex(&s3.secret)], "only the session whose change is still held");
+    assert_eq!(hashes, vec![unlinkable_inference::sha256_hex(&s3.secret)], "only the session whose change is still held");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_loses_nothing() {
-    use chaumian_sessions::manager::Manager;
+    use unlinkable_inference::manager::Manager;
     let stack = start_stack().await;
     let key = new_account(&stack.server, 2_000).await;
-    let seed = chaumian_sessions::seed::account_keys("7730 1945 2286 0413").unwrap().seed;
+    let seed = unlinkable_inference::seed::account_keys("7730 1945 2286 0413").unwrap().seed;
     let chat = |secret: String| {
         let server = stack.server.clone();
         async move {
@@ -730,8 +730,8 @@ async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_lo
 /// some of the same secrets (64 a minute); the server refuses the second
 /// (`secret_taken`) and it picks again, so none is shared and nothing is lost.
 async fn two_devices_never_share_a_session(server: &str, key: &str) {
-    use chaumian_sessions::manager::Manager;
-    let seed = chaumian_sessions::seed::account_keys("1188 6021 4459 3307").unwrap().seed;
+    use unlinkable_inference::manager::Manager;
+    let seed = unlinkable_inference::seed::account_keys("1188 6021 4459 3307").unwrap().seed;
     let mut phone = Manager::connect(server, seed.clone(), None).await.unwrap();
     let mut laptop = Manager::connect(server, seed, None).await.unwrap();
     let mut secrets = std::collections::HashSet::new();
@@ -759,11 +759,11 @@ async fn two_devices_never_share_a_session(server: &str, key: &str) {
 }
 
 /// The same against a real server (spends nothing for good: every session closes unused):
-///   CHAUMIAN_SERVER=http://127.0.0.1:8230 CHAUMIAN_KEY=sk-obs1_… cargo test -p chaumian-sessions-cli --test e2e -- --ignored
+///   UNLINKABLE_SERVER=http://127.0.0.1:8230 UNLINKABLE_KEY=sk-obs1_… cargo test -p unlinkable-inference-cli --test e2e -- --ignored
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn against_a_real_server_two_devices_never_share_a_session() {
-    let server = std::env::var("CHAUMIAN_SERVER").expect("CHAUMIAN_SERVER");
-    let key = std::env::var("CHAUMIAN_KEY").expect("CHAUMIAN_KEY");
+    let server = std::env::var("UNLINKABLE_SERVER").expect("UNLINKABLE_SERVER");
+    let key = std::env::var("UNLINKABLE_KEY").expect("UNLINKABLE_KEY");
     two_devices_never_share_a_session(&server, &key).await;
 }

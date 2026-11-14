@@ -5,8 +5,8 @@ WORKDIR /src
 COPY . .
 ENV SOURCE_DATE_EPOCH=0 CARGO_INCREMENTAL=0 \
     RUSTFLAGS="--remap-path-prefix=/src=. --remap-path-prefix=/usr/local/cargo=cargo"
-RUN cargo build --locked --release -p chaumian-sessions-cli -p chaumian-sessions-reference-server \
- && mkdir /out && cp target/release/chaumian-sessions target/release/chaumian-sessions-reference-server /out/ \
+RUN cargo build --locked --release -p unlinkable-inference-cli -p unlinkable-inference-reference-server \
+ && mkdir /out && cp target/release/unlinkable-inference target/release/unlinkable-inference-reference-server /out/ \
  && cd /out && sha256sum * > SHA256SUMS
 
 FROM debian:bookworm-slim

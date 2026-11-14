@@ -21,7 +21,7 @@ pub const TIERS: [&str; 3] = ["pay_as_you_go", "casual", "pro"];
 
 /// The public metadata a pass is bound to.
 pub fn metadata(tier: &str, period: &str) -> Vec<u8> {
-    format!("chaumian-sessions-pass:v1:{tier}:{period}").into_bytes()
+    format!("unlinkable-inference-pass:v1:{tier}:{period}").into_bytes()
 }
 
 /// `YYYY-MM` for a Unix time, UTC.

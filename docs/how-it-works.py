@@ -27,7 +27,7 @@ colors = ['#52606d', '#0e7c86', '#b44d12', '#6b46c1', '#2f855a']
 e(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">')
 e('<defs>' + ''.join(f'<marker id="a{c[1:]}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{c}"/></marker>' for c in colors) + '</defs>')
 e(f'<rect width="{W}" height="{H}" fill="#f7f8fa"/>')
-text(W/2, 46, ['How Chaumian sessions work'], 28, 700)
+text(W/2, 46, ['How unlinkable inference works'], 28, 700)
 text(W/2, 76, ['The server is paid for every chat, but cannot tell which account a chat came from, or which chats go together.'], 15, 400, '#52606d')
 
 # Columns
@@ -65,14 +65,14 @@ box(DX, y + 152, DW, 46, ['Unblinds them: a wallet of vouchers the server has ne
 # 2. Open
 y = 600
 step(y, 2, 'Each conversation opens a session')
-box(DX, y + 72, DW, 58, ['Pays with vouchers and picks a session secret', 'sk-chs1_…  (also from the seed)'], '#fff', '#cbd2d9', 14)
+box(DX, y + 72, DW, 58, ['Pays with vouchers and picks a session secret', 'sk-unl1_…  (also from the seed)'], '#fff', '#cbd2d9', 14)
 arrow(DX + DW, y + 101, SX, y + 101, ['vouchers + hash of the secret', 'no account, no cookie'], '#6b46c1')
 box(SX, y + 72, SW, 58, ['Vouchers valid and never spent: session open', 'It cannot tell whose vouchers they are'], '#fff', '#cbd2d9', 14)
 
 # 3. Chat
 y = 760
 step(y, 3, 'Chat')
-box(DX, y + 72, DW, 46, ['Every request: Authorization: Bearer sk-chs1_…'], '#fff', '#cbd2d9', 14)
+box(DX, y + 72, DW, 46, ['Every request: Authorization: Bearer sk-unl1_…'], '#fff', '#cbd2d9', 14)
 arrow(DX + DW, y + 95, SX, y + 95, ['the secret instead of an API key'], '#6b46c1')
 box(SX, y + 72, SW, 46, ['Charges each request to the session, per token'], '#fff', '#cbd2d9', 14)
 

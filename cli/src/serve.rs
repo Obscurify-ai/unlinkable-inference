@@ -22,8 +22,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use chaumian_sessions::net::{Client, Observed, Request as Inner, Session};
-use chaumian_sessions::{Family, Voucher, Wallet};
+use unlinkable_inference::net::{Client, Observed, Request as Inner, Session};
+use unlinkable_inference::{Family, Voucher, Wallet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -110,15 +110,15 @@ pub struct Proxy {
     helper_balance: Mutex<String>,
 }
 
-/// The session handed out by `/_chaumian/key` for agents that talk to the
+/// The session handed out by `/_unlinkable/key` for agents that talk to the
 /// server directly (Claude Code's `apiKeyHelper`).
 const HELPER: &str = "helper";
 
 /// The server no longer knows this session (expired or closed elsewhere).
 fn gone(e: &anyhow::Error) -> bool {
     matches!(
-        e.downcast_ref::<chaumian_sessions::net::ApiError>(),
-        Some(chaumian_sessions::net::ApiError::Server { status: 401 | 404 | 410, .. })
+        e.downcast_ref::<unlinkable_inference::net::ApiError>(),
+        Some(unlinkable_inference::net::ApiError::Server { status: 401 | 404 | 410, .. })
     )
 }
 
@@ -162,7 +162,7 @@ const FORWARDED_POSTS: &[&str] = &[
 fn text(status: StatusCode, message: &str) -> Response {
     (
         status,
-        Json(json!({"error": {"message": message, "type": "chaumian_sessions_cli_error"}})),
+        Json(json!({"error": {"message": message, "type": "unlinkable_inference_cli_error"}})),
     )
         .into_response()
 }
@@ -188,7 +188,7 @@ pub fn conversation_fingerprint(path: &str, body: &Value) -> String {
     } else {
         Value::Null
     };
-    chaumian_sessions::sha256_hex(parts.to_string())[..16].to_string()
+    unlinkable_inference::sha256_hex(parts.to_string())[..16].to_string()
 }
 
 fn client_key(headers: &HeaderMap) -> String {
@@ -291,7 +291,7 @@ impl Proxy {
             }
         }
         if self.client.keyset.pass_key.is_some() {
-            let period = chaumian_sessions::pass::current_period();
+            let period = unlinkable_inference::pass::current_period();
             let held = wallet.passes(&period).len();
             if held < self.settings.keep_passes {
                 match self.client.get_passes(&mut wallet, &key, 30).await {
@@ -406,7 +406,7 @@ impl Proxy {
         if changed {
             entry.last_used.store(now(), Ordering::SeqCst);
         }
-        if chaumian_sessions::net::usd_to_cents_floor(&st.balance_usd) < self.settings.funding_cents {
+        if unlinkable_inference::net::usd_to_cents_floor(&st.balance_usd) < self.settings.funding_cents {
             let mut wallet = self.wallet.lock().await;
             if wallet.balance_cents(entry.session.family) < self.settings.funding_cents {
                 drop(wallet);
@@ -474,7 +474,7 @@ impl Proxy {
         }
     }
 
-    async fn send(&self, entry: &Entry, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> Result<chaumian_sessions::net::Response> {
+    async fn send(&self, entry: &Entry, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> Result<unlinkable_inference::net::Response> {
         let mut inner = Inner {
             method: method.to_string(),
             path: path.to_string(),
@@ -574,7 +574,7 @@ impl Proxy {
 
     async fn status_json(&self) -> Value {
         let mut wallet = self.wallet.lock().await;
-        let period = chaumian_sessions::pass::current_period();
+        let period = unlinkable_inference::pass::current_period();
         let passes = wallet.passes(&period);
         let sessions: Vec<Value> = self
             .sessions
@@ -634,7 +634,7 @@ impl Proxy {
         let mut wallet = self.wallet.lock().await;
         for code in codes {
             let voucher = Voucher::parse(code).ok_or_else(|| anyhow!("not a voucher: {code}"))?;
-            let family = chaumian_sessions::blank::verify(&self.client.keyset, &voucher)
+            let family = unlinkable_inference::blank::verify(&self.client.keyset, &voucher)
                 .ok_or_else(|| anyhow!("this server did not sign {code}"))?;
             added += voucher.denomination_cents;
             wallet.add(family, [voucher]);
@@ -644,7 +644,7 @@ impl Proxy {
     }
 }
 
-fn copy_headers(resp: &chaumian_sessions::net::Response, out: &mut HeaderMap) {
+fn copy_headers(resp: &unlinkable_inference::net::Response, out: &mut HeaderMap) {
     for (k, v) in &resp.headers {
         let k = k.to_ascii_lowercase();
         if DROPPED_RESPONSE_HEADERS.contains(&k.as_str()) {
@@ -659,7 +659,7 @@ fn copy_headers(resp: &chaumian_sessions::net::Response, out: &mut HeaderMap) {
     }
 }
 
-fn pass_through(resp: chaumian_sessions::net::Response) -> Response {
+fn pass_through(resp: unlinkable_inference::net::Response) -> Response {
     let mut headers = HeaderMap::new();
     copy_headers(&resp, &mut headers);
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -669,7 +669,7 @@ fn pass_through(resp: chaumian_sessions::net::Response) -> Response {
 
 /// Like [`pass_through`], keeping the session marked busy until the
 /// stream ends, so it is never closed mid-answer.
-fn pass_through_tracked(resp: chaumian_sessions::net::Response, entry: Arc<Entry>) -> Response {
+fn pass_through_tracked(resp: unlinkable_inference::net::Response, entry: Arc<Entry>) -> Response {
     let mut headers = HeaderMap::new();
     copy_headers(&resp, &mut headers);
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -725,7 +725,7 @@ async fn handle(State(proxy): State<Arc<Proxy>>, req: Request) -> Response {
         return text(StatusCode::PAYLOAD_TOO_LARGE, "request too large");
     };
 
-    if path.starts_with("/_chaumian") {
+    if path.starts_with("/_unlinkable") {
         return control(&proxy, &method, &path, &parts.headers, &body).await;
     }
     if method == "POST" {
@@ -771,13 +771,13 @@ async fn control(proxy: &Proxy, method: &str, path: &str, headers: &HeaderMap, b
     }
     let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     match (method, path) {
-        ("GET", "/_chaumian") | ("GET", "/_chaumian/") => Html(PAGE).into_response(),
-        ("GET", "/_chaumian/status") => Json(proxy.status_json().await).into_response(),
-        ("GET", "/_chaumian/key") => match proxy.helper_secret().await {
+        ("GET", "/_unlinkable") | ("GET", "/_unlinkable/") => Html(PAGE).into_response(),
+        ("GET", "/_unlinkable/status") => Json(proxy.status_json().await).into_response(),
+        ("GET", "/_unlinkable/key") => match proxy.helper_secret().await {
             Ok(secret) => secret.into_response(),
             Err(e) => text(StatusCode::PAYMENT_REQUIRED, &format!("{e:#}")),
         },
-        ("POST", "/_chaumian/withdraw") => {
+        ("POST", "/_unlinkable/withdraw") => {
             let cents = body["amount_cents"].as_i64().unwrap_or(0);
             let key = body["api_key"].as_str().unwrap_or("");
             match proxy.withdraw(key, cents).await {
@@ -785,7 +785,7 @@ async fn control(proxy: &Proxy, method: &str, path: &str, headers: &HeaderMap, b
                 Err(e) => text(StatusCode::BAD_REQUEST, &format!("{e:#}")),
             }
         }
-        ("POST", "/_chaumian/passes") => {
+        ("POST", "/_unlinkable/passes") => {
             let count = body["count"].as_i64().unwrap_or(30);
             let key = body["api_key"].as_str().unwrap_or("");
             match proxy.passes(key, count).await {
@@ -793,7 +793,7 @@ async fn control(proxy: &Proxy, method: &str, path: &str, headers: &HeaderMap, b
                 Err(e) => text(StatusCode::BAD_REQUEST, &format!("{e:#}")),
             }
         }
-        ("POST", "/_chaumian/import") => {
+        ("POST", "/_unlinkable/import") => {
             let codes: Vec<String> = body["vouchers"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
@@ -803,7 +803,7 @@ async fn control(proxy: &Proxy, method: &str, path: &str, headers: &HeaderMap, b
                 Err(e) => text(StatusCode::BAD_REQUEST, &format!("{e:#}")),
             }
         }
-        ("POST", "/_chaumian/close") => {
+        ("POST", "/_unlinkable/close") => {
             proxy.close_all().await;
             Json(json!({"closed": true})).into_response()
         }
@@ -846,7 +846,7 @@ pub async fn run(
 
 const PAGE: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>chaumian-sessions: what leaves this device</title>
+<title>unlinkable-inference: what leaves this device</title>
 <style>
 body{font:15px/1.45 system-ui,sans-serif;background:#111;color:#ddd;margin:0;padding:1rem 1rem 6rem}
 h1{font-size:1.2rem;margin:.2rem 0 1rem}h2{font-size:1rem;margin:1.5rem 0 .5rem;color:#aaa}
@@ -872,7 +872,7 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const usd=c=>'$'+(c/100).toFixed(2);
 async function load(){
- const s=await (await fetch('/_chaumian/status')).json();
+ const s=await (await fetch('/_unlinkable/status')).json();
  $('summary').innerHTML=`Server <code>${esc(s.server)}</code><br>`+
   `The server sees your IP address unless Tor or a VPN hides it. It never sees your account or how you paid.`+
   `<br>Keyset <code>${esc(s.keyset)}</code><br>Wallet ${usd(s.wallet.paid_cents)} paid, ${usd(s.wallet.promo_cents)} promo, in ${s.wallet.vouchers} vouchers`+
@@ -881,11 +881,11 @@ async function load(){
  $('traffic').innerHTML=s.traffic.map(t=>`<tr><td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><span class="server">server sees</span> ${esc(t.server_sees)}</td></tr>`).join('')||'<tr><td>Nothing sent yet.</td></tr>';
 }
 async function withdraw(){
- const r=await fetch('/_chaumian/withdraw',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),amount_cents:+$('amt').value})});
+ const r=await fetch('/_unlinkable/withdraw',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),amount_cents:+$('amt').value})});
  const j=await r.json(); alert(r.ok?'Added '+usd(j.withdrawn_cents)+' to the wallet':j.error.message); $('key').value=''; load();
 }
 async function passes(){
- const r=await fetch('/_chaumian/passes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),count:30})});
+ const r=await fetch('/_unlinkable/passes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),count:30})});
  const j=await r.json(); alert(r.ok?'Got '+j.got+' passes':j.error.message); $('key').value=''; load();
 }
 load(); setInterval(load,4000);

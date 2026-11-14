@@ -1,4 +1,4 @@
-# Chaumian sessions
+# Unlinkable inference
 
 Use AI models without the server being able to tell which account or payment
 a chat came from, or which other chats it goes with. The server still reads
@@ -14,17 +14,17 @@ never seen. Everything is derived from the account number, so a device that
 forgets it all gets the money back at the next sign-in. Nothing depends on a
 third party.
 
-![How Chaumian sessions work](https://raw.githubusercontent.com/Obscurify-ai/chaumian-sessions/main/docs/how-it-works.svg)
+![How unlinkable inference works](https://raw.githubusercontent.com/Obscurify-ai/unlinkable-inference/main/docs/how-it-works.svg)
 
 ## Use it in an app
 
-The client logic is one Rust crate, `chaumian-sessions`; browsers get the same
-code as WebAssembly in the npm package `chaumian-sessions`.
+The client logic is one Rust crate, `unlinkable-inference`; browsers get the same
+code as WebAssembly in the npm package `unlinkable-inference`.
 
-**Rust** (`cargo add chaumian-sessions`):
+**Rust** (`cargo add unlinkable-inference`):
 
 ```rust
-use chaumian_sessions::{manager::Manager, seed::account_keys};
+use unlinkable_inference::{manager::Manager, seed::account_keys};
 
 let keys = account_keys(&number)?;            // slow on purpose, ~1 s
 // sign in with keys.login_key; keep keys.seed on the device
@@ -37,10 +37,10 @@ save(m.state());                               // after every call
 // Every 30 s: m.tick().await (closes quiet sessions for their change, tops up).
 ```
 
-**Browser** (`npm install chaumian-sessions`):
+**Browser** (`npm install unlinkable-inference`):
 
 ```js
-import * as sessions from 'chaumian-sessions';
+import * as sessions from 'unlinkable-inference';
 
 const { loginKey, seed } = await sessions.keys(number); // sign in with loginKey
 const u = await sessions.connect({ seed, apiKey });     // wallet kept in localStorage
@@ -54,9 +54,9 @@ so no cookie goes with it, and tops the session up when it runs out.
 
 | Package | What | Licence |
 |---|---|---|
-| [`chaumian-sessions`](lib) (crate) | The library. Client: blind vouchers, wallet, sessions, key pinning, recovery from the account number, `Manager` for apps. With the `server` feature: the session endpoints and voucher checks (axum) over your storage. | MIT or Apache-2.0 |
-| `chaumian-sessions` (npm) | The same client compiled to WebAssembly for web pages ([`wasm`](wasm), `wasm/build.sh`) | MIT or Apache-2.0 |
-| [`chaumian-sessions-cli`](cli) (crate) | `chaumian-sessions`: local OpenAI/Anthropic proxy, MCP server, wallet CLI, `verify` | GPL-3.0-or-later |
+| [`unlinkable-inference`](lib) (crate) | The library. Client: blind vouchers, wallet, sessions, key pinning, recovery from the account number, `Manager` for apps. With the `server` feature: the session endpoints and voucher checks (axum) over your storage. | MIT or Apache-2.0 |
+| `unlinkable-inference` (npm) | The same client compiled to WebAssembly for web pages ([`wasm`](wasm), `wasm/build.sh`) | MIT or Apache-2.0 |
+| [`unlinkable-inference-cli`](cli) (crate) | `unlinkable-inference`: local OpenAI/Anthropic proxy, MCP server, wallet CLI, `verify` | GPL-3.0-or-later |
 
 [`reference-server`](reference-server) is not published: the server feature over
 in-memory storage with an echo model, play money and a full database dump, for
@@ -65,7 +65,7 @@ the tests and for checking what a server learns.
 ## Use it with any agent
 
 ```sh
-cargo install chaumian-sessions-cli   # or, from this repo: cargo install --path cli
+cargo install unlinkable-inference-cli   # or, from this repo: cargo install --path cli
 ```
 
 **As an MCP server** (Claude Code, Codex, anything with MCP): the agent starts
@@ -73,7 +73,7 @@ the proxy and stops it when it exits, closing its sessions. The server entry
 has no tools:
 
 ```json
-{"mcpServers": {"chaumian-sessions": {"command": "chaumian-sessions", "args": ["mcp"],
+{"mcpServers": {"unlinkable-inference": {"command": "unlinkable-inference", "args": ["mcp"],
   "env": {"OBSCURIFY_API_KEY": "sk-obs1_…"}}}}
 ```
 
@@ -81,7 +81,7 @@ Claude Code then keeps talking to the server directly; only the key changes,
 to a session secret from the proxy. In `.claude/settings.json`:
 
 ```json
-{"apiKeyHelper": "chaumian-sessions key",
+{"apiKeyHelper": "unlinkable-inference key",
  "env": {"ANTHROPIC_BASE_URL": "https://obscurify.ai"}}
 ```
 
@@ -99,11 +99,11 @@ env_key = "OBSCURIFY_API_KEY"
 model_provider = "obscurify-private"
 ```
 
-**pi**: copy `integrations/pi/chaumian-sessions.ts` to `~/.pi/agent/extensions/`. It
+**pi**: copy `integrations/pi/unlinkable-inference.ts` to `~/.pi/agent/extensions/`. It
 starts the proxy when needed and adds an `obscurify-private` provider with the
 same models as your `obscurify` one; the normal provider stays.
 
-**On its own**: `chaumian-sessions serve` (http://127.0.0.1:8899), then use your
+**On its own**: `unlinkable-inference serve` (http://127.0.0.1:8899), then use your
 usual key and change only the base URL, e.g. Claude Code:
 
 ```sh
@@ -116,15 +116,15 @@ The proxy uses that key for one thing: keeping the wallet (and this month's
 passes, on a plan) topped up in the background. Chats go out with a session
 secret instead and are charged exactly their tokens, down to 0.001¢.
 
-`http://127.0.0.1:8899/_chaumian` shows what the server received for each
+`http://127.0.0.1:8899/_unlinkable` shows what the server received for each
 request. To hide your IP address too, run the proxy behind Tor or a VPN
 (`HTTPS_PROXY` / `ALL_PROXY` are honoured).
 
 ## Verify it yourself
 
-1. Open `/_chaumian`, or run with `--show-traffic`: requests carry a
+1. Open `/_unlinkable`, or run with `--show-traffic`: requests carry a
    session secret, no cookie, no account key.
-2. `chaumian-sessions verify` compares the keys the server gives you with your pins
+2. `unlinkable-inference verify` compares the keys the server gives you with your pins
    and the published pins, and prints what the server received.
 3. `./verify.sh` rebuilds the binaries in a pinned container and compares
    hashes with a release.

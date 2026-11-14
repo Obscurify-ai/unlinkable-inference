@@ -1,12 +1,12 @@
-//! The `chaumian-sessions` proxy: shared setup for the CLI and the local server.
+//! The `unlinkable-inference` proxy: shared setup for the CLI and the local server.
 
 pub mod serve;
 
 use anyhow::{bail, Context as _, Result};
 use std::path::PathBuf;
-use chaumian_sessions::keyset::{Keyset, Pins};
-use chaumian_sessions::net::{Client, Transport};
-use chaumian_sessions::Wallet;
+use unlinkable_inference::keyset::{Keyset, Pins};
+use unlinkable_inference::net::{Client, Transport};
+use unlinkable_inference::Wallet;
 
 /// Where to find the server and how to reach it.
 #[derive(Debug, Clone)]
@@ -37,7 +37,7 @@ impl Options {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| PathBuf::from("."));
         let host = self.host().replace([':', '/'], "_");
-        base.join("chaumian-sessions").join(host).join("wallet.json")
+        base.join("unlinkable-inference").join(host).join("wallet.json")
     }
 
     pub fn transport(&self) -> Transport {
@@ -62,7 +62,7 @@ pub fn lock_wallet(opts: &Options) -> Result<WalletLock> {
         .with_context(|| format!("opening {}", path.display()))?;
     if file.try_lock().is_err() {
         bail!(
-            "another chaumian-sessions process holds the wallet ({}). If the proxy is running, use its page at /_chaumian or stop it first.",
+            "another unlinkable-inference process holds the wallet ({}). If the proxy is running, use its page at /_unlinkable or stop it first.",
             path.display()
         );
     }
@@ -86,7 +86,7 @@ pub async fn trusted_keyset(opts: &Options, wallet: &mut Wallet) -> Result<Keyse
     let fingerprint = keyset.fingerprint();
     if pins.fingerprints.is_empty() {
         eprintln!(
-            "chaumian-sessions: pinned keyset {fingerprint} for {} on first use",
+            "unlinkable-inference: pinned keyset {fingerprint} for {} on first use",
             opts.host()
         );
         wallet.pin(Some(fingerprint));
@@ -97,7 +97,7 @@ pub async fn trusted_keyset(opts: &Options, wallet: &mut Wallet) -> Result<Keyse
         bail!(
             "{} is serving keyset {fingerprint}, which is not one you pinned ({}). \
              That is what a server singling you out would look like. If the server \
-             announced a key rotation in its public changelog, run `chaumian-sessions keys --trust`.",
+             announced a key rotation in its public changelog, run `unlinkable-inference keys --trust`.",
             opts.host(),
             pins.fingerprints.iter().cloned().collect::<Vec<_>>().join(", ")
         );
@@ -115,7 +115,7 @@ pub async fn connect(opts: &Options, wallet: &mut Wallet) -> Result<Client> {
 pub async fn api_key_for(opts: &Options, login_key: &str) -> Result<String> {
     let resp = opts
         .transport()
-        .send(chaumian_sessions::net::Request::post_json(
+        .send(unlinkable_inference::net::Request::post_json(
             "/generate_token",
             &serde_json::json!({ "account_key": login_key }),
         ))

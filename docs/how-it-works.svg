@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 1300" width="1160" height="1300">
 <defs><marker id="a52606d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#52606d"/></marker><marker id="a0e7c86" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0e7c86"/></marker><marker id="ab44d12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b44d12"/></marker><marker id="a6b46c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6b46c1"/></marker><marker id="a2f855a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2f855a"/></marker></defs>
 <rect width="1160" height="1300" fill="#f7f8fa"/>
-<text x="580.0" y="46" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="28" font-weight="700" fill="#1f2933" text-anchor="middle">How Chaumian sessions work</text>
+<text x="580.0" y="46" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="28" font-weight="700" fill="#1f2933" text-anchor="middle">How unlinkable inference works</text>
 <text x="580.0" y="76" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="15" font-weight="400" fill="#52606d" text-anchor="middle">The server is paid for every chat, but cannot tell which account a chat came from, or which chats go together.</text>
 <rect x="30" y="100" width="460" height="950" rx="16" fill="#e6f6f7"/>
 <rect x="670" y="100" width="460" height="950" rx="16" fill="#eceff3"/>
@@ -42,7 +42,7 @@
 <text x="580.0" y="638" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="15" font-weight="700" fill="#1f2933" text-anchor="middle">Each conversation opens a session</text>
 <rect x="40" y="672" width="440" height="58" rx="10" fill="#fff" stroke="#cbd2d9" stroke-width="1.5"/>
 <text x="260.0" y="696" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="14" font-weight="400" fill="#1f2933" text-anchor="middle">Pays with vouchers and picks a session secret</text>
-<text x="260.0" y="715" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="14" font-weight="400" fill="#1f2933" text-anchor="middle">sk-chs1_…  (also from the seed)</text>
+<text x="260.0" y="715" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="14" font-weight="400" fill="#1f2933" text-anchor="middle">sk-unl1_…  (also from the seed)</text>
 <line x1="480" y1="701" x2="680" y2="701" stroke="#6b46c1" stroke-width="2" marker-end="url(#a6b46c1)"/>
 <text x="580.0" y="675" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="13" font-weight="500" fill="#6b46c1" text-anchor="middle">vouchers + hash of the secret</text>
 <text x="580.0" y="693" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="13" font-weight="500" fill="#6b46c1" text-anchor="middle">no account, no cookie</text>
@@ -53,7 +53,7 @@
 <text x="580.0" y="765" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="15" font-weight="700" fill="#fff" text-anchor="middle">3</text>
 <text x="580.0" y="798" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="15" font-weight="700" fill="#1f2933" text-anchor="middle">Chat</text>
 <rect x="40" y="832" width="440" height="46" rx="10" fill="#fff" stroke="#cbd2d9" stroke-width="1.5"/>
-<text x="260.0" y="860" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="14" font-weight="400" fill="#1f2933" text-anchor="middle">Every request: Authorization: Bearer sk-chs1_…</text>
+<text x="260.0" y="860" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="14" font-weight="400" fill="#1f2933" text-anchor="middle">Every request: Authorization: Bearer sk-unl1_…</text>
 <line x1="480" y1="855" x2="680" y2="855" stroke="#6b46c1" stroke-width="2" marker-end="url(#a6b46c1)"/>
 <text x="580.0" y="847" font-family="system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" font-size="13" font-weight="500" fill="#6b46c1" text-anchor="middle">the secret instead of an API key</text>
 <rect x="680" y="832" width="440" height="46" rx="10" fill="#fff" stroke="#cbd2d9" stroke-width="1.5"/>

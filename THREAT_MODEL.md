@@ -46,7 +46,7 @@ use Tor or a VPN, or at least withdraw from a different network.
   each other only.
 - **Plan → chat**: passes. The server sees "a Pro session", never which Pro
   account; the crowd is everyone on that plan that month.
-- **Tagging a user with a unique key**: keysets are pinned; `chaumian-sessions verify`
+- **Tagging a user with a unique key**: keysets are pinned; `unlinkable-inference verify`
   compares the keys the server gives you with your pins and the published pins.
 - **A website spending your wallet through the proxy**: the proxy refuses
   requests with a non-local Origin or Host and POSTs that are not JSON.
@@ -61,7 +61,7 @@ use Tor or a VPN, or at least withdraw from a different network.
   vouchers into session-sized pieces through anonymous exchanges.
 - **Denominations**. Change comes back in the standard split, so its values
   say how much was left; spending those exact values later is weakly
-  suggestive. `chaumian-sessions exchange` trades them for a standard set. Dust is
+  suggestive. `unlinkable-inference exchange` trades them for a standard set. Dust is
   always spent with the next session, so dust in an opening says only "this
   client had a session before".
 - **Automatic top-ups**. With the account key, the proxy withdraws when the
@@ -74,7 +74,7 @@ use Tor or a VPN, or at least withdraw from a different network.
   number loses nothing: every voucher, pass and session secret is derived from
   the number, and the next sign-in rebuilds the wallet and closes stranded
   sessions for their change. A wallet without the number (vouchers bought or
-  imported) is lost with its file; `chaumian-sessions export` makes a backup.
+  imported) is lost with its file; `unlinkable-inference export` makes a backup.
   Either way the wallet stays small (it tops up $1 when below 50¢) and the
   account balance is untouched.
 - **Abuse controls**. The server cannot ban a person in this mode, only refuse

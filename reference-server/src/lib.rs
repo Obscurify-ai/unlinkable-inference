@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use chaumian_sessions::protocol::{ChangeResponse, Issued, PassAllowance, PassResponse, SessionStatus, UnclaimedSession};
-use chaumian_sessions::{sha256_hex, Family};
-use chaumian_sessions::server::{
+use unlinkable_inference::protocol::{ChangeResponse, Issued, PassAllowance, PassResponse, SessionStatus, UnclaimedSession};
+use unlinkable_inference::{sha256_hex, Family};
+use unlinkable_inference::server::{
     signer::KeyStore,
     Backend, Gateway, GatewayError, IssuedRecord, PassUse, SignChange, Spend,
 };
@@ -175,7 +175,7 @@ impl MemoryBackend {
     }
 
     pub fn create_account(&self, balance_cents: i64, tier: &str) -> String {
-        let token = format!("sk-test_{}", chaumian_sessions::b64(rand::random::<[u8; 18]>()));
+        let token = format!("sk-test_{}", unlinkable_inference::b64(rand::random::<[u8; 18]>()));
         self.db.lock().unwrap().accounts.insert(
             sha256_hex(&token),
             AccountRow {
@@ -523,7 +523,7 @@ fn session_of(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
     token
-        .starts_with(chaumian_sessions::SESSION_SECRET_PREFIX)
+        .starts_with(unlinkable_inference::SESSION_SECRET_PREFIX)
         .then(|| sha256_hex(token.trim()))
 }
 
@@ -711,7 +711,7 @@ fn default_balance() -> i64 {
 
 /// Test payment: an account with play money.
 async fn create_account(State(app): State<App>, Json(req): Json<NewAccount>) -> Json<Value> {
-    if !chaumian_sessions::pass::TIERS.contains(&req.tier.as_str()) {
+    if !unlinkable_inference::pass::TIERS.contains(&req.tier.as_str()) {
         return Json(json!({"error": {"message": "tier is pay_as_you_go, casual or pro"}}));
     }
     let token = app.backend.create_account(req.balance_cents, &req.tier);
@@ -750,7 +750,7 @@ async fn record(State(app): State<App>, req: Request, next: Next) -> Response {
             .or_else(|| req.headers().get("x-api-key"))
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let credential = if auth.contains(chaumian_sessions::SESSION_SECRET_PREFIX) {
+        let credential = if auth.contains(unlinkable_inference::SESSION_SECRET_PREFIX) {
             "session"
         } else if auth.is_empty() {
             "none"
@@ -793,7 +793,7 @@ pub fn build(
         .route("/test/account", get(account))
         .route("/debug/db", get(dump))
         .with_state(app.clone())
-        .merge(chaumian_sessions::server::router(gateway.clone()))
+        .merge(unlinkable_inference::server::router(gateway.clone()))
         .layer(middleware::from_fn_with_state(app, record));
     let router = inner;
     Server {

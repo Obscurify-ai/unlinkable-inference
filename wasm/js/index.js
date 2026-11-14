@@ -1,4 +1,4 @@
-// chaumian-sessions: Chaumian sessions in a web page.
+// unlinkable-inference: Unlinkable inference in a web page.
 //
 // The page's chat requests go out with a session secret paid from a wallet of
 // blind vouchers, and with no cookie, so the server cannot tell which account
@@ -6,11 +6,11 @@
 // comes from the account number, so when the browser forgets (Tor Browser
 // closing), the next sign-in brings the wallet back. Nothing is lost.
 //
-//   import * as sessions from 'chaumian-sessions';
+//   import * as sessions from 'unlinkable-inference';
 //   const { loginKey, seed } = await sessions.keys(number); // send loginKey to sign in
 //   const u = await sessions.connect({ seed, apiKey });
 //   const res = await u.fetch('/v1/chat/completions', { method: 'POST', body }, { chat: conversationId });
-import init, { accountKeys, newAccountNumber, Manager } from './chaumian_sessions_wasm.js';
+import init, { accountKeys, newAccountNumber, Manager } from './unlinkable_inference_wasm.js';
 
 let loaded;
 
@@ -46,7 +46,7 @@ export async function newNumber() {
  *   storage      where the wallet is kept (default localStorage), under `name`
  *   replyHeader  a response header naming a reply the server holds for later
  */
-export async function connect({ seed, apiKey, server = location.origin, storage = localStorage, name = 'chaumian-sessions', replyHeader, tickMs = 30000 }) {
+export async function connect({ seed, apiKey, server = location.origin, storage = localStorage, name = 'unlinkable-inference', replyHeader, tickMs = 30000 }) {
     await load();
     const key = typeof apiKey === 'function' ? await apiKey() : apiKey;
     const m = await Manager.connect(server, seed, storage.getItem(name), key ?? null);
@@ -91,6 +91,6 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
 }
 
 /** Signing out: drop the saved wallet (it comes back from the number). */
-export function forget({ storage = localStorage, name = 'chaumian-sessions' } = {}) {
+export function forget({ storage = localStorage, name = 'unlinkable-inference' } = {}) {
     storage.removeItem(name);
 }

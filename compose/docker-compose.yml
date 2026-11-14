@@ -1,21 +1,21 @@
 # The whole system on one machine: reference server and the proxy.
 #   docker compose -f compose/docker-compose.yml up --build
 #   curl -s localhost:8250/test/accounts -H 'content-type: application/json' -d '{}'   # play money
-#   docker compose -f compose/docker-compose.yml exec proxy chaumian-sessions withdraw 5 --api-key sk-test_…
+#   docker compose -f compose/docker-compose.yml exec proxy unlinkable-inference withdraw 5 --api-key sk-test_…
 #   curl localhost:8899/v1/chat/completions -H 'content-type: application/json' \
 #     -d '{"model":"echo","messages":[{"role":"user","content":"hi"}]}'
 #   curl -s localhost:8250/debug/db    # everything the server knows: try to link
 services:
   server:
     build: ..
-    command: chaumian-sessions-reference-server --listen 0.0.0.0:8250
+    command: unlinkable-inference-reference-server --listen 0.0.0.0:8250
     ports: ["127.0.0.1:8250:8250"]
   proxy:
     build: ..
-    command: chaumian-sessions serve --listen 0.0.0.0:8899
+    command: unlinkable-inference serve --listen 0.0.0.0:8899
     environment:
-      CHAUMIAN_SERVER: http://server:8250
-      CHAUMIAN_WALLET: /wallet/wallet.json
+      UNLINKABLE_SERVER: http://server:8250
+      UNLINKABLE_WALLET: /wallet/wallet.json
     volumes: ["wallet:/wallet"]
     ports: ["127.0.0.1:8899:8899"]
     depends_on: [server]

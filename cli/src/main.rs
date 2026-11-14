@@ -2,11 +2,11 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::time::Duration;
-use chaumian_sessions::keyset::Pins;
-use chaumian_sessions::net::{Observed, Request, Transport};
-use chaumian_sessions::{Family, Voucher, Wallet};
-use chaumian_sessions_cli::serve::{self, Mode, Settings};
-use chaumian_sessions_cli::{connect, dollars, lock_wallet, Options};
+use unlinkable_inference::keyset::Pins;
+use unlinkable_inference::net::{Observed, Request, Transport};
+use unlinkable_inference::{Family, Voucher, Wallet};
+use unlinkable_inference_cli::serve::{self, Mode, Settings};
+use unlinkable_inference_cli::{connect, dollars, lock_wallet, Options};
 
 /// Use AI models without the server being able to tell who sent each chat.
 ///
@@ -17,20 +17,20 @@ use chaumian_sessions_cli::{connect, dollars, lock_wallet, Options};
 ///
 /// Quick start (the key is your usual Obscurify key; it only ever moves
 /// money into the wallet and is never sent with a chat):
-///   chaumian-sessions serve                              # localhost:8899
+///   unlinkable-inference serve                              # localhost:8899
 ///   ANTHROPIC_BASE_URL=http://127.0.0.1:8899 ANTHROPIC_AUTH_TOKEN=sk-obs1_… claude
 ///   OPENAI_BASE_URL=http://127.0.0.1:8899/v1 OPENAI_API_KEY=sk-obs1_… …
 #[derive(Parser)]
-#[command(name = "chaumian-sessions", version, verbatim_doc_comment)]
+#[command(name = "unlinkable-inference", version, verbatim_doc_comment)]
 struct Cli {
     /// Server origin
-    #[arg(long, global = true, env = "CHAUMIAN_SERVER", default_value = "https://obscurify.ai")]
+    #[arg(long, global = true, env = "UNLINKABLE_SERVER", default_value = "https://obscurify.ai")]
     server: String,
-    /// Wallet file (default: ~/.local/share/chaumian-sessions/<server>/wallet.json)
-    #[arg(long, global = true, env = "CHAUMIAN_WALLET")]
+    /// Wallet file (default: ~/.local/share/unlinkable-inference/<server>/wallet.json)
+    #[arg(long, global = true, env = "UNLINKABLE_WALLET")]
     wallet: Option<std::path::PathBuf>,
     /// Also accept this keyset fingerprint (repeatable)
-    #[arg(long = "pin", global = true, env = "CHAUMIAN_PINS", value_delimiter = ',')]
+    #[arg(long = "pin", global = true, env = "UNLINKABLE_PINS", value_delimiter = ',')]
     pins: Vec<String>,
     #[command(subcommand)]
     command: Command,
@@ -38,7 +38,7 @@ struct Cli {
 
 #[derive(clap::Args)]
 struct ServeArgs {
-    #[arg(long, env = "CHAUMIAN_LISTEN", default_value = "127.0.0.1:8899")]
+    #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
     listen: String,
     /// What each new session starts with, in dollars
     #[arg(long, default_value = "0.50")]
@@ -77,13 +77,13 @@ enum Command {
     Serve(ServeArgs),
     /// The proxy as an MCP server with no tools: add it to an agent's MCP
     /// servers and the proxy runs while the agent does. If another proxy
-    /// already runs, it stays idle. Pair it with `chaumian-sessions key` as Claude
+    /// already runs, it stays idle. Pair it with `unlinkable-inference key` as Claude
     /// Code's apiKeyHelper, or point the agent's base URL at the proxy.
     Mcp(ServeArgs),
     /// Print a session secret to use in place of an API key (for Claude
-    /// Code's apiKeyHelper; needs `chaumian-sessions mcp` or `serve` running)
+    /// Code's apiKeyHelper; needs `unlinkable-inference mcp` or `serve` running)
     Key {
-        #[arg(long, env = "CHAUMIAN_LISTEN", default_value = "127.0.0.1:8899")]
+        #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
         listen: String,
     },
     /// Print the login key for an account number read from stdin: what
@@ -135,7 +135,7 @@ enum Command {
 }
 
 fn parse_dollars(text: &str) -> Result<i64> {
-    let cents = chaumian_sessions::net::usd_to_cents_floor(text);
+    let cents = unlinkable_inference::net::usd_to_cents_floor(text);
     if cents <= 0 {
         bail!("{text} is not an amount");
     }
@@ -145,7 +145,7 @@ fn parse_dollars(text: &str) -> Result<i64> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "chaumian_sessions=info,chaumian_sessions_cli=info".into()))
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "unlinkable_inference=info,unlinkable_inference_cli=info".into()))
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
             let (proxy, listener, _lock) = start(&opts, args).await?;
             serve::run(listener, proxy, async {
                 let _ = tokio::signal::ctrl_c().await;
-                eprintln!("chaumian-sessions: closing sessions…");
+                eprintln!("unlinkable-inference: closing sessions…");
             })
             .await?;
         }
@@ -168,11 +168,11 @@ async fn main() -> Result<()> {
         Command::LoginKey => {
             let mut number = String::new();
             std::io::stdin().read_to_string(&mut number)?;
-            println!("{}", chaumian_sessions::seed::account_keys(&number)?.login_key);
+            println!("{}", unlinkable_inference::seed::account_keys(&number)?.login_key);
         }
         Command::Key { listen } => {
             // The agent may ask before the MCP server has started the proxy.
-            let url = format!("http://{listen}/_chaumian/key");
+            let url = format!("http://{listen}/_unlinkable/key");
             let mut last = String::new();
             for _ in 0..60 {
                 match reqwest::get(&url).await {
@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
         }
         Command::Wallet => {
             let mut wallet = Wallet::open(opts.wallet_path())?;
-            let period = chaumian_sessions::pass::current_period();
+            let period = unlinkable_inference::pass::current_period();
             let passes = wallet.passes(&period);
             println!("wallet   {}", wallet.path().display());
             println!("paid     {}", dollars(wallet.balance_cents(Family::Paid)));
@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
             println!("passes   {} for {period}", passes.len());
             println!("sessions {} left open", wallet.sessions().len());
             if !wallet.pending().is_empty() {
-                println!("pending  {} (run `chaumian-sessions recover`)", wallet.pending().len());
+                println!("pending  {} (run `unlinkable-inference recover`)", wallet.pending().len());
             }
             println!("pinned   {}", wallet.pinned().unwrap_or("(nothing yet)"));
         }
@@ -218,7 +218,7 @@ async fn main() -> Result<()> {
             let mut wallet = Wallet::open(opts.wallet_path())?;
             let client = connect(&opts, &mut wallet).await?;
             let got = client.get_passes(&mut wallet, &api_key, count).await?;
-            let period = chaumian_sessions::pass::current_period();
+            let period = unlinkable_inference::pass::current_period();
             let held = wallet.passes(&period);
             wallet.save()?;
             println!(
@@ -243,7 +243,7 @@ async fn main() -> Result<()> {
                 let Some(voucher) = Voucher::parse(code) else {
                     bail!("not a voucher: {code}");
                 };
-                let Some(family) = chaumian_sessions::blank::verify(&client.keyset, &voucher) else {
+                let Some(family) = unlinkable_inference::blank::verify(&client.keyset, &voucher) else {
                     bail!("{} did not sign {code}", opts.host());
                 };
                 added += voucher.denomination_cents;
@@ -309,7 +309,7 @@ async fn main() -> Result<()> {
 async fn start(
     opts: &Options,
     args: ServeArgs,
-) -> Result<(std::sync::Arc<serve::Proxy>, tokio::net::TcpListener, chaumian_sessions_cli::WalletLock)> {
+) -> Result<(std::sync::Arc<serve::Proxy>, tokio::net::TcpListener, unlinkable_inference_cli::WalletLock)> {
     let ServeArgs {
         listen,
         session_funding,
@@ -327,24 +327,24 @@ async fn start(
     let mut client = connect(opts, &mut wallet).await?;
     let keys = account_number
         .as_deref()
-        .map(chaumian_sessions::seed::account_keys)
+        .map(unlinkable_inference::seed::account_keys)
         .transpose()?;
     if let Some(keys) = &keys {
         if api_key.is_none() {
-            api_key = Some(chaumian_sessions_cli::api_key_for(opts, &keys.login_key).await?);
+            api_key = Some(unlinkable_inference_cli::api_key_for(opts, &keys.login_key).await?);
         }
         client.seed = Some(keys.seed.clone());
     }
     match client.recover(&mut wallet).await {
         Ok(0) => {}
-        Ok(c) => eprintln!("chaumian-sessions: recovered {} from an earlier run", dollars(c)),
-        Err(e) => eprintln!("chaumian-sessions: could not finish an earlier run's work yet: {e:#}"),
+        Ok(c) => eprintln!("unlinkable-inference: recovered {} from an earlier run", dollars(c)),
+        Err(e) => eprintln!("unlinkable-inference: could not finish an earlier run's work yet: {e:#}"),
     }
     if keys.is_some() {
         match client.restore(&mut wallet, api_key.as_deref()).await {
             Ok(0) => {}
-            Ok(c) => eprintln!("chaumian-sessions: restored {} from the account number", dollars(c)),
-            Err(e) => eprintln!("chaumian-sessions: could not restore the wallet yet: {e:#}"),
+            Ok(c) => eprintln!("unlinkable-inference: restored {} from the account number", dollars(c)),
+            Err(e) => eprintln!("unlinkable-inference: could not restore the wallet yet: {e:#}"),
         }
     }
     let settings = Settings {
@@ -359,7 +359,7 @@ async fn start(
         account_key_prefix: "sk-obs1_".into(),
     };
     eprintln!(
-        "chaumian-sessions: wallet {} ({}); proxy on http://{listen} (page: http://{listen}/_chaumian)",
+        "unlinkable-inference: wallet {} ({}); proxy on http://{listen} (page: http://{listen}/_unlinkable)",
         dollars(wallet.balance_cents(Family::Paid) + wallet.balance_cents(Family::Promo)),
         wallet.path().display()
     );
@@ -385,8 +385,8 @@ async fn mcp(opts: &Options, args: ServeArgs) -> Result<()> {
                 "initialize" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
                     "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "chaumian-sessions", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Runs the chaumian-sessions proxy while the agent runs. It has no tools."
+                    "serverInfo": {"name": "unlinkable-inference", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": "Runs the unlinkable-inference proxy while the agent runs. It has no tools."
                 }}),
                 "tools/list" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}),
                 "ping" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
@@ -412,8 +412,8 @@ async fn mcp(opts: &Options, args: ServeArgs) -> Result<()> {
             .await?;
         }
         Err(e) => {
-            // Another agent's MCP server (or `chaumian-sessions serve`) has it.
-            eprintln!("chaumian-sessions: not starting a proxy here: {e:#}");
+            // Another agent's MCP server (or `unlinkable-inference serve`) has it.
+            eprintln!("unlinkable-inference: not starting a proxy here: {e:#}");
             let _ = rpc.await;
         }
     }
@@ -442,7 +442,7 @@ async fn verify(opts: &Options, published: Option<String>) -> Result<()> {
     }
     let published = published.or_else(|| {
         (opts.host() == "obscurify.ai").then(|| {
-            "https://raw.githubusercontent.com/Obscurify-ai/chaumian-sessions/main/lib/keys/obscurify.ai.pins"
+            "https://raw.githubusercontent.com/Obscurify-ai/unlinkable-inference/main/lib/keys/obscurify.ai.pins"
                 .to_string()
         })
     });

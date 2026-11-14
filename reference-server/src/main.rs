@@ -2,12 +2,12 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use chaumian_sessions::server::signer::{KeyStore, PassKey};
+use unlinkable_inference::server::signer::{KeyStore, PassKey};
 
-/// Reference Chaumian-sessions server with an echo model and play money.
+/// Reference unlinkable-inference server with an echo model and play money.
 /// `POST /test/accounts` makes an account; `GET /debug/db` dumps everything.
 #[derive(Parser)]
-#[command(name = "chaumian-sessions-reference-server", version)]
+#[command(name = "unlinkable-inference-reference-server", version)]
 struct Args {
     #[arg(long, env = "LISTEN", default_value = "127.0.0.1:8250")]
     listen: SocketAddr,
@@ -30,13 +30,13 @@ async fn main() -> anyhow::Result<()> {
         None => PassKey::from_pem(&PassKey::generate()?)?,
     };
     let dust = KeyStore::new(
-        &chaumian_sessions::denominations::DUST_MILLICENTS,
+        &unlinkable_inference::denominations::DUST_MILLICENTS,
         args.keys_dir.as_ref().map(|d| d.join("dust")).as_deref(),
     )?;
     let keys = KeyStore::all(args.keys_dir.as_deref())?
         .with_pass_key(pass)
         .with_dust(dust);
-    let server = chaumian_sessions_reference_server::build(
+    let server = unlinkable_inference_reference_server::build(
         keys,
         Duration::from_secs(args.idle_timeout_seconds),
     );

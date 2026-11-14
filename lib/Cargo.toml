@@ -1,6 +1,6 @@
 [package]
-name = "chaumian-sessions"
-description = "Chaumian sessions: anonymous prepaid API sessions paid with blind-signed e-cash. Client (wallet, blinding, sessions, recovery from one secret) and, with the `server` feature, the server endpoints"
+name = "unlinkable-inference"
+description = "Unlinkable inference: anonymous prepaid API sessions paid with blind-signed e-cash. Client (wallet, blinding, sessions, recovery from one secret) and, with the `server` feature, the server endpoints"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition.workspace = true

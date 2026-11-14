@@ -72,7 +72,7 @@ impl GatewayError {
         Self::Status(
             StatusCode::NOT_FOUND,
             "not_found_error",
-            "Chaumian sessions are not available on this server.".into(),
+            "Unlinkable inference is not available on this server.".into(),
         )
     }
 }
