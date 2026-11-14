@@ -2,17 +2,17 @@
 //! family, optionally kept in a directory. Production servers can bring
 //! their own [`crate::Signer`] instead.
 
-use crate::Signer;
+use super::Signer;
 use blind_rsa_signatures::pbrsa::{
     PartiallyBlindKeyPairSha384PSSDeterministic as PassKeyPair,
     PartiallyBlindSecretKeySha384PSSDeterministic as PassSecretKey,
 };
 use std::sync::Mutex;
-use unlinkable_core::keyset::PassKeyInfo;
+use crate::keyset::PassKeyInfo;
 use blind_rsa_signatures::{DefaultRng, KeyPairSha384PSSDeterministic, SecretKeySha384PSSDeterministic};
 use std::collections::HashMap;
 use std::path::Path;
-use unlinkable_core::{keyset::VoucherKeyInfo, Family, DENOMINATIONS};
+use crate::{keyset::VoucherKeyInfo, Family, DENOMINATIONS};
 
 pub struct KeyStore {
     keys: HashMap<(Family, i64), (VoucherKeyInfo, KeyPairSha384PSSDeterministic)>,
@@ -68,7 +68,7 @@ impl PassKey {
 
     pub fn sign(&self, tier: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(blinded.len() == 256, "blinded pass has the wrong length");
-        let meta = unlinkable_core::pass::metadata(tier, period);
+        let meta = crate::pass::metadata(tier, period);
         let mut cache = self.derived.lock().unwrap();
         if !cache.contains_key(&meta) {
             let sk = self

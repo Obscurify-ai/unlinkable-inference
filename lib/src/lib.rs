@@ -1,11 +1,13 @@
-//! Client side of unlinkable sessions.
+//! Chaumian sessions: anonymous prepaid API sessions paid for with
+//! blind-signed e-cash (David Chaum's scheme).
 //!
 //! A wallet of blind-signed vouchers pays for a session, and the session
-//! secret, not an account key, authorises requests. See `SPEC.md` for the
+//! secret, not an account key, authorises requests. The client is the
+//! default; `server` (feature) is the other end. See `SPEC.md` for the
 //! wire format and `THREAT_MODEL.md` for what this protects (not the IP:
 //! that is the network's job, Tor or a VPN).
 //!
-//! Everything that makes requests unlinkable happens here, on the device: the
+//! Everything that keeps requests from being tied to an account happens on the device: the
 //! server only ever sees blinded messages when it signs, and unblinded vouchers
 //! it has never seen when they are spent.
 
@@ -22,6 +24,8 @@ pub mod wallet;
 pub mod net;
 #[cfg(feature = "net")]
 pub mod manager;
+#[cfg(feature = "server")]
+pub mod server;
 
 pub use blank::Blank;
 pub use denominations::{split, DENOMINATIONS, WITHDRAW_SIZES};
@@ -30,7 +34,7 @@ pub use voucher::{Family, Voucher};
 pub use wallet::Wallet;
 
 /// Session secrets look like API keys so OpenAI and Anthropic SDKs accept them.
-pub const SESSION_SECRET_PREFIX: &str = "sk-unl1_";
+pub const SESSION_SECRET_PREFIX: &str = "sk-chs1_";
 
 /// Seconds since 1970 (in a browser, from `Date.now()`: `SystemTime` panics there).
 pub fn unix_now() -> u64 {

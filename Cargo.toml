@@ -1,17 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["core", "gateway", "proxy", "reference-server", "wasm"]
+members = ["lib", "cli", "reference-server", "wasm"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-repository = "https://github.com/Obscurify-ai/unlinkable"
+repository = "https://github.com/Obscurify-ai/chaumian-sessions"
 
 [workspace.dependencies]
-unlinkable-core = { version = "0.1.0", path = "core", default-features = false }
-unlinkable-gateway = { version = "0.1.0", path = "gateway" }
-unlinkable-reference-server = { path = "reference-server" }
+chaumian-sessions = { version = "0.1.0", path = "lib", default-features = false }
+chaumian-sessions-reference-server = { path = "reference-server" }
 anyhow = "1"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 async-trait = "0.1"

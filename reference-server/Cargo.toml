@@ -1,17 +1,17 @@
 [package]
-name = "unlinkable-reference-server"
-description = "Reference unlinkable-sessions server: gateway, in-memory backend, echo model, test payments, full database dump"
+name = "chaumian-sessions-reference-server"
+description = "Reference Chaumian-sessions server: gateway, in-memory backend, echo model, test payments, full database dump"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+publish = false
 readme = "../README.md"
 keywords = ["privacy", "blind-signatures", "ecash", "llm", "anonymity"]
 
 [dependencies]
-unlinkable-core.workspace = true
-unlinkable-gateway.workspace = true
+chaumian-sessions = { workspace = true, features = ["server"] }
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true

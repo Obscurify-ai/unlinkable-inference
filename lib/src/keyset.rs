@@ -176,7 +176,7 @@ pub struct Pins {
 
 impl Pins {
     /// Fingerprints built into this release for the public Obscurify server.
-    /// Filled in by the release process from `core/keys/obscurify.ai.pins`; a
+    /// Filled in by the release process from `lib/keys/obscurify.ai.pins`; a
     /// release never trusts a key that is not in its own source.
     pub fn builtin(host: &str) -> Self {
         let text = match host {

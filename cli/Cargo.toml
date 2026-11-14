@@ -1,6 +1,6 @@
 [package]
-name = "unlinkable-proxy"
-description = "Local proxy for unlinkable sessions: OpenAI and Anthropic endpoints on localhost paid from a voucher wallet, one session per conversation"
+name = "chaumian-sessions-cli"
+description = "Local proxy for Chaumian sessions: OpenAI and Anthropic endpoints on localhost paid from a voucher wallet, one session per conversation"
 license = "GPL-3.0-or-later"
 version.workspace = true
 edition.workspace = true
@@ -10,11 +10,11 @@ readme = "../README.md"
 keywords = ["privacy", "blind-signatures", "ecash", "llm", "anonymity"]
 
 [[bin]]
-name = "unlinkable"
+name = "chaumian-sessions"
 path = "src/main.rs"
 
 [dependencies]
-unlinkable-core = { workspace = true, features = ["net"] }
+chaumian-sessions = { workspace = true, features = ["net"] }
 anyhow.workspace = true
 axum.workspace = true
 bytes.workspace = true
@@ -28,6 +28,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-unlinkable-gateway.workspace = true
-unlinkable-reference-server.workspace = true
+chaumian-sessions = { workspace = true, features = ["server"] }
+chaumian-sessions-reference-server.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }

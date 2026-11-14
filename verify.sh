@@ -3,8 +3,8 @@
 # published hashes: ./verify.sh [SHA256SUMS-from-the-release]
 set -eu
 cd "$(dirname "$0")"
-docker build --target build -t unlinkable-verify .
-id=$(docker create unlinkable-verify)
+docker build --target build -t chaumian-sessions-verify .
+id=$(docker create chaumian-sessions-verify)
 docker cp "$id:/out/SHA256SUMS" ./SHA256SUMS.rebuilt
 docker rm "$id" >/dev/null
 cat SHA256SUMS.rebuilt

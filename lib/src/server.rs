@@ -1,4 +1,4 @@
-//! Server side of unlinkable sessions.
+//! The server side (feature `server`).
 //!
 //! [`router`] serves the session endpoints (`/u/*`). They read no cookie and
 //! no account key (except `/u/withdraw`, which is the account moving its own
@@ -9,7 +9,6 @@
 
 pub mod signer;
 
-pub use unlinkable_core as core;
 
 use async_trait::async_trait;
 use axum::{
@@ -21,7 +20,7 @@ use axum::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-use unlinkable_core::{
+use crate::{
     denominations::{pick_blanks, pick_dust_blanks, MILLICENTS_PER_CENT, WITHDRAW_SIZES},
     keyset::{Keyset, PassKeyInfo, VoucherKeyInfo, SCHEME},
     pass::{current_period, Pass, TIERS},
@@ -73,7 +72,7 @@ impl GatewayError {
         Self::Status(
             StatusCode::NOT_FOUND,
             "not_found_error",
-            "Unlinkable sessions are not available on this server.".into(),
+            "Chaumian sessions are not available on this server.".into(),
         )
     }
 }
@@ -296,7 +295,7 @@ impl Gateway {
         for (i, code) in codes.iter().enumerate() {
             let voucher = Voucher::parse(code)
                 .ok_or_else(|| GatewayError::bad_request(format!("Voucher {i} is not a voucher.")))?;
-            let f = unlinkable_core::blank::verify(&self.keyset, &voucher).ok_or_else(|| {
+            let f = crate::blank::verify(&self.keyset, &voucher).ok_or_else(|| {
                 GatewayError::bad_request(format!("Voucher {i} has no valid signature."))
             })?;
             if *family.get_or_insert(f) != f {
@@ -386,7 +385,7 @@ impl Gateway {
                     "The voucher keys changed; fetch /u/keys and blind again.".into(),
                 ));
             }
-            let blinded = unlinkable_core::unb64(&blank.blinded_message)
+            let blinded = crate::unb64(&blank.blinded_message)
                 .ok_or_else(|| GatewayError::bad_request("Invalid blinded message."))?;
             let sig = if blank.dust {
                 self.signer.sign_dust(family, blank.denomination_cents, &blinded)
@@ -397,7 +396,7 @@ impl Gateway {
             total += blank_millicents(blank);
             signed.push(SignedBlank {
                 index,
-                blind_signature: unlinkable_core::b64(sig),
+                blind_signature: crate::b64(sig),
             });
         }
         Ok(ChangeResponse {
@@ -428,7 +427,7 @@ impl Gateway {
                 pass.period
             )));
         }
-        if !unlinkable_core::pass::verify(&self.keyset, &pass) {
+        if !crate::pass::verify(&self.keyset, &pass) {
             return Err(GatewayError::bad_request("That pass has no valid signature."));
         }
         Ok(PassUse {
@@ -441,7 +440,7 @@ impl Gateway {
 
 fn account_token(headers: &HeaderMap) -> Result<String, GatewayError> {
     bearer(headers)
-        .filter(|t| !t.starts_with(unlinkable_core::SESSION_SECRET_PREFIX))
+        .filter(|t| !t.starts_with(crate::SESSION_SECRET_PREFIX))
         .ok_or_else(|| {
             GatewayError::Status(
                 StatusCode::UNAUTHORIZED,
@@ -482,7 +481,7 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
             digest.push('|');
             digest.push_str(b);
         }
-        let digest = unlinkable_core::sha256_hex(digest);
+        let digest = crate::sha256_hex(digest);
         let allowance = gw.backend.pass_allowance(&token, &req.period).await?;
         if allowance.tier != req.tier {
             return Err(GatewayError::Status(
@@ -495,13 +494,13 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
         // allowance and stores the answer in one step.
         let mut signatures = Vec::with_capacity(req.blinded.len());
         for b in &req.blinded {
-            let blinded = unlinkable_core::unb64(b)
+            let blinded = crate::unb64(b)
                 .ok_or_else(|| GatewayError::bad_request("Invalid blinded pass."))?;
             let sig = gw
                 .signer
                 .sign_pass(&req.tier, &req.period, &blinded)
                 .map_err(|e| GatewayError::bad_request(format!("Cannot sign that pass: {e}")))?;
-            signatures.push(unlinkable_core::b64(sig));
+            signatures.push(crate::b64(sig));
         }
         let answer = PassResponse {
             tier: req.tier.clone(),
@@ -524,7 +523,7 @@ fn blanks_digest(kind: &str, blanks: &[BlindedVoucher]) -> String {
         text.push('|');
         text.push_str(&b.blinded_message);
     }
-    unlinkable_core::sha256_hex(text)
+    crate::sha256_hex(text)
 }
 
 fn check_blank_count(blanks: &[BlindedVoucher]) -> Result<(), GatewayError> {
@@ -546,10 +545,10 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 
 fn session_hash(headers: &HeaderMap) -> Result<String, GatewayError> {
     let token = bearer(headers).ok_or_else(GatewayError::unauthorized)?;
-    if !token.starts_with(unlinkable_core::SESSION_SECRET_PREFIX) {
+    if !token.starts_with(crate::SESSION_SECRET_PREFIX) {
         return Err(GatewayError::unauthorized());
     }
-    Ok(unlinkable_core::sha256_hex(token))
+    Ok(crate::sha256_hex(token))
 }
 
 async fn ensure_enabled(gw: &Gateway) -> Result<(), GatewayError> {

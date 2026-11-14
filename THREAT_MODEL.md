@@ -29,7 +29,7 @@ What links a session to a withdrawal would have to be in what the server sees
 at both. At withdrawal it signs blinded messages; at spending it sees
 unblinded messages and signatures. RFC 9474 blinding makes these independent:
 no amount of computation ties one to the other. The reference server's
-`/debug/db` is the server's full view; `proxy/tests/e2e.rs` asserts the two
+`/debug/db` is the server's full view; `cli/tests/e2e.rs` asserts the two
 share nothing.
 
 An address seen at both is a link. Someone who withdraws and chats from the
@@ -46,7 +46,7 @@ use Tor or a VPN, or at least withdraw from a different network.
   each other only.
 - **Plan → chat**: passes. The server sees "a Pro session", never which Pro
   account; the crowd is everyone on that plan that month.
-- **Tagging a user with a unique key**: keysets are pinned; `unlinkable verify`
+- **Tagging a user with a unique key**: keysets are pinned; `chaumian-sessions verify`
   compares the keys the server gives you with your pins and the published pins.
 - **A website spending your wallet through the proxy**: the proxy refuses
   requests with a non-local Origin or Host and POSTs that are not JSON.
@@ -61,7 +61,7 @@ use Tor or a VPN, or at least withdraw from a different network.
   vouchers into session-sized pieces through anonymous exchanges.
 - **Denominations**. Change comes back in the standard split, so its values
   say how much was left; spending those exact values later is weakly
-  suggestive. `unlinkable exchange` trades them for a standard set. Dust is
+  suggestive. `chaumian-sessions exchange` trades them for a standard set. Dust is
   always spent with the next session, so dust in an opening says only "this
   client had a session before".
 - **Automatic top-ups**. With the account key, the proxy withdraws when the
@@ -73,7 +73,7 @@ use Tor or a VPN, or at least withdraw from a different network.
 - **Loss**. Vouchers are bearer credit. Lose the wallet file, lose them.
   With the account key the proxy keeps the wallet small (it tops up $1 when
   below 50¢), so a lost device costs at most about $1.50; the account balance
-  is untouched. `unlinkable export` makes a backup.
+  is untouched. `chaumian-sessions export` makes a backup.
 - **Abuse controls**. The server cannot ban a person in this mode, only refuse
   a session.
 

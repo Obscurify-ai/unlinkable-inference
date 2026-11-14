@@ -1,6 +1,6 @@
 [package]
-name = "unlinkable-wasm"
-description = "Unlinkable sessions in a browser: the core client as a WebAssembly module"
+name = "chaumian-sessions-wasm"
+description = "Chaumian sessions in a browser: the core client as a WebAssembly module"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition.workspace = true
@@ -14,7 +14,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-unlinkable-core = { path = "../core" }
+chaumian-sessions = { path = "../lib" }
 futures.workspace = true
 hex.workspace = true
 serde_json.workspace = true

@@ -1,11 +1,11 @@
-# Unlinkable sessions: wire format
+# Chaumian sessions: wire format
 
 Version 1. All JSON. Binary values are base64url without padding. Amounts are
 integer cents unless named `_usd`, which are exact decimal strings.
 
 ## Parties
 
-- **Client**: holds the wallet. The proxy (`unlinkable`), and later the
+- **Client**: holds the wallet. The proxy (`chaumian-sessions`), and later the
   Android and web apps.
 - **Server**: runs the gateway. Sees each request's content and the address it
   came from. Hiding that address is up to the client's network (Tor, a VPN);
@@ -54,7 +54,7 @@ JSON serialisation with both key lists sorted by value, fields in the order
 above. Clients accept a keyset only if its fingerprint is pinned (built into
 the release, given with `--pin`, or pinned on first use for servers with no
 built-in pins) and every `key_id` matches its key. Published pins for
-obscurify.ai live in `core/keys/obscurify.ai.pins`.
+obscurify.ai live in `lib/keys/obscurify.ai.pins`.
 
 ## Endpoints
 
@@ -75,7 +75,7 @@ None of them reads a cookie or stores an IP. Errors are
 - **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed", "tier"?}`.
 - **Change**: `{"change_cents", "family", "signed": [{"index", "blind_signature"}]}`;
   `index` points into the request's `blanks`.
-- **Session auth**: `Authorization: Bearer sk-unl1_<32 random bytes>`. The
+- **Session auth**: `Authorization: Bearer sk-chs1_<32 random bytes>`. The
   client picks the secret and sends only `secret_hash` = SHA-256(secret), hex,
   when opening. The same secret is the API key for model and tool requests.
 
@@ -110,7 +110,7 @@ Rules:
 A pass proves "this session's holder has plan X this month" without saying
 which account. It is a partially blind RSA signature
 (draft-irtf-cfrg-partially-blind-rsa, SHA-384, PSS, deterministic) under the
-keyset's `pass_key`, with public metadata `unlinkable-pass:v1:<tier>:<YYYY-MM>`;
+keyset's `pass_key`, with public metadata `chaumian-sessions-pass:v1:<tier>:<YYYY-MM>`;
 the client blinds against the key derived for that metadata. Tiers:
 `pay_as_you_go`, `casual`, `pro`. Text form:
 `obp1.<tier>.<YYYY-MM>.<message>.<signature>`, message 32 random bytes; spent

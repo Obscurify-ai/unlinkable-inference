@@ -1,4 +1,4 @@
-# unlinkable
+# Chaumian sessions
 
 Use AI models without the server being able to tell which account or payment
 a chat came from, or which other chats it goes with. The server still reads
@@ -7,24 +7,24 @@ the prompt, and sees your IP address unless you hide it with Tor or a VPN.
 [SPEC.md](SPEC.md) has the wire format.
 
 How it works, in one paragraph: your device holds a wallet of blind-signed
-vouchers. Each conversation opens a session paid with a few of them and uses a
+vouchers (Chaumian e-cash: David Chaum's blind signatures, 1982). Each conversation opens a session paid with a few of them and uses a
 random session secret instead of an API key. When the conversation goes quiet
 the session closes and the change comes back as fresh vouchers the server has
 never seen. Everything is derived from the account number, so a device that
 forgets it all gets the money back at the next sign-in. Nothing depends on a
 third party.
 
-![How unlinkable sessions work](https://raw.githubusercontent.com/Obscurify-ai/unlinkable/main/docs/how-it-works.svg)
+![How Chaumian sessions work](https://raw.githubusercontent.com/Obscurify-ai/chaumian-sessions/main/docs/how-it-works.svg)
 
 ## Use it in an app
 
-The client logic is one Rust crate, `unlinkable-core`; browsers get the same
-code as WebAssembly in the npm package `@obscurify/unlinkable`.
+The client logic is one Rust crate, `chaumian-sessions`; browsers get the same
+code as WebAssembly in the npm package `chaumian-sessions`.
 
-**Rust** (`cargo add unlinkable-core`):
+**Rust** (`cargo add chaumian-sessions`):
 
 ```rust
-use unlinkable_core::{manager::Manager, seed::account_keys};
+use chaumian_sessions::{manager::Manager, seed::account_keys};
 
 let keys = account_keys(&number)?;            // slow on purpose, ~1 s
 // sign in with keys.login_key; keep keys.seed on the device
@@ -37,33 +37,35 @@ save(m.state());                               // after every call
 // Every 30 s: m.tick().await (closes quiet sessions for their change, tops up).
 ```
 
-**Browser** (`npm install @obscurify/unlinkable`):
+**Browser** (`npm install chaumian-sessions`):
 
 ```js
-import * as unlinkable from '@obscurify/unlinkable';
+import * as sessions from 'chaumian-sessions';
 
-const { loginKey, seed } = await unlinkable.keys(number); // sign in with loginKey
-const u = await unlinkable.connect({ seed, apiKey });     // wallet kept in localStorage
+const { loginKey, seed } = await sessions.keys(number); // sign in with loginKey
+const u = await sessions.connect({ seed, apiKey });     // wallet kept in localStorage
 const res = await u.fetch('/v1/chat/completions', { method: 'POST', headers, body }, { chat: conversationId });
 ```
 
 `u.fetch` sends the conversation's session secret with `credentials: 'omit'`,
 so no cookie goes with it, and tops the session up when it runs out.
 
-## Parts
+## Packages
 
-| Crate | What | Licence |
+| Package | What | Licence |
 |---|---|---|
-| `core` | vouchers, blinding, wallet, sessions, key pinning, seed, `Manager` | MIT or Apache-2.0 |
-| `wasm` | `core` for browsers: npm `@obscurify/unlinkable` (`wasm/build.sh`) | MIT or Apache-2.0 |
-| `gateway` | session endpoints and voucher checks (axum) | MIT or Apache-2.0 |
-| `reference-server` | gateway + in-memory storage + echo model + play money + full DB dump | MIT or Apache-2.0 |
-| `proxy` | `unlinkable`: local OpenAI/Anthropic API, wallet CLI, `verify` | GPL-3.0-or-later |
+| [`chaumian-sessions`](lib) (crate) | The library. Client: blind vouchers, wallet, sessions, key pinning, recovery from the account number, `Manager` for apps. With the `server` feature: the session endpoints and voucher checks (axum) over your storage. | MIT or Apache-2.0 |
+| `chaumian-sessions` (npm) | The same client compiled to WebAssembly for web pages ([`wasm`](wasm), `wasm/build.sh`) | MIT or Apache-2.0 |
+| [`chaumian-sessions-cli`](cli) (crate) | `chaumian-sessions`: local OpenAI/Anthropic proxy, MCP server, wallet CLI, `verify` | GPL-3.0-or-later |
+
+[`reference-server`](reference-server) is not published: the server feature over
+in-memory storage with an echo model, play money and a full database dump, for
+the tests and for checking what a server learns.
 
 ## Use it with any agent
 
 ```sh
-cargo install --path proxy
+cargo install chaumian-sessions-cli   # or, from this repo: cargo install --path cli
 ```
 
 **As an MCP server** (Claude Code, Codex, anything with MCP): the agent starts
@@ -71,7 +73,7 @@ the proxy and stops it when it exits, closing its sessions. The server entry
 has no tools:
 
 ```json
-{"mcpServers": {"unlinkable": {"command": "unlinkable", "args": ["mcp"],
+{"mcpServers": {"chaumian-sessions": {"command": "chaumian-sessions", "args": ["mcp"],
   "env": {"OBSCURIFY_API_KEY": "sk-obs1_…"}}}}
 ```
 
@@ -79,7 +81,7 @@ Claude Code then keeps talking to the server directly; only the key changes,
 to a session secret from the proxy. In `.claude/settings.json`:
 
 ```json
-{"apiKeyHelper": "unlinkable key",
+{"apiKeyHelper": "chaumian-sessions key",
  "env": {"ANTHROPIC_BASE_URL": "https://obscurify.ai"}}
 ```
 
@@ -89,7 +91,7 @@ instead, as a profile next to the normal one (`codex --profile private`):
 
 ```toml
 [model_providers.obscurify-private]
-name = "Obscurify (unlinkable)"
+name = "Obscurify (private)"
 base_url = "http://127.0.0.1:8899/v1"
 env_key = "OBSCURIFY_API_KEY"
 
@@ -97,11 +99,11 @@ env_key = "OBSCURIFY_API_KEY"
 model_provider = "obscurify-private"
 ```
 
-**pi**: copy `integrations/pi/unlinkable.ts` to `~/.pi/agent/extensions/`. It
+**pi**: copy `integrations/pi/chaumian-sessions.ts` to `~/.pi/agent/extensions/`. It
 starts the proxy when needed and adds an `obscurify-private` provider with the
 same models as your `obscurify` one; the normal provider stays.
 
-**On its own**: `unlinkable serve` (http://127.0.0.1:8899), then use your
+**On its own**: `chaumian-sessions serve` (http://127.0.0.1:8899), then use your
 usual key and change only the base URL, e.g. Claude Code:
 
 ```sh
@@ -114,15 +116,15 @@ The proxy uses that key for one thing: keeping the wallet (and this month's
 passes, on a plan) topped up in the background. Chats go out with a session
 secret instead and are charged exactly their tokens, down to 0.001¢.
 
-`http://127.0.0.1:8899/_unlinkable` shows what the server received for each
+`http://127.0.0.1:8899/_chaumian` shows what the server received for each
 request. To hide your IP address too, run the proxy behind Tor or a VPN
 (`HTTPS_PROXY` / `ALL_PROXY` are honoured).
 
 ## Verify it yourself
 
-1. Open `/_unlinkable`, or run with `--show-traffic`: requests carry a
+1. Open `/_chaumian`, or run with `--show-traffic`: requests carry a
    session secret, no cookie, no account key.
-2. `unlinkable verify` compares the keys the server gives you with your pins
+2. `chaumian-sessions verify` compares the keys the server gives you with your pins
    and the published pins, and prints what the server received.
 3. `./verify.sh` rebuilds the binaries in a pinned container and compares
    hashes with a release.
