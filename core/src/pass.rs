@@ -130,12 +130,38 @@ pub struct PassBlank {
 
 impl PassBlank {
     pub fn new(keyset: &Keyset, tier: &str, period: &str) -> Result<Self> {
-        let pk = derived(keyset, tier, period)?;
         let mut message = vec![0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut message);
+        Self::build(keyset, tier, period, message, &mut DefaultRng)
+    }
+
+    /// The `j`th pass blank of operation `op`, derived from the seed (see
+    /// [`crate::Blank::seeded`]).
+    pub fn seeded(
+        keyset: &Keyset,
+        tier: &str,
+        period: &str,
+        seed: &crate::seed::Seed,
+        op: &[u8],
+        j: u32,
+    ) -> Result<Self> {
+        let j = j.to_be_bytes();
+        let message = seed.derive(&[b"pass", op, &j]).to_vec();
+        let mut rng = seed.rng(&[b"pass-blinding", op, &j]);
+        Self::build(keyset, tier, period, message, &mut rng)
+    }
+
+    fn build<R: blind_rsa_signatures::reexports::rsa::rand_core::CryptoRng + ?Sized>(
+        keyset: &Keyset,
+        tier: &str,
+        period: &str,
+        message: Vec<u8>,
+        rng: &mut R,
+    ) -> Result<Self> {
+        let pk = derived(keyset, tier, period)?;
         let meta = metadata(tier, period);
         let blinding = pk
-            .blind(&mut DefaultRng, &message, Some(&meta))
+            .blind(rng, &message, Some(&meta))
             .map_err(|e| anyhow!("blinding failed: {e}"))?;
         Ok(Self {
             tier: tier.to_string(),

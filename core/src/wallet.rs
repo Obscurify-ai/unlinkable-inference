@@ -2,7 +2,9 @@
 //!
 //! Vouchers are bearer credit. Whoever has the file can spend them, and if the
 //! file is lost they are gone; `export` exists for backups. The file is
-//! written atomically with owner-only permissions.
+//! written atomically with owner-only permissions. A wallet with no file
+//! ([`Wallet::in_memory`]) is for clients that keep the JSON themselves
+//! (a browser's storage).
 
 use crate::blank::Blank;
 use crate::pass::{Pass, PassBlank};
@@ -59,6 +61,11 @@ struct WalletFile {
     /// Keyset fingerprint pinned on first use (servers without built-in pins)
     #[serde(default)]
     pinned: Option<String>,
+    /// Where each voucher came from (hash of its message → `w:<nonce>` for a
+    /// withdrawal, `s:<secret hash>` for a session's change). Once nothing
+    /// from a source is left, the server can forget it (seeded wallets).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    sources: std::collections::BTreeMap<String, String>,
 }
 
 pub struct Wallet {
@@ -79,11 +86,33 @@ impl Wallet {
         Ok(Self { path, file })
     }
 
+    /// A wallet with no file: `save` does nothing; keep [`Wallet::to_json`].
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            file: WalletFile::default(),
+        }
+    }
+
+    pub fn from_json(text: &str) -> Result<Self> {
+        Ok(Self {
+            path: PathBuf::new(),
+            file: serde_json::from_str(text)?,
+        })
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.file).expect("wallet serialises")
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     pub fn save(&self) -> Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
             restrict(dir, 0o700);
@@ -119,6 +148,64 @@ impl Wallet {
                 self.file.vouchers.push(Held { family, voucher });
             }
         }
+    }
+
+    /// Add vouchers from `source` (see `WalletFile::sources`). With no
+    /// vouchers the source is finished straight away.
+    pub fn add_from(&mut self, family: Family, vouchers: Vec<Voucher>, source: &str) {
+        if vouchers.is_empty() {
+            self.file.sources.insert(format!("empty:{source}"), source.to_string());
+        }
+        for v in &vouchers {
+            self.file
+                .sources
+                .insert(crate::sha256_hex(&v.message), source.to_string());
+        }
+        self.add(family, vouchers);
+    }
+
+    /// Sources none of whose vouchers are held any more.
+    pub fn finished_sources(&self) -> Vec<String> {
+        let held: std::collections::HashSet<String> = self
+            .file
+            .vouchers
+            .iter()
+            .map(|h| crate::sha256_hex(&h.voucher.message))
+            .chain(self.file.passes.iter().map(|p| crate::sha256_hex(&p.message)))
+            .collect();
+        let alive: std::collections::HashSet<&String> = self
+            .file
+            .sources
+            .iter()
+            .filter(|(h, _)| held.contains(*h))
+            .map(|(_, s)| s)
+            .collect();
+        let mut done: Vec<String> = self
+            .file
+            .sources
+            .values()
+            .filter(|s| !alive.contains(s))
+            .cloned()
+            .collect();
+        done.sort();
+        done.dedup();
+        done
+    }
+
+    /// Remember where passes came from (see [`Wallet::add_from`]).
+    pub fn note_pass_source(&mut self, passes: &[Pass], source: &str) {
+        if passes.is_empty() {
+            self.file.sources.insert(format!("empty:{source}"), source.to_string());
+        }
+        for p in passes {
+            self.file
+                .sources
+                .insert(crate::sha256_hex(&p.message), source.to_string());
+        }
+    }
+
+    pub fn forget_sources(&mut self, sources: &[String]) {
+        self.file.sources.retain(|_, s| !sources.contains(s));
     }
 
     /// Take vouchers of one family worth at least `cents` (or everything

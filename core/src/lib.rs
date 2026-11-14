@@ -14,6 +14,7 @@ pub mod denominations;
 pub mod keyset;
 pub mod pass;
 pub mod protocol;
+pub mod seed;
 pub mod voucher;
 pub mod wallet;
 

@@ -218,6 +218,28 @@ pub struct Session {
 pub struct Client {
     pub transport: Transport,
     pub keyset: Keyset,
+    /// With a seed (from the account number) everything the wallet makes is
+    /// derived, so [`Client::restore`] can rebuild it on a device that lost
+    /// its storage. Without one, it is random and lives only in the wallet.
+    pub seed: Option<crate::seed::Seed>,
+}
+
+/// A close sends blanks for any change up to this (cents) in seeded wallets,
+/// the same set every time, so a repeated close matches the first.
+const SEEDED_CLOSE_MAX_CENTS: i64 = 100_000;
+
+/// Withdrawals arrive in pieces of this size (seeded wallets), so a session
+/// never needs an exchange to get started.
+const PIECE_CENTS: i64 = 50;
+
+fn random_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    crate::b64(bytes)
+}
+
+fn prefix(hash: &str) -> &str {
+    &hash[..HASH_PREFIX.min(hash.len())]
 }
 
 fn now() -> u64 {
@@ -248,7 +270,67 @@ pub fn usd_to_cents_floor(usd: &str) -> i64 {
 
 impl Client {
     pub fn new(transport: Transport, keyset: Keyset) -> Self {
-        Self { transport, keyset }
+        Self {
+            transport,
+            keyset,
+            seed: None,
+        }
+    }
+
+    pub fn with_seed(mut self, seed: crate::seed::Seed) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// A secret for a new session: derived from (this minute, k) when seeded.
+    fn new_secret(&self) -> String {
+        match &self.seed {
+            Some(seed) => {
+                let k = rand::random::<u32>() % crate::seed::SESSIONS_PER_MINUTE;
+                seed.session_secret(now() / 60, k)
+            }
+            None => crate::new_session_secret(),
+        }
+    }
+
+    /// The blanks a close sends.
+    fn close_blanks(&self, secret: &str, family: Family, max_cents: i64) -> Result<Vec<Blank>> {
+        let dust = !self.keyset.dust_paid.is_empty();
+        Ok(match &self.seed {
+            Some(seed) => {
+                let op = format!("change:{}", crate::sha256_hex(secret));
+                let mut values = blanks_for_any_amount_up_to(SEEDED_CLOSE_MAX_CENTS);
+                values.retain(|&v| self.keyset.key_for(family, v, false).is_some());
+                let mut blanks = Blank::seeded_many(
+                    &self.keyset,
+                    family,
+                    &values,
+                    false,
+                    seed,
+                    op.as_bytes(),
+                    0,
+                )?;
+                if dust {
+                    blanks.extend(Blank::seeded_many(
+                        &self.keyset,
+                        family,
+                        &dust_blanks_for_any(),
+                        true,
+                        seed,
+                        op.as_bytes(),
+                        1000,
+                    )?);
+                }
+                blanks
+            }
+            None => {
+                let mut blanks = Blank::many(&self.keyset, family, &blanks_for_any_amount_up_to(max_cents))?;
+                if dust {
+                    blanks.extend(Blank::many_dust(&self.keyset, family, &dust_blanks_for_any())?);
+                }
+                blanks
+            }
+        })
     }
 
     fn finish(&self, blanks: &[Blank], change: &ChangeResponse) -> Result<Vec<Voucher>> {
@@ -299,7 +381,9 @@ impl Client {
 
     /// Open a session worth at least `cents` from the wallet.
     pub async fn open(&self, wallet: &mut Wallet, family: Family, cents: i64) -> Result<Session> {
-        self.break_up(wallet, family, cents).await?;
+        if self.seed.is_none() {
+            self.break_up(wallet, family, cents).await?;
+        }
         let period = crate::pass::current_period();
         for _attempt in 0..3 {
             // A pass, if we hold one for this month, gives the session our
@@ -324,7 +408,7 @@ impl Client {
                 );
             }
             let codes: Vec<String> = vouchers.iter().map(Voucher::encode).collect();
-            let secret = crate::new_session_secret();
+            let secret = self.new_secret();
             wallet.remember_session(OpenSession {
                 secret: secret.clone(),
                 family,
@@ -432,15 +516,15 @@ impl Client {
 
     /// Close a session and put its change in the wallet. Returns the change in cents.
     pub async fn close(&self, wallet: &mut Wallet, session: &Session) -> Result<i64> {
-        let status = self.status(session).await?;
         // Change is the balance rounded up to the next 0.001¢: whole cents
         // the standard way, the rest as dust. One cent more of whole-cent
         // blanks covers the rounding.
-        let max = usd_to_cents_floor(&status.balance_usd) + 1;
-        let mut blanks = Blank::many(&self.keyset, session.family, &blanks_for_any_amount_up_to(max))?;
-        if !self.keyset.dust_paid.is_empty() {
-            blanks.extend(Blank::many_dust(&self.keyset, session.family, &dust_blanks_for_any())?);
-        }
+        let max = if self.seed.is_some() {
+            0
+        } else {
+            usd_to_cents_floor(&self.status(session).await?.balance_usd) + 1
+        };
+        let blanks = self.close_blanks(&session.secret, session.family, max)?;
         let id = crate::new_session_secret();
         wallet.push_pending(Pending {
             id: id.clone(),
@@ -454,7 +538,11 @@ impl Client {
         wallet.save()?;
         let change = self.close_with(&session.secret, &blanks).await?;
         let vouchers = self.finish(&blanks, &change)?;
-        wallet.add(change.family, vouchers);
+        if self.seed.is_some() {
+            wallet.add_from(change.family, vouchers, &format!("s:{}", session.secret));
+        } else {
+            wallet.add(change.family, vouchers);
+        }
         wallet.finish_pending(&id);
         wallet.forget_session(&session.secret);
         wallet.save()?;
@@ -483,8 +571,18 @@ impl Client {
                     .join(", ")
             );
         }
-        let blanks = Blank::many(&self.keyset, Family::Paid, &split(cents))?;
-        let id = crate::new_session_secret();
+        let nonce = self.seed.as_ref().map(|_| random_nonce());
+        let blanks = match (&self.seed, &nonce) {
+            (Some(seed), Some(nonce)) => {
+                let pieces = (cents / PIECE_CENTS).min(20);
+                let mut values = vec![PIECE_CENTS; pieces as usize];
+                values.extend(split(cents - pieces * PIECE_CENTS));
+                let op = format!("withdraw:{nonce}");
+                Blank::seeded_many(&self.keyset, Family::Paid, &values, false, seed, op.as_bytes(), 0)?
+            }
+            _ => Blank::many(&self.keyset, Family::Paid, &split(cents))?,
+        };
+        let id = nonce.clone().unwrap_or_else(crate::new_session_secret);
         wallet.push_pending(Pending {
             id: id.clone(),
             kind: "withdraw".into(),
@@ -495,16 +593,26 @@ impl Client {
             pass_blanks: Vec::new(),
         });
         wallet.save()?;
-        let change = self.withdraw_with(api_key, cents, &blanks).await?;
+        let change = self.withdraw_with(api_key, cents, &blanks, nonce.as_deref()).await?;
         let vouchers = self.finish(&blanks, &change)?;
-        wallet.add(Family::Paid, vouchers);
+        match &nonce {
+            Some(nonce) => wallet.add_from(Family::Paid, vouchers, &format!("w:{nonce}")),
+            None => wallet.add(Family::Paid, vouchers),
+        }
         wallet.finish_pending(&id);
         wallet.save()?;
         Ok(change.change_cents)
     }
 
-    async fn withdraw_with(&self, api_key: &str, cents: i64, blanks: &[Blank]) -> Result<ChangeResponse> {
+    async fn withdraw_with(
+        &self,
+        api_key: &str,
+        cents: i64,
+        blanks: &[Blank],
+        nonce: Option<&str>,
+    ) -> Result<ChangeResponse> {
         let req = WithdrawRequest {
+            nonce: nonce.map(str::to_string),
             amount_cents: cents,
             blanks: blanks.iter().map(Blank::to_wire).collect(),
         };
@@ -613,10 +721,21 @@ impl Client {
         if count == 0 {
             return Ok(0);
         }
+        let nonce = self.seed.as_ref().map(|_| random_nonce());
         let blanks: Vec<PassBlank> = (0..count)
-            .map(|_| PassBlank::new(&self.keyset, &allowance.tier, &allowance.period))
+            .map(|j| match (&self.seed, &nonce) {
+                (Some(seed), Some(nonce)) => PassBlank::seeded(
+                    &self.keyset,
+                    &allowance.tier,
+                    &allowance.period,
+                    seed,
+                    format!("passes:{nonce}").as_bytes(),
+                    j as u32,
+                ),
+                _ => PassBlank::new(&self.keyset, &allowance.tier, &allowance.period),
+            })
             .collect::<Result<_>>()?;
-        let id = crate::new_session_secret();
+        let id = nonce.clone().unwrap_or_else(crate::new_session_secret);
         wallet.push_pending(Pending {
             id: id.clone(),
             kind: "passes".into(),
@@ -627,18 +746,22 @@ impl Client {
             pass_blanks: blanks.clone(),
         });
         wallet.save()?;
-        let answer = self.passes_with(api_key, &blanks).await?;
+        let answer = self.passes_with(api_key, &blanks, nonce.as_deref()).await?;
         let passes = self.finish_passes(&blanks, &answer)?;
         let got = passes.len();
+        if let Some(nonce) = &nonce {
+            wallet.note_pass_source(&passes, &format!("p:{nonce}"));
+        }
         wallet.add_passes(passes);
         wallet.finish_pending(&id);
         wallet.save()?;
         Ok(got)
     }
 
-    async fn passes_with(&self, api_key: &str, blanks: &[PassBlank]) -> Result<PassResponse> {
+    async fn passes_with(&self, api_key: &str, blanks: &[PassBlank], nonce: Option<&str>) -> Result<PassResponse> {
         let first = blanks.first().ok_or_else(|| anyhow!("no passes asked for"))?;
         let req = PassRequest {
+            nonce: nonce.map(str::to_string),
             tier: first.tier.clone(),
             period: first.period.clone(),
             blinded: blanks.iter().map(|b| crate::b64(&b.blinded)).collect(),
@@ -673,7 +796,11 @@ impl Client {
         for pending in wallet.pending().to_vec() {
             if pending.kind == "passes" {
                 let answer = self
-                    .passes_with(pending.secret.as_deref().unwrap_or(""), &pending.pass_blanks)
+                    .passes_with(
+                        pending.secret.as_deref().unwrap_or(""),
+                        &pending.pass_blanks,
+                        self.seed.as_ref().map(|_| pending.id.as_str()),
+                    )
                     .await;
                 match answer {
                     Ok(answer) => {
@@ -701,6 +828,7 @@ impl Client {
                         pending.secret.as_deref().unwrap_or(""),
                         pending.amount_cents,
                         &pending.blanks,
+                        self.seed.as_ref().map(|_| pending.id.as_str()),
                     )
                     .await
                 }
@@ -753,4 +881,154 @@ impl Client {
         }
         Ok(recovered)
     }
+
+    /// Tell the server which withdrawals, passes and sessions this wallet has
+    /// spent everything from, so it can delete them (seeded wallets). The
+    /// account key is needed for withdrawals and passes; sessions use their
+    /// own secret. Call it at a quiet moment, not right after a session
+    /// opens, so its timing says little.
+    pub async fn flush_done(&self, wallet: &mut Wallet, api_key: Option<&str>) -> Result<()> {
+        let finished = wallet.finished_sources();
+        let mut done = Vec::new();
+        let nonces: Vec<String> = finished
+            .iter()
+            .filter_map(|s| s.strip_prefix("w:").or_else(|| s.strip_prefix("p:")))
+            .map(str::to_string)
+            .collect();
+        if let (Some(key), false) = (api_key, nonces.is_empty()) {
+            let _: serde_json::Value = self
+                .transport
+                .json(Request::post_json("/u/issued/done", &DoneRequest { nonces }).bearer(key))
+                .await?;
+            done.extend(finished.iter().filter(|s| !s.starts_with("s:")).cloned());
+        }
+        for source in finished.iter().filter(|s| s.starts_with("s:")) {
+            let secret = &source[2..];
+            match self
+                .transport
+                .json::<serde_json::Value>(Request::post_json("/u/sessions/done", &serde_json::json!({})).bearer(secret))
+                .await
+            {
+                Ok(_) | Err(ApiError::Server { status: 401 | 404 | 410, .. }) => done.push(source.clone()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        wallet.forget_sources(&done);
+        wallet.save()
+    }
+
+    /// Rebuild a seeded wallet from the server's records: withdrawals and
+    /// passes the account has not marked done (needs its key), and sessions
+    /// left open or with change not yet collected (found by comparing hash
+    /// prefixes on this device). Then drop whatever was spent since. Returns
+    /// the cents recovered into the wallet.
+    pub async fn restore(&self, wallet: &mut Wallet, api_key: Option<&str>) -> Result<i64> {
+        let seed = self
+            .seed
+            .clone()
+            .ok_or_else(|| anyhow!("restoring needs the seed from the account number"))?;
+        // (family, vouchers, source)
+        let mut found: Vec<(Family, Vec<Voucher>, String)> = Vec::new();
+        let mut passes: Vec<(Vec<Pass>, String)> = Vec::new();
+        let mut since = now();
+
+        if let Some(key) = api_key {
+            let issued: Vec<Issued> = self.transport.json(Request::get("/u/issued").bearer(key)).await?;
+            for it in issued {
+                since = since.min(it.created);
+                match it.kind.as_str() {
+                    "withdraw" => {
+                        let req: WithdrawRequest = serde_json::from_value(it.request)?;
+                        let answer: ChangeResponse = serde_json::from_value(it.answer)?;
+                        let op = format!("withdraw:{}", it.nonce);
+                        let blanks = req
+                            .blanks
+                            .iter()
+                            .enumerate()
+                            .map(|(j, b)| {
+                                Blank::seeded(&self.keyset, Family::Paid, b.denomination_cents, b.dust, &seed, op.as_bytes(), j as u32)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        if !same_blinded(&blanks, &req.blanks) {
+                            continue; // not made with this seed
+                        }
+                        found.push((Family::Paid, self.finish(&blanks, &answer)?, format!("w:{}", it.nonce)));
+                    }
+                    "passes" => {
+                        let req: PassRequest = serde_json::from_value(it.request)?;
+                        let answer: PassResponse = serde_json::from_value(it.answer)?;
+                        let op = format!("passes:{}", it.nonce);
+                        let blanks = (0..req.blinded.len())
+                            .map(|j| PassBlank::seeded(&self.keyset, &req.tier, &req.period, &seed, op.as_bytes(), j as u32))
+                            .collect::<Result<Vec<_>>>()?;
+                        if blanks.iter().zip(&req.blinded).any(|(b, w)| crate::b64(&b.blinded) != *w) {
+                            continue;
+                        }
+                        passes.push((self.finish_passes(&blanks, &answer)?, format!("p:{}", it.nonce)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let unclaimed: Vec<UnclaimedSession> = self.transport.json(Request::get("/u/sessions/unclaimed")).await?;
+        let wanted: std::collections::HashSet<&str> = unclaimed.iter().map(|u| u.h.as_str()).collect();
+        let mut minutes: Vec<u64> = unclaimed
+            .iter()
+            .flat_map(|u| u.m.saturating_sub(2)..=u.m + 2)
+            .collect();
+        minutes.sort_unstable();
+        minutes.dedup();
+        for m in minutes {
+            for k in 0..crate::seed::SESSIONS_PER_MINUTE {
+                let secret = seed.session_secret(m, k);
+                let hash = crate::sha256_hex(&secret);
+                if !wanted.contains(prefix(&hash)) {
+                    continue;
+                }
+                let status = match self.status(&Session { secret: secret.clone(), family: Family::Paid }).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                since = since.min(m * 60);
+                let blanks = self.close_blanks(&secret, status.family, 0)?;
+                let change = self.close_with(&secret, &blanks).await?;
+                found.push((change.family, self.finish(&blanks, &change)?, format!("s:{secret}")));
+                wallet.forget_session(&secret);
+            }
+        }
+
+        let spent: SpentList = self
+            .transport
+            .json(Request::get(&format!("/u/spent?since={}", since.saturating_sub(120))))
+            .await?;
+        let spent: std::collections::HashSet<String> = spent.hashes.into_iter().collect();
+        let unspent = |message: &[u8]| !spent.contains(prefix(&crate::sha256_hex(message)));
+
+        let mut cents = 0;
+        let held: std::collections::HashSet<String> = wallet.vouchers().iter().map(|h| h.voucher.encode()).collect();
+        for (family, vouchers, source) in found {
+            let keep: Vec<Voucher> = vouchers
+                .into_iter()
+                .filter(|v| unspent(&v.message) && !held.contains(&v.encode()))
+                .collect();
+            cents += keep.iter().map(Voucher::value_millicents).sum::<i64>();
+            wallet.add_from(family, keep, &source);
+        }
+        for (list, source) in passes {
+            let keep: Vec<Pass> = list.into_iter().filter(|p| unspent(&p.message)).collect();
+            wallet.note_pass_source(&keep, &source);
+            wallet.add_passes(keep);
+        }
+        wallet.save()?;
+        Ok(cents / MILLICENTS_PER_CENT)
+    }
+}
+
+fn same_blinded(blanks: &[Blank], wire: &[BlindedVoucher]) -> bool {
+    blanks.len() == wire.len()
+        && blanks
+            .iter()
+            .zip(wire)
+            .all(|(b, w)| crate::b64(&b.blinded) == w.blinded_message)
 }

@@ -596,3 +596,77 @@ async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session
         }
     }
 }
+
+/// Tor Browser closing, a lost phone: a seeded wallet is rebuilt from the
+/// account number alone, to the millicent, and records the device has
+/// finished with are deleted from the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number() {
+    use unlinkable_core::net::{Client, Session, Transport};
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 2_000).await;
+    let keys = unlinkable_core::seed::account_keys("4821 0937 5512 8846").unwrap();
+    let keyset = Transport::new(&stack.server).fetch_keyset().await.unwrap();
+    let client = || Client::new(Transport::new(&stack.server), keyset.clone()).with_seed(keys.seed.clone());
+    let a = client();
+    let mut wallet = Wallet::in_memory();
+
+    a.withdraw(&mut wallet, &key, 100).await.unwrap();
+    assert_eq!(a.get_passes(&mut wallet, &key, 3).await.unwrap(), 3);
+    let chat = |secret: String| {
+        let server = stack.server.clone();
+        async move {
+            let r = reqwest::Client::new()
+                .post(format!("{server}/v1/chat/completions"))
+                .bearer_auth(secret)
+                .json(&json!({"model": "echo", "messages": [{"role": "user", "content": "x".repeat(20_000)}]}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+        }
+    };
+    // One session used and closed (its change is in the wallet), one used
+    // and left open: the device dies before it can close it.
+    let s1 = a.open(&mut wallet, Family::Paid, 50).await.unwrap();
+    chat(s1.secret.clone()).await;
+    a.close(&mut wallet, &s1).await.unwrap();
+    let s2 = a.open(&mut wallet, Family::Paid, 50).await.unwrap();
+    chat(s2.secret.clone()).await;
+    let left_in_s2 = {
+        let st = a.status(&s2).await.unwrap();
+        // Close rounds up to the next millicent.
+        let (whole, frac) = st.balance_usd.split_once('.').unwrap();
+        let frac = format!("{frac:0<8}");
+        let nano: i64 = whole.parse::<i64>().unwrap() * 100_000_000 + frac[..8].parse::<i64>().unwrap();
+        (nano + 999) / 1000
+    };
+    let had = wallet.balance_millicents(Family::Paid) + left_in_s2;
+    let passes_had = wallet.passes(&unlinkable_core::pass::current_period()).len();
+    assert_eq!(passes_had, 1, "two of three passes went into sessions");
+    drop(wallet);
+
+    // A new device: nothing but the account number (and the key it gives).
+    let b = client();
+    let mut fresh = Wallet::in_memory();
+    b.restore(&mut fresh, Some(&key)).await.unwrap();
+    assert_eq!(fresh.balance_millicents(Family::Paid), had, "every millicent is back");
+    assert_eq!(fresh.passes(&unlinkable_core::pass::current_period()).len(), passes_had);
+    assert!(b.status(&Session { secret: s2.secret.clone(), family: Family::Paid }).await.unwrap().closed);
+    // Restoring again finds nothing new.
+    b.restore(&mut fresh, Some(&key)).await.unwrap();
+    assert_eq!(fresh.balance_millicents(Family::Paid), had);
+
+    // The withdrawal is fully spent, so the server forgets it at once; the
+    // sessions are forgotten once their change is spent too.
+    b.flush_done(&mut fresh, Some(&key)).await.unwrap();
+    let db = stack.backend.dump();
+    assert!(db["issued"].as_array().unwrap().iter().all(|i| i["kind"] == "passes"), "{}", db["issued"]);
+    assert_eq!(db["sessions"].as_array().unwrap().len(), 2);
+    let s3 = b.open(&mut fresh, Family::Paid, had / 1000 + 1).await.unwrap();
+    b.close(&mut fresh, &s3).await.unwrap();
+    b.flush_done(&mut fresh, Some(&key)).await.unwrap();
+    let db = stack.backend.dump();
+    let hashes: Vec<&str> = db["sessions"].as_array().unwrap().iter().map(|s| s["secret_hash"].as_str().unwrap()).collect();
+    assert_eq!(hashes, vec![unlinkable_core::sha256_hex(&s3.secret)], "only the session whose change is still held");
+}

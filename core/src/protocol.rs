@@ -48,6 +48,9 @@ pub struct PassRequest {
     pub period: String,
     /// base64url blinded messages
     pub blinded: Vec<String>,
+    /// As in [`WithdrawRequest::nonce`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +98,10 @@ pub struct ExchangeRequest {
 pub struct WithdrawRequest {
     pub amount_cents: i64,
     pub blanks: Vec<BlindedVoucher>,
+    /// Seeded wallets: the blanks are derived from this, and the server keeps
+    /// the request and answer under it until `POST /u/issued/done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,3 +141,45 @@ pub struct ErrorDetail {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spent: Vec<usize>,
 }
+
+/// `GET /u/sessions/unclaimed`: every session still open, or closed with
+/// change nobody has confirmed collecting. A seeded wallet finds its own by
+/// deriving secrets for those minutes and comparing, on the device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnclaimedSession {
+    /// First 16 hex digits of the secret's hash
+    pub h: String,
+    /// Unix minute the session was opened
+    pub m: u64,
+}
+
+/// `GET /u/issued` (bearer: the account's key): withdrawals and passes the
+/// account made with a nonce and has not marked done, so a seeded wallet can
+/// unblind them again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Issued {
+    /// "withdraw" or "passes"
+    pub kind: String,
+    pub nonce: String,
+    /// Unix time it was made
+    pub created: u64,
+    pub request: serde_json::Value,
+    pub answer: serde_json::Value,
+}
+
+/// `POST /u/issued/done` (bearer: the account's key)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoneRequest {
+    pub nonces: Vec<String>,
+}
+
+/// `GET /u/spent?since=<unix>`: the first 16 hex digits of every voucher and
+/// pass hash spent since then. Checked on the device, so asking reveals
+/// nothing about which vouchers are yours.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpentList {
+    pub hashes: Vec<String>,
+}
+
+/// How much of a hash the recovery lists show.
+pub const HASH_PREFIX: usize = 16;

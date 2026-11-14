@@ -21,11 +21,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use unlinkable_core::protocol::{ChangeResponse, PassAllowance, PassResponse, SessionStatus};
+use unlinkable_core::protocol::{ChangeResponse, Issued, PassAllowance, PassResponse, SessionStatus, UnclaimedSession};
 use unlinkable_core::{sha256_hex, Family};
 use unlinkable_gateway::{
     signer::KeyStore,
-    Backend, Gateway, GatewayError, PassUse, SignChange, Spend,
+    Backend, Gateway, GatewayError, IssuedRecord, PassUse, SignChange, Spend,
 };
 
 /// Passes each account gets per month.
@@ -104,6 +104,8 @@ struct Db {
     withdrawals: Vec<WithdrawalRow>,
     signed_change: Vec<(u64, Vec<String>)>,
     requests: Vec<RequestRow>,
+    /// (account key hash, record): seeded withdrawals and passes until done
+    issued: Vec<(String, Issued)>,
 }
 
 pub struct MemoryBackend {
@@ -212,6 +214,7 @@ impl MemoryBackend {
             "withdrawals": db.withdrawals,
             "signed_change": db.signed_change.iter().map(|(at, h)| json!({"at": at, "blinded_hashes": h})).collect::<Vec<_>>(),
             "requests": db.requests,
+            "issued": db.issued.iter().map(|(a, i)| json!({"account": a, "kind": i.kind, "nonce": i.nonce, "created": i.created})).collect::<Vec<_>>(),
         })
     }
 }
@@ -374,6 +377,7 @@ impl Backend for MemoryBackend {
         count: i64,
         request_digest: &str,
         answer: &PassResponse,
+        issued: Option<&IssuedRecord>,
     ) -> Result<PassResponse, GatewayError> {
         let mut db = self.db.lock().unwrap();
         if let Some(previous) = db.pass_answers.get(request_digest) {
@@ -383,19 +387,22 @@ impl Backend for MemoryBackend {
             .accounts
             .get_mut(&sha256_hex(account_token))
             .ok_or_else(GatewayError::unauthorized)?;
-        let issued = account.passes.entry(answer.period.clone()).or_insert(0);
-        if *issued + count > PASSES_PER_MONTH {
+        let used = account.passes.entry(answer.period.clone()).or_insert(0);
+        if *used + count > PASSES_PER_MONTH {
             return Err(GatewayError::Status(
                 StatusCode::TOO_MANY_REQUESTS,
                 "pass_limit",
-                format!("{} passes left this month.", PASSES_PER_MONTH - *issued),
+                format!("{} passes left this month.", PASSES_PER_MONTH - *used),
             ));
         }
-        *issued += count;
+        *used += count;
         let mut answer = answer.clone();
-        answer.remaining = PASSES_PER_MONTH - *issued;
+        answer.remaining = PASSES_PER_MONTH - *used;
         db.pass_answers
             .insert(request_digest.to_string(), answer.clone());
+        if let Some(i) = issued {
+            db.issued.push((sha256_hex(account_token), issued_row(i, &answer)));
+        }
         Ok(answer)
     }
 
@@ -405,6 +412,7 @@ impl Backend for MemoryBackend {
         cents: i64,
         request_digest: &str,
         answer: &ChangeResponse,
+        issued: Option<&IssuedRecord>,
     ) -> Result<ChangeResponse, GatewayError> {
         let mut db = self.db.lock().unwrap();
         if let Some(previous) = db.answers.get(request_digest) {
@@ -425,14 +433,76 @@ impl Backend for MemoryBackend {
         }
         account.balance_cents -= cents;
         db.withdrawals.push(WithdrawalRow {
-            account: key,
+            account: key.clone(),
             amount_cents: cents,
             at: unix(),
             blinded_hashes: blinded_hashes(answer),
         });
         db.answers
             .insert(request_digest.to_string(), answer.clone());
+        if let Some(i) = issued {
+            db.issued.push((key, issued_row(i, answer)));
+        }
         Ok(answer.clone())
+    }
+
+    async fn unclaimed(&self) -> Result<Vec<UnclaimedSession>, GatewayError> {
+        let db = self.db.lock().unwrap();
+        let mut list: Vec<UnclaimedSession> = db
+            .sessions
+            .iter()
+            .map(|(h, s)| UnclaimedSession { h: h.clone(), m: s.opened_at / 60 })
+            .collect();
+        list.sort_by_key(|u| u.m);
+        Ok(list)
+    }
+
+    async fn session_done(&self, secret_hash: &str) -> Result<(), GatewayError> {
+        let mut db = self.db.lock().unwrap();
+        if db.sessions.get(secret_hash).is_some_and(|s| s.closed_at.is_some()) {
+            db.sessions.remove(secret_hash);
+        }
+        Ok(())
+    }
+
+    async fn issued(&self, account_token: &str) -> Result<Vec<Issued>, GatewayError> {
+        let key = sha256_hex(account_token);
+        let db = self.db.lock().unwrap();
+        if !db.accounts.contains_key(&key) {
+            return Err(GatewayError::unauthorized());
+        }
+        Ok(db.issued.iter().filter(|(a, _)| *a == key).map(|(_, i)| i.clone()).collect())
+    }
+
+    async fn issued_done(&self, account_token: &str, nonces: &[String]) -> Result<(), GatewayError> {
+        let key = sha256_hex(account_token);
+        self.db
+            .lock()
+            .unwrap()
+            .issued
+            .retain(|(a, i)| !(*a == key && nonces.contains(&i.nonce)));
+        Ok(())
+    }
+
+    async fn spent_since(&self, since: u64) -> Result<Vec<String>, GatewayError> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .spent
+            .iter()
+            .chain(db.spent_passes.iter())
+            .filter(|(_, at)| **at >= since)
+            .map(|(h, _)| h.clone())
+            .collect())
+    }
+}
+
+fn issued_row(i: &IssuedRecord, answer: &impl Serialize) -> Issued {
+    Issued {
+        kind: i.kind.to_string(),
+        nonce: i.nonce.clone(),
+        created: unix(),
+        request: i.request.clone(),
+        answer: serde_json::to_value(answer).expect("answer serialises"),
     }
 }
 

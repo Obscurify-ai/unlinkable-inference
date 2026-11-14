@@ -62,11 +62,59 @@ impl Blank {
     }
 
     fn make(keyset: &Keyset, family: Family, value: i64, dust: bool) -> Result<Self> {
-        let (key_id, pk) = public_key(keyset, family, value, dust)?;
         let mut message = vec![0u8; VOUCHER_MESSAGE_LEN];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut message);
+        Self::build(keyset, family, value, dust, message, &mut DefaultRng)
+    }
+
+    /// The `j`th blank of operation `op`, derived from the seed: the same
+    /// inputs always give the same message and blinding, so a device that
+    /// lost its storage can make it again and unblind the server's stored
+    /// answer. Each (op, j) must be used once only.
+    pub fn seeded(
+        keyset: &Keyset,
+        family: Family,
+        value: i64,
+        dust: bool,
+        seed: &crate::seed::Seed,
+        op: &[u8],
+        j: u32,
+    ) -> Result<Self> {
+        let j = j.to_be_bytes();
+        let message = seed.derive(&[b"voucher", op, &j]).to_vec();
+        let mut rng = seed.rng(&[b"blinding", op, &j]);
+        Self::build(keyset, family, value, dust, message, &mut rng)
+    }
+
+    /// Seeded blanks for `values` (cents, or millicents when `dust`),
+    /// numbered from `first`.
+    pub fn seeded_many(
+        keyset: &Keyset,
+        family: Family,
+        values: &[i64],
+        dust: bool,
+        seed: &crate::seed::Seed,
+        op: &[u8],
+        first: u32,
+    ) -> Result<Vec<Self>> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| Self::seeded(keyset, family, v, dust, seed, op, first + i as u32))
+            .collect()
+    }
+
+    fn build<R: blind_rsa_signatures::reexports::rsa::rand_core::CryptoRng + ?Sized>(
+        keyset: &Keyset,
+        family: Family,
+        value: i64,
+        dust: bool,
+        message: Vec<u8>,
+        rng: &mut R,
+    ) -> Result<Self> {
+        let (key_id, pk) = public_key(keyset, family, value, dust)?;
         let blinding = pk
-            .blind(&mut DefaultRng, &message)
+            .blind(rng, &message)
             .map_err(|e| anyhow!("blinding failed: {e}"))?;
         Ok(Self {
             family,

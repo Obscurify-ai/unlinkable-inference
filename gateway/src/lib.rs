@@ -125,6 +125,16 @@ impl IntoResponse for GatewayError {
     }
 }
 
+/// A withdrawal or pass request made with a nonce (a seeded wallet): kept
+/// with its answer, linked to the account, until the account says it is done.
+#[derive(Debug, Clone)]
+pub struct IssuedRecord {
+    /// "withdraw" or "passes"
+    pub kind: &'static str,
+    pub nonce: String,
+    pub request: serde_json::Value,
+}
+
 /// Signs change: given the family and the millicents the session holds
 /// (its balance rounded up to the next millicent, in the customer's favour),
 /// sign/// the blanks that add up to it.
@@ -175,10 +185,21 @@ pub trait Backend: Send + Sync + 'static {
         count: i64,
         request_digest: &str,
         answer: &PassResponse,
+        issued: Option<&IssuedRecord>,
     ) -> Result<PassResponse, GatewayError> {
-        let _ = (account_token, count, request_digest, answer);
+        let _ = (account_token, count, request_digest, answer, issued);
         Err(GatewayError::unavailable())
     }
+    /// Sessions still open, or closed and not marked done, oldest first.
+    async fn unclaimed(&self) -> Result<Vec<UnclaimedSession>, GatewayError>;
+    /// Forget a closed session (its holder has spent all its change). An
+    /// open session is left alone.
+    async fn session_done(&self, secret_hash: &str) -> Result<(), GatewayError>;
+    /// The account's [`IssuedRecord`]s not yet marked done, with answers.
+    async fn issued(&self, account_token: &str) -> Result<Vec<Issued>, GatewayError>;
+    async fn issued_done(&self, account_token: &str, nonces: &[String]) -> Result<(), GatewayError>;
+    /// Hashes of vouchers and passes spent at or after `since` (Unix seconds).
+    async fn spent_since(&self, since: u64) -> Result<Vec<String>, GatewayError>;
     async fn topup(
         &self,
         secret_hash: &str,
@@ -211,6 +232,7 @@ pub trait Backend: Send + Sync + 'static {
         cents: i64,
         request_digest: &str,
         answer: &ChangeResponse,
+        issued: Option<&IssuedRecord>,
     ) -> Result<ChangeResponse, GatewayError>;
 }
 
@@ -486,8 +508,9 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
             blind_signatures: signatures,
             remaining: 0,
         };
+        let issued = issued_record("passes", req.nonce.as_deref(), &req)?;
         gw.backend
-            .record_passes(&token, req.blinded.len() as i64, &digest, &answer)
+            .record_passes(&token, req.blinded.len() as i64, &digest, &answer, issued.as_ref())
             .await
     };
     respond(run.await, &[])
@@ -651,14 +674,92 @@ async fn withdraw(State(gw): Gw, headers: HeaderMap, Json(req): Json<WithdrawReq
         }
         check_blank_count(&req.blanks)?;
         let answer = gw.sign_all(&req.blanks, Family::Paid, req.amount_cents * MILLICENTS_PER_CENT)?;
+        let issued = issued_record("withdraw", req.nonce.as_deref(), &req)?;
         gw.backend
             .withdraw(
                 &token,
                 req.amount_cents,
                 &blanks_digest("withdraw", &req.blanks),
                 &answer,
+                issued.as_ref(),
             )
             .await
+    };
+    respond(run.await, &[])
+}
+
+fn issued_record(
+    kind: &'static str,
+    nonce: Option<&str>,
+    request: &impl serde::Serialize,
+) -> Result<Option<IssuedRecord>, GatewayError> {
+    let Some(nonce) = nonce else { return Ok(None) };
+    if nonce.is_empty() || nonce.len() > 64 {
+        return Err(GatewayError::bad_request("Invalid nonce."));
+    }
+    Ok(Some(IssuedRecord {
+        kind,
+        nonce: nonce.to_string(),
+        request: serde_json::to_value(request).map_err(|e| GatewayError::internal(e.to_string()))?,
+    }))
+}
+
+async fn unclaimed(State(gw): Gw) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        let mut list = gw.backend.unclaimed().await?;
+        for u in &mut list {
+            u.h.truncate(HASH_PREFIX);
+        }
+        Ok(list)
+    };
+    respond(run.await, &[])
+}
+
+async fn session_done(State(gw): Gw, headers: HeaderMap) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        gw.backend.session_done(&session_hash(&headers)?).await?;
+        Ok(serde_json::json!({"done": true}))
+    };
+    respond(run.await, &[])
+}
+
+async fn issued(State(gw): Gw, headers: HeaderMap) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        gw.backend.issued(&account_token(&headers)?).await
+    };
+    respond(run.await, &[])
+}
+
+async fn issued_done(State(gw): Gw, headers: HeaderMap, Json(req): Json<DoneRequest>) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        if req.nonces.len() > 1000 {
+            return Err(GatewayError::bad_request("At most 1000 at a time."));
+        }
+        gw.backend.issued_done(&account_token(&headers)?, &req.nonces).await?;
+        Ok(serde_json::json!({"done": req.nonces.len()}))
+    };
+    respond(run.await, &[])
+}
+
+#[derive(serde::Deserialize)]
+struct SpentQuery {
+    since: u64,
+}
+
+async fn spent(State(gw): Gw, axum::extract::Query(q): axum::extract::Query<SpentQuery>) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        let hashes = gw.backend.spent_since(q.since).await?;
+        Ok(SpentList {
+            hashes: hashes
+                .into_iter()
+                .map(|h| h.chars().take(HASH_PREFIX).collect())
+                .collect(),
+        })
     };
     respond(run.await, &[])
 }
@@ -691,5 +792,10 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/u/exchange", post(exchange))
         .route("/u/withdraw", post(withdraw))
         .route("/u/passes", get(pass_allowance).post(passes))
+        .route("/u/sessions/unclaimed", get(unclaimed))
+        .route("/u/sessions/done", post(session_done))
+        .route("/u/issued", get(issued))
+        .route("/u/issued/done", post(issued_done))
+        .route("/u/spent", get(spent))
         .with_state(gateway)
 }
