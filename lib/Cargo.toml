@@ -31,6 +31,10 @@ anyhow.workspace = true
 argon2.workspace = true
 base64.workspace = true
 blind-rsa-signatures.workspace = true
+# blind-rsa-signatures 0.18 only builds against these exact versions
+# (rsa 0.10.0 final changed the key traits). Not used directly.
+rsa = { version = "=0.10.0-rc.19", default-features = false }
+crypto-bigint = { version = "=0.7.10", default-features = false }
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
