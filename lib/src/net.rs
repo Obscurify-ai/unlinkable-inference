@@ -284,6 +284,21 @@ fn now() -> u64 {
     crate::unix_now()
 }
 
+/// Millicents (0.001¢) in a decimal USD string, rounded up like a close.
+pub fn usd_to_millicents_ceil(usd: &str) -> i64 {
+    let usd = usd.trim();
+    if usd.starts_with('-') {
+        return 0;
+    }
+    let (whole, frac) = usd.split_once('.').unwrap_or((usd, ""));
+    let mut digits: String = frac.chars().take(5).collect();
+    while digits.len() < 5 {
+        digits.push('0');
+    }
+    let round_up = frac.chars().skip(5).any(|c| c != '0') as i64;
+    whole.parse::<i64>().unwrap_or(0) * 100_000 + digits.parse::<i64>().unwrap_or(0) + round_up
+}
+
 /// Whole cents in a decimal USD string, rounded down.
 pub fn usd_to_cents_floor(usd: &str) -> i64 {
     let usd = usd.trim();
@@ -457,6 +472,8 @@ impl Client {
                 secret: secret.clone(),
                 family,
                 opened_at: now(),
+                funded_millicents: vouchers.iter().map(Voucher::value_millicents).sum(),
+                used_at: 0,
             });
             wallet.save()?;
             let req = OpenSessionRequest {
@@ -547,6 +564,7 @@ impl Client {
         }
         wallet.save()?;
         let codes: Vec<String> = vouchers.iter().map(Voucher::encode).collect();
+        let millicents: i64 = vouchers.iter().map(Voucher::value_millicents).sum();
         match self
             .transport
             .json::<SessionStatus>(
@@ -555,7 +573,11 @@ impl Client {
             )
             .await
         {
-            Ok(status) => Ok(status),
+            Ok(status) => {
+                wallet.funded_session(&session.secret, millicents);
+                wallet.save()?;
+                Ok(status)
+            }
             Err(e) => {
                 if !matches!(e, ApiError::Server { status: 409, .. }) {
                     wallet.add(session.family, vouchers);
@@ -590,13 +612,14 @@ impl Client {
         wallet.save()?;
         let change = self.close_with(&session.secret, &blanks).await?;
         let vouchers = self.finish(&blanks, &change)?;
+        let back: i64 = vouchers.iter().map(Voucher::value_millicents).sum();
         if self.seed.is_some() {
             wallet.add_from(change.family, vouchers, &format!("s:{}", session.secret));
         } else {
             wallet.add(change.family, vouchers);
         }
         wallet.finish_pending(&id);
-        wallet.forget_session(&session.secret);
+        wallet.closed_session(&session.secret, back);
         wallet.save()?;
         Ok(change.change_cents)
     }
@@ -890,11 +913,16 @@ impl Client {
             match result {
                 Ok(change) => {
                     let vouchers = self.finish(&pending.blanks, &change)?;
+                    let back: i64 = vouchers.iter().map(Voucher::value_millicents).sum();
                     wallet.add(change.family, vouchers);
                     recovered += change.change_cents;
                     wallet.finish_pending(&pending.id);
                     if let Some(secret) = &pending.secret {
-                        wallet.forget_session(secret);
+                        if pending.kind == "close" {
+                            wallet.closed_session(secret, back);
+                        } else {
+                            wallet.forget_session(secret);
+                        }
                     }
                 }
                 Err(e) => match e.downcast_ref::<ApiError>() {

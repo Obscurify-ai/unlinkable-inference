@@ -197,6 +197,12 @@ async fn main() -> Result<()> {
             println!("vouchers {}", wallet.vouchers().len());
             println!("passes   {} for {period}", passes.len());
             println!("sessions {} left open", wallet.sessions().len());
+            let since = |days: u64| -> i64 {
+                let cutoff = unlinkable_inference::unix_now().saturating_sub(days * 86_400);
+                wallet.spending().iter().filter(|e| e.at >= cutoff).map(|e| e.millicents).sum()
+            };
+            let usd = |m: i64| format!("${:.4}", m as f64 / 100_000.0);
+            println!("spent    {} last 24 h, {} last 30 days (closed sessions, kept on this device)", usd(since(1)), usd(since(30)));
             if !wallet.pending().is_empty() {
                 println!("pending  {} (run `unlinkable-inference recover`)", wallet.pending().len());
             }

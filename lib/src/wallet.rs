@@ -46,6 +46,21 @@ pub struct OpenSession {
     pub secret: String,
     pub family: Family,
     pub opened_at: u64,
+    /// What was put in (opening plus top-ups), millicents
+    #[serde(default)]
+    pub funded_millicents: i64,
+    /// Last request, Unix seconds (0: never noted)
+    #[serde(default)]
+    pub used_at: u64,
+}
+
+/// What one closed session cost: what was put in minus the change. Kept
+/// only on this device; the server cannot tie it to the account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Spend {
+    /// When the session was last used, Unix seconds
+    pub at: u64,
+    pub millicents: i64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -66,6 +81,9 @@ struct WalletFile {
     /// from a source is left, the server can forget it (seeded wallets).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     sources: std::collections::BTreeMap<String, String>,
+    /// What closed sessions cost, oldest first (see [`Spend`])
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spending: Vec<Spend>,
 }
 
 pub struct Wallet {
@@ -316,6 +334,42 @@ impl Wallet {
 
     pub fn forget_session(&mut self, secret: &str) {
         self.file.sessions.retain(|s| s.secret != secret);
+    }
+
+    /// More money went into an open session.
+    pub fn funded_session(&mut self, secret: &str, millicents: i64) {
+        if let Some(s) = self.file.sessions.iter_mut().find(|s| s.secret == secret) {
+            s.funded_millicents += millicents;
+        }
+    }
+
+    /// A request went out on this session at `at` (Unix seconds).
+    pub fn used_session(&mut self, secret: &str, at: u64) {
+        if let Some(s) = self.file.sessions.iter_mut().find(|s| s.secret == secret) {
+            s.used_at = s.used_at.max(at);
+        }
+    }
+
+    /// The session closed and `change_millicents` came back: note what it
+    /// cost (when its funding is known) and forget it.
+    pub fn closed_session(&mut self, secret: &str, change_millicents: i64) {
+        if let Some(s) = self.file.sessions.iter().find(|s| s.secret == secret) {
+            if s.funded_millicents > 0 {
+                let spent = s.funded_millicents - change_millicents;
+                if spent > 0 {
+                    self.file.spending.push(Spend { at: s.used_at.max(s.opened_at), millicents: spent });
+                }
+                // About thirteen months is plenty for a history.
+                let cutoff = crate::unix_now().saturating_sub(400 * 86_400);
+                self.file.spending.retain(|e| e.at >= cutoff);
+            }
+        }
+        self.forget_session(secret);
+    }
+
+    /// What closed sessions cost, oldest first.
+    pub fn spending(&self) -> &[Spend] {
+        &self.file.spending
     }
 
     pub fn pinned(&self) -> Option<&str> {

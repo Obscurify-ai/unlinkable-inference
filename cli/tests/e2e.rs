@@ -224,6 +224,10 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
         .sum();
     assert!(charged_mc > 0);
     assert_eq!(500_000 - wallet_mc, charged_mc, "the wallet paid exactly for the tokens");
+    // The proxy's page shows the same total as spent (kept on this device only).
+    let spending: Value = http.get(format!("{url}/_unlinkable/spending")).send().await.unwrap().json().await.unwrap();
+    let shown: i64 = spending["spent"].as_array().unwrap().iter().map(|e| e["millicents"].as_i64().unwrap()).sum();
+    assert_eq!(shown, charged_mc, "spent, as the proxy shows it: {spending}");
 
     // Now read everything the server has and try to link.
     let db = stack.backend.dump();
@@ -710,11 +714,28 @@ async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_lo
     m.start().await.unwrap();
     assert_eq!(m.session("chat-a").await.unwrap(), a);
 
+    // What the chats cost shows while their sessions are still open...
+    let charged = || -> i64 {
+        stack.backend.dump()["sessions"].as_array().unwrap().iter().map(|s| s["spent_nano"].as_i64().unwrap() / 10_000).sum()
+    };
+    let live = m.spending().await.spent;
+    assert_eq!(live.len(), 2, "both conversations' sessions: {live:?}");
+    assert!(live.iter().map(|e| e.millicents).sum::<i64>() >= charged());
+
     // Quiet conversations are closed for their change.
     m.policy.idle_secs = 0;
     m.tick().await;
     let db = stack.backend.dump();
     assert!(db["sessions"].as_array().unwrap().iter().all(|s| !s["closed_at"].is_null()), "{}", db["sessions"]);
+    // ...and stays on this device once they close: what was paid in minus the change.
+    let log = m.wallet().spending().to_vec();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log.iter().map(|e| e.millicents).sum::<i64>(), charged(), "the log matches what the server charged");
+    let after = m.spending().await;
+    assert_eq!(after.spent.len(), 2, "closed sessions are not counted twice");
+    assert_eq!(after.prepaid_millicents, m.wallet().balance_millicents(Family::Paid));
+    let saved = m.state();
+    assert!(saved.contains("\"spending\""), "the log is saved with the wallet");
 
     // A new device with nothing saved ends up with the same money.
     let had = m.wallet().balance_millicents(Family::Paid);

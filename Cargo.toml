@@ -3,13 +3,13 @@ resolver = "2"
 members = ["lib", "cli", "reference-server", "wasm"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.89"
 repository = "https://github.com/Obscurify-ai/unlinkable-inference"
 
 [workspace.dependencies]
-unlinkable-inference = { version = "0.1.0", path = "lib", default-features = false }
+unlinkable-inference = { version = "0.1.1", path = "lib", default-features = false }
 unlinkable-inference-reference-server = { path = "reference-server" }
 anyhow = "1"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }

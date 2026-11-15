@@ -74,6 +74,15 @@ impl Manager {
         obj.into()
     }
 
+    /// What private use cost: `{spent: [{at, millicents}], prepaid_millicents}`
+    /// (`at` in Unix seconds; 100000 millicents = $1). Changes nothing.
+    pub fn spending(&self) -> js_sys::Promise {
+        promise!(self, |m| {
+            let s = m.spending().await;
+            js_sys::JSON::parse(&serde_json::to_string(&s).map_err(err)?)
+        })
+    }
+
     /// Close sessions no conversation uses, bring back what a lost browser
     /// left behind, top up. Resolves to the cents recovered.
     pub fn start(&self) -> js_sys::Promise {

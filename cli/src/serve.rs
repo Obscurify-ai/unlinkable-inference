@@ -438,6 +438,8 @@ impl Proxy {
 
     async fn close_entry(&self, entry: &Entry) {
         let mut wallet = self.wallet.lock().await;
+        // Dates what the session cost (the wallet's spending log) by its last request.
+        wallet.used_session(&entry.session.secret, entry.last_used.load(Ordering::SeqCst));
         match self.client.close(&mut wallet, &entry.session).await {
             Ok(cents) => tracing::info!("closed a session; {} back in the wallet", dollars(cents)),
             Err(e) => tracing::warn!("could not close a session (will retry at next start): {e}"),
@@ -619,6 +621,26 @@ impl Proxy {
         })
     }
 
+    /// What private use cost, oldest first: closed sessions from the wallet's
+    /// log plus what open ones have used so far (each asked with its own secret).
+    async fn spending_json(&self) -> Value {
+        let (mut spent, open, mut prepaid) = {
+            let wallet = self.wallet.lock().await;
+            (wallet.spending().to_vec(), wallet.sessions().to_vec(), wallet.balance_millicents(Family::Paid))
+        };
+        for o in open.into_iter().filter(|o| o.funded_millicents > 0) {
+            let session = unlinkable_inference::net::Session { secret: o.secret.clone(), family: o.family };
+            if let Ok(status) = self.client.status(&session).await {
+                let left = unlinkable_inference::net::usd_to_millicents_ceil(&status.balance_usd);
+                prepaid += left;
+                if o.funded_millicents > left {
+                    spent.push(unlinkable_inference::Spend { at: o.used_at.max(o.opened_at), millicents: o.funded_millicents - left });
+                }
+            }
+        }
+        json!({ "spent": spent, "prepaid_millicents": prepaid })
+    }
+
     async fn withdraw(&self, api_key: &str, cents: i64) -> Result<i64> {
         let mut wallet = self.wallet.lock().await;
         self.client.withdraw(&mut wallet, api_key, cents).await
@@ -773,6 +795,7 @@ async fn control(proxy: &Proxy, method: &str, path: &str, headers: &HeaderMap, b
     match (method, path) {
         ("GET", "/_unlinkable") | ("GET", "/_unlinkable/") => Html(PAGE).into_response(),
         ("GET", "/_unlinkable/status") => Json(proxy.status_json().await).into_response(),
+        ("GET", "/_unlinkable/spending") => Json(proxy.spending_json().await).into_response(),
         ("GET", "/_unlinkable/key") => match proxy.helper_secret().await {
             Ok(secret) => secret.into_response(),
             Err(e) => text(StatusCode::PAYMENT_REQUIRED, &format!("{e:#}")),
@@ -859,6 +882,7 @@ button{background:#2d4f7c;border-color:#3d6aa5}
 </style></head><body>
 <h1>What leaves this device</h1>
 <div id="summary" class="card">Loading…</div>
+<h2>Spent</h2><div id="spent" class="card">Loading…</div>
 <h2>Open sessions</h2><div id="sessions" class="card"></div>
 <h2>Last requests</h2><div class="card"><table id="traffic"></table></div>
 <div class="dock">
@@ -880,6 +904,16 @@ async function load(){
  $('sessions').innerHTML=s.sessions.length?s.sessions.map(x=>`${x.requests} request${x.requests==1?'':'s'}, open ${x.age_seconds}s, idle ${x.idle_seconds}s`).join('<br>'):'None. Sessions close after '+s.settings.idle_close_seconds+'s without a request; change goes back to the wallet.';
  $('traffic').innerHTML=s.traffic.map(t=>`<tr><td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><span class="server">server sees</span> ${esc(t.server_sees)}</td></tr>`).join('')||'<tr><td>Nothing sent yet.</td></tr>';
 }
+async function spent(){
+ const list=(await (await fetch('/_unlinkable/spending')).json()).spent;
+ const day=t=>new Date(t*1000).toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric'});
+ const m=x=>'$'+(x/100000).toFixed(x&&x<1000?4:2);
+ const now=new Date(), today=day(now/1000), month=now.getFullYear()*12+now.getMonth();
+ const days=new Map(); let t=0,mo=0;
+ for(const e of list){const d=new Date(e.at*1000); if(day(e.at)===today)t+=e.millicents; if(d.getFullYear()*12+d.getMonth()===month)mo+=e.millicents; days.set(day(e.at),(days.get(day(e.at))||0)+e.millicents);}
+ $('spent').innerHTML=`Today ${m(t)} · this month ${m(mo)}`+([...days].reverse().slice(0,30).map(([d,v])=>`<br><span style="color:#888">${d}</span> ${m(v)}`).join(''))+
+  '<br><span style="color:#888">Kept on this device only: the server cannot tie these sessions to your account.</span>';
+}
 async function withdraw(){
  const r=await fetch('/_unlinkable/withdraw',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),amount_cents:+$('amt').value})});
  const j=await r.json(); alert(r.ok?'Added '+usd(j.withdrawn_cents)+' to the wallet':j.error.message); $('key').value=''; load();
@@ -888,5 +922,5 @@ async function passes(){
  const r=await fetch('/_unlinkable/passes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:$('key').value.trim(),count:30})});
  const j=await r.json(); alert(r.ok?'Got '+j.got+' passes':j.error.message); $('key').value=''; load();
 }
-load(); setInterval(load,4000);
+load(); setInterval(load,4000); spent(); setInterval(spent,30000);
 </script></body></html>"#;

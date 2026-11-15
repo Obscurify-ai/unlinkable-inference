@@ -31,7 +31,7 @@ pub use blank::Blank;
 pub use denominations::{split, DENOMINATIONS, WITHDRAW_SIZES};
 pub use keyset::{Keyset, Pins};
 pub use voucher::{Family, Voucher};
-pub use wallet::Wallet;
+pub use wallet::{Spend, Wallet};
 
 /// Session secrets look like API keys so OpenAI and Anthropic SDKs accept them.
 pub const SESSION_SECRET_PREFIX: &str = "sk-unl1_";

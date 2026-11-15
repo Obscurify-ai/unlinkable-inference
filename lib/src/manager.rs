@@ -38,6 +38,15 @@ impl Default for Policy {
     }
 }
 
+/// See [`Manager::spending`].
+#[derive(Debug, Clone, Serialize)]
+pub struct Spending {
+    /// What each session cost, oldest first (open ones: so far)
+    pub spent: Vec<crate::Spend>,
+    /// Prepaid money still here: the wallet plus what open sessions hold
+    pub prepaid_millicents: i64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     #[serde(default)]
@@ -120,6 +129,7 @@ impl Manager {
     pub async fn session(&mut self, chat: &str) -> Result<String> {
         if let Some((secret, used)) = self.chats.get_mut(chat) {
             *used = unix_now();
+            self.wallet.used_session(secret, *used);
             return Ok(secret.clone());
         }
         let cents = self.policy.funding_cents;
@@ -131,6 +141,7 @@ impl Manager {
             }
         };
         self.chats.insert(chat.to_string(), (opened.secret.clone(), unix_now()));
+        self.wallet.used_session(&opened.secret, unix_now());
         Ok(opened.secret)
     }
 
@@ -197,6 +208,28 @@ impl Manager {
     pub fn summary(&mut self) -> (i64, usize) {
         let passes = self.wallet.passes(&crate::pass::current_period()).len();
         (self.wallet.balance_cents(Family::Paid), passes)
+    }
+
+    /// What private use cost, for an app's history. Closed sessions come
+    /// from the wallet's log; open ones are asked from the server with each
+    /// session's own secret. Changes nothing.
+    pub async fn spending(&self) -> Spending {
+        let mut spent = self.wallet.spending().to_vec();
+        let mut prepaid_millicents = self.wallet.balance_millicents(Family::Paid);
+        for open in self.wallet.sessions() {
+            if open.funded_millicents <= 0 {
+                continue;
+            }
+            let session = Session { secret: open.secret.clone(), family: open.family };
+            if let Ok(status) = self.client.status(&session).await {
+                let left = crate::net::usd_to_millicents_ceil(&status.balance_usd);
+                prepaid_millicents += left;
+                if open.funded_millicents > left {
+                    spent.push(crate::Spend { at: open.used_at.max(open.opened_at), millicents: open.funded_millicents - left });
+                }
+            }
+        }
+        Spending { spent, prepaid_millicents }
     }
 
     pub fn wallet(&self) -> &Wallet {

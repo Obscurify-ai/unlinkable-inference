@@ -86,8 +86,26 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
         },
         /** `{ paid_cents, passes }`, or null while busy. */
         summary: () => m.summary(),
+        /** What private use cost: see `spending()` below. */
+        spending: () => m.spending(),
         stop: () => clearInterval(timer),
     };
+}
+
+/**
+ * What private use cost on this device, for an account page's history:
+ * `{ spent: [{ at, millicents }], prepaid_millicents }`, `spent` oldest first
+ * (`at` Unix seconds, 100000 millicents = $1; sessions still open count what
+ * they have used so far) and `prepaid_millicents` the money still here (the
+ * wallet plus what open sessions hold). Read-only: opens, closes and saves
+ * nothing, so it is safe next to a running `connect` in another tab.
+ */
+export async function spending({ seed, server = location.origin, storage = localStorage, name = 'unlinkable-inference' }) {
+    await load();
+    const state = storage.getItem(name);
+    if (!state) return { spent: [], prepaid_millicents: 0 };
+    const m = await Manager.connect(server, seed, state, null);
+    return m.spending();
 }
 
 /** Signing out: drop the saved wallet (it comes back from the number). */
