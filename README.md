@@ -87,17 +87,23 @@ to a session secret from the proxy. In `.claude/settings.json`:
 
 One session lasts until Claude Code goes quiet for 5 minutes; the proxy tops
 it up as it runs low. Codex has no key helper, so it goes through the proxy
-instead, as a profile next to the normal one (`codex --profile private`):
+instead, as a provider in `~/.codex/config.toml`:
 
 ```toml
 [model_providers.obscurify-private]
 name = "Obscurify (private)"
 base_url = "http://127.0.0.1:8899/v1"
 env_key = "OBSCURIFY_API_KEY"
-
-[profiles.private]
-model_provider = "obscurify-private"
 ```
+
+and a profile next to it, `~/.codex/private.config.toml` (Codex 0.169+; `codex --profile private`):
+
+```toml
+model_provider = "obscurify-private"
+model = "deepseek/deepseek-v4.1-flash"
+```
+
+Step-by-step for every client: https://obscurify.ai/tutorials/private_sessions
 
 **pi**: copy `integrations/pi/unlinkable-inference.ts` to `~/.pi/agent/extensions/`. It
 starts the proxy when needed and adds an `obscurify-private` provider with the
