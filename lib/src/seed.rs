@@ -1,13 +1,14 @@
-//! Everything a wallet makes, derived from the account number or the account's
-//! recovery words.
+//! Everything a wallet makes, derived from the account code or, for accounts
+//! made before codes, the account number.
 //!
-//! An account is either a 16-digit number (about 53 bits) or 12 recovery words
-//! from the BIP-39 English list (128 random bits and a 4-bit checksum). Words
-//! are for anything kept on a server under keys from them (synced chats): no
-//! one, not even someone holding the server and all its secrets, can guess
-//! 128 bits, while 16 digits can be searched by anyone willing to pay.
+//! An account code is 20 characters (Crockford base 32: digits and letters
+//! without I, L, O and U), `7KQM2-XDP4R-9WZTH-C3NVB`: 96 random bits and a 4-bit
+//! typo check. No one, not even someone holding the server and all its
+//! secrets, can guess 96 bits through the slow hash below; 16 digits (about 53
+//! bits) can be searched by anyone willing to pay, so anything kept on a server
+//! under keys from them (synced chats) needs a code.
 //!
-//! One slow hash of the number (or words) gives a master key. The device sends the
+//! One slow hash of the code (or number) gives a master key. The device sends the
 //! server `HMAC(master, "login")` to sign in and keeps `HMAC(master,
 //! "wallet")`, the seed, to itself. The server never sees the number, so it
 //! cannot compute the seed: it would have to guess the number through the
@@ -26,111 +27,96 @@ use blind_rsa_signatures::reexports::rsa::rand_core::{TryCryptoRng, TryRng};
 const ARGON2_MEMORY_KIB: u32 = 64 * 1024;
 const ARGON2_PASSES: u32 = 8;
 const MASTER_SALT: &[u8] = b"obscurify-account-v1";
-/// Words hash under their own salt, so the two kinds can never give the same keys.
-const WORDS_SALT: &[u8] = b"obscurify-words-v1";
+/// Codes hash under their own salt, so the two kinds can never give the same keys.
+const CODE_SALT: &[u8] = b"obscurify-code-v1";
 
-/// The BIP-39 English word list (2048 words; the first four letters of each are unique).
-const WORD_LIST: &str = include_str!("bip39-english.txt");
-
-/// The 2048 words, in order (for suggestions while typing).
-pub fn word_list() -> &'static [&'static str] {
-    static LIST: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| WORD_LIST.lines().map(str::trim).filter(|w| !w.is_empty()).collect())
-}
+/// Crockford base 32: no I, L, O or U (read as 1, 1, 0; U is left out).
+const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// What a person typed to sign in, cleaned up.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Credential {
     /// 16 digits.
     Number(String),
-    /// 12 recovery words, lowercase, one space apart.
-    Words(String),
+    /// An account code: 20 characters, upper case, no dashes.
+    Code(String),
 }
 
 impl std::fmt::Debug for Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self { Credential::Number(_) => "Number(..)", Credential::Words(_) => "Words(..)" })
+        f.write_str(match self { Credential::Number(_) => "Number(..)", Credential::Code(_) => "Code(..)" })
     }
 }
 
-/// 16 digits (spaces and dashes allowed) or 12 recovery words; `None` for
-/// anything else, including words whose checksum doesn't hold (a typo).
+/// An account code (any case, dashes and spaces anywhere, O for 0, I or L
+/// for 1) or 16 digits; `None` for anything else, including a code whose
+/// typo check fails.
 pub fn normalize_credential(input: &str) -> Option<Credential> {
-    if input.len() > 400 {
+    if input.len() > 200 {
         return None;
     }
-    if input.chars().any(|c| c.is_ascii_alphabetic()) {
-        return normalize_words(input).map(Credential::Words);
+    let bare: String = input.chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '.').collect();
+    if bare.len() == 16 && bare.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(Credential::Number(bare));
     }
-    normalize(input).map(Credential::Number)
+    normalize_code(input).map(Credential::Code)
 }
 
-/// 12 recovery words as they're kept: lowercase, one space apart. Accepts any
-/// separators, numbering ("1. abandon") and words cut to their first four
-/// letters or more; `None` unless all 12 are on the list and the checksum holds.
-pub fn normalize_words(input: &str) -> Option<String> {
-    if input.len() > 400 {
-        return None;
-    }
-    let list = word_list();
-    let mut indices = Vec::with_capacity(12);
-    for token in input.split(|c: char| !c.is_ascii_alphabetic()).filter(|t| !t.is_empty()) {
-        let token = token.to_ascii_lowercase();
-        let i = match list.binary_search(&token.as_str()) {
-            Ok(i) => i,
-            Err(_) if token.len() >= 4 => {
-                let mut hits = list.iter().enumerate().filter(|(_, w)| w.starts_with(token.as_str()));
-                match (hits.next(), hits.next()) {
-                    (Some((i, _)), None) => i,
-                    _ => return None,
-                }
-            }
-            Err(_) => return None,
-        };
-        indices.push(i);
-    }
-    if indices.len() != 12 {
-        return None;
-    }
-    // 12 x 11 bits = 128 bits of entropy, then the first 4 bits of its SHA-256.
-    let mut bits: u128 = 0;
-    for &i in &indices[..11] {
-        bits = (bits << 11) | i as u128;
-    }
-    let last = indices[11] as u128;
-    let entropy = (bits << 7) | (last >> 4);
-    let checksum = (last & 0x0f) as u8;
-    let hash = blind_rsa_signatures::reexports::hmac_sha256::Hash::hash(&entropy.to_be_bytes());
-    if hash[0] >> 4 != checksum {
-        return None;
-    }
-    Some(indices.iter().map(|&i| list[i]).collect::<Vec<_>>().join(" "))
+/// The value of a typed character in the code alphabet.
+fn code_value(c: char) -> Option<u8> {
+    let c = match c.to_ascii_uppercase() {
+        'O' => '0',
+        'I' | 'L' => '1',
+        c => c,
+    };
+    CODE_ALPHABET.iter().position(|&a| a as char == c).map(|i| i as u8)
 }
 
-/// 12 new recovery words (128 random bits), made on the device so the server
-/// never learns them.
-pub fn new_recovery_words() -> String {
-    words_from_entropy(rand::random::<[u8; 16]>())
+/// An account code as it's kept: 20 characters, upper case, no dashes;
+/// `None` unless it has 20 and its typo check holds.
+pub fn normalize_code(input: &str) -> Option<String> {
+    if input.len() > 200 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(20);
+    for c in input.chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '.') {
+        values.push(code_value(c)?);
+    }
+    if values.len() != 20 {
+        return None;
+    }
+    let bits = values.iter().fold(0u128, |acc, &v| (acc << 5) | v as u128); // 100 bits
+    let random = bits >> 4; // 96
+    let check = (bits & 0x0f) as u8;
+    let bytes = random.to_be_bytes();
+    if code_check(&bytes[4..]) != check {
+        return None;
+    }
+    Some(values.iter().map(|&v| CODE_ALPHABET[v as usize] as char).collect())
 }
 
-/// The 12 words for 16 bytes of entropy (BIP-39).
-pub fn words_from_entropy(entropy: [u8; 16]) -> String {
-    let list = word_list();
-    let hash = blind_rsa_signatures::reexports::hmac_sha256::Hash::hash(&entropy);
-    let e = u128::from_be_bytes(entropy);
-    let mut words = Vec::with_capacity(12);
-    for k in 0..12 {
-        // Bits 11k..11k+11 of entropy || checksum (132 bits).
-        let start = 11 * k;
-        let index = if start + 11 <= 128 {
-            ((e >> (128 - start - 11)) & 0x7ff) as usize
-        } else {
-            // The last word: 7 bits of entropy and the 4 checksum bits.
-            (((e & 0x7f) << 4) as usize) | (hash[0] >> 4) as usize
-        };
-        words.push(list[index]);
-    }
-    words.join(" ")
+/// The typo check: the first 4 bits of SHA-256 of the 12 random bytes.
+fn code_check(random: &[u8]) -> u8 {
+    blind_rsa_signatures::reexports::hmac_sha256::Hash::hash(random)[0] >> 4
+}
+
+/// The code for 12 random bytes.
+pub fn code_from_bytes(random: [u8; 12]) -> String {
+    let mut wide = [0u8; 16];
+    wide[4..].copy_from_slice(&random);
+    let bits = (u128::from_be_bytes(wide) << 4) | code_check(&random) as u128;
+    (0..20).rev().map(|k| CODE_ALPHABET[((bits >> (5 * k)) & 0x1f) as usize] as char).collect()
+}
+
+/// A code as people read it: four groups of five, `7KQM2-XDP4R-9WZTH-C3NVB`.
+pub fn format_code(code: &str) -> String {
+    code.as_bytes().chunks(5).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("-")
+}
+
+/// A new account code (96 random bits), made on the device so the server
+/// never learns it. Grouped for reading.
+pub fn new_account_code() -> String {
+    format_code(&code_from_bytes(rand::random::<[u8; 12]>()))
 }
 
 /// The two things the account number gives a device.
@@ -153,13 +139,13 @@ pub fn normalize(number: &str) -> Option<String> {
     (digits.len() == 16).then_some(digits)
 }
 
-/// Derive the login key and the wallet seed from an account number or 12
-/// recovery words. Slow on purpose (Argon2id, 64 MiB).
-pub fn account_keys(number_or_words: &str) -> anyhow::Result<AccountKeys> {
-    let (input, salt) = match normalize_credential(number_or_words) {
+/// Derive the login key and the wallet seed from an account code or a 16-digit
+/// account number. Slow on purpose (Argon2id, 64 MiB).
+pub fn account_keys(code_or_number: &str) -> anyhow::Result<AccountKeys> {
+    let (input, salt) = match normalize_credential(code_or_number) {
         Some(Credential::Number(digits)) => (digits, MASTER_SALT),
-        Some(Credential::Words(words)) => (words, WORDS_SALT),
-        None => anyhow::bail!("an account number has 16 digits, and recovery words are 12 words from the list"),
+        Some(Credential::Code(code)) => (code, CODE_SALT),
+        None => anyhow::bail!("an account code has 20 characters, and an account number 16 digits"),
     };
     let params = argon2::Params::new(ARGON2_MEMORY_KIB, ARGON2_PASSES, 1, Some(32))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
