@@ -10,7 +10,8 @@ How it works, in one paragraph: your device holds a wallet of blind-signed
 vouchers (Chaumian e-cash: David Chaum's blind signatures, 1982). Each conversation opens a session paid with a few of them and uses a
 random session secret instead of an API key. When the conversation goes quiet
 the session closes and the change comes back as fresh vouchers the server has
-never seen. Everything is derived from the account number, so a device that
+never seen. Everything is derived from the account's 12 account words (BIP-39,
+128 bits; older accounts have a 16-digit number), so a device that
 forgets it all gets the money back at the next sign-in. Nothing depends on a
 third party.
 
@@ -26,7 +27,8 @@ code as WebAssembly in the npm package `unlinkable-inference`.
 ```rust
 use unlinkable_inference::{manager::Manager, seed::account_keys};
 
-let keys = account_keys(&number)?;            // slow on purpose, ~1 s
+let keys = account_keys(&words)?;             // 12 words or 16 digits; slow on purpose, ~1 s
+// new accounts: seed::new_recovery_words(), made on the device
 // sign in with keys.login_key; keep keys.seed on the device
 let mut m = Manager::connect(server, keys.seed, saved.as_deref()).await?;
 m.api_key = Some(api_key);                     // used only to top the wallet up
@@ -54,7 +56,7 @@ so no cookie goes with it, and tops the session up when it runs out.
 
 | Package | What | Licence |
 |---|---|---|
-| [`unlinkable-inference`](lib) (crate) | The library. Client: blind vouchers, wallet, sessions, key pinning, recovery from the account number, `Manager` for apps. With the `server` feature: the session endpoints and voucher checks (axum) over your storage. | MIT or Apache-2.0 |
+| [`unlinkable-inference`](lib) (crate) | The library. Client: blind vouchers, wallet, sessions, key pinning, recovery from the account words or number, 12-word account words (BIP-39), `Manager` for apps. With the `server` feature: the session endpoints and voucher checks (axum) over your storage. | MIT or Apache-2.0 |
 | `unlinkable-inference` (npm) | The same client compiled to WebAssembly for web pages ([`wasm`](wasm), `wasm/build.sh`) | MIT or Apache-2.0 |
 | [`unlinkable-inference-cli`](cli) (crate) | `unlinkable-inference`: local OpenAI/Anthropic proxy, MCP server, wallet CLI, `verify` | GPL-3.0-or-later |
 

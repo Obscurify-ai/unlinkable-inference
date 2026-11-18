@@ -53,7 +53,7 @@ struct ServeArgs {
     /// Print what leaves this device for every request
     #[arg(long)]
     show_traffic: bool,
-    /// The account number. With it the wallet is seeded: everything in it can
+    /// The account's 12 words or 16-digit number. With it the wallet is seeded: everything in it can
     /// be rebuilt from the number on any device, so nothing is lost with the
     /// wallet file. Only a key derived from it is sent, never the number.
     #[arg(long, env = "OBSCURIFY_ACCOUNT_NUMBER", hide_env_values = true)]
@@ -86,7 +86,7 @@ enum Command {
         #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
         listen: String,
     },
-    /// Print the login key for an account number read from stdin: what
+    /// Print the login key for account words or a number read from stdin: what
     /// `POST /login` and `/generate_token` take as `account_key` instead of
     /// the number, so the server never sees the number.
     LoginKey,
@@ -349,7 +349,7 @@ async fn start(
     if keys.is_some() {
         match client.restore(&mut wallet, api_key.as_deref()).await {
             Ok(0) => {}
-            Ok(c) => eprintln!("unlinkable-inference: restored {} from the account number", dollars(c)),
+            Ok(c) => eprintln!("unlinkable-inference: restored {} from the account words", dollars(c)),
             Err(e) => eprintln!("unlinkable-inference: could not restore the wallet yet: {e:#}"),
         }
     }
