@@ -27,6 +27,30 @@ pub fn new_account_number() -> String {
     unlinkable_inference::seed::new_account_number()
 }
 
+/// 12 fresh recovery words (128 random bits), made on the device.
+#[wasm_bindgen(js_name = newRecoveryWords)]
+pub fn new_recovery_words() -> String {
+    unlinkable_inference::seed::new_recovery_words()
+}
+
+/// What `input` is: "number" (16 digits), "words" (12 recovery words, checksum
+/// holds) or "" (neither yet).
+#[wasm_bindgen(js_name = credentialKind)]
+pub fn credential_kind(input: &str) -> String {
+    match unlinkable_inference::seed::normalize_credential(input) {
+        Some(unlinkable_inference::seed::Credential::Number(_)) => "number",
+        Some(unlinkable_inference::seed::Credential::Words(_)) => "words",
+        None => "",
+    }
+    .into()
+}
+
+/// The 2048 words recovery words come from, for suggestions while typing.
+#[wasm_bindgen(js_name = wordList)]
+pub fn word_list() -> Vec<String> {
+    unlinkable_inference::seed::word_list().iter().map(|w| w.to_string()).collect()
+}
+
 #[wasm_bindgen]
 pub struct Manager {
     inner: Rc<Mutex<manager::Manager>>,

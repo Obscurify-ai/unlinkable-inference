@@ -1,6 +1,13 @@
-//! Everything a wallet makes, derived from the account number.
+//! Everything a wallet makes, derived from the account number or the account's
+//! recovery words.
 //!
-//! One slow hash of the number gives a master key. The device sends the
+//! An account is either a 16-digit number (about 53 bits) or 12 recovery words
+//! from the BIP-39 English list (128 random bits and a 4-bit checksum). Words
+//! are for anything kept on a server under keys from them (synced chats): no
+//! one, not even someone holding the server and all its secrets, can guess
+//! 128 bits, while 16 digits can be searched by anyone willing to pay.
+//!
+//! One slow hash of the number (or words) gives a master key. The device sends the
 //! server `HMAC(master, "login")` to sign in and keeps `HMAC(master,
 //! "wallet")`, the seed, to itself. The server never sees the number, so it
 //! cannot compute the seed: it would have to guess the number through the
@@ -19,6 +26,112 @@ use blind_rsa_signatures::reexports::rsa::rand_core::{TryCryptoRng, TryRng};
 const ARGON2_MEMORY_KIB: u32 = 64 * 1024;
 const ARGON2_PASSES: u32 = 8;
 const MASTER_SALT: &[u8] = b"obscurify-account-v1";
+/// Words hash under their own salt, so the two kinds can never give the same keys.
+const WORDS_SALT: &[u8] = b"obscurify-words-v1";
+
+/// The BIP-39 English word list (2048 words; the first four letters of each are unique).
+const WORD_LIST: &str = include_str!("bip39-english.txt");
+
+/// The 2048 words, in order (for suggestions while typing).
+pub fn word_list() -> &'static [&'static str] {
+    static LIST: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| WORD_LIST.lines().map(str::trim).filter(|w| !w.is_empty()).collect())
+}
+
+/// What a person typed to sign in, cleaned up.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// 16 digits.
+    Number(String),
+    /// 12 recovery words, lowercase, one space apart.
+    Words(String),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { Credential::Number(_) => "Number(..)", Credential::Words(_) => "Words(..)" })
+    }
+}
+
+/// 16 digits (spaces and dashes allowed) or 12 recovery words; `None` for
+/// anything else, including words whose checksum doesn't hold (a typo).
+pub fn normalize_credential(input: &str) -> Option<Credential> {
+    if input.len() > 400 {
+        return None;
+    }
+    if input.chars().any(|c| c.is_ascii_alphabetic()) {
+        return normalize_words(input).map(Credential::Words);
+    }
+    normalize(input).map(Credential::Number)
+}
+
+/// 12 recovery words as they're kept: lowercase, one space apart. Accepts any
+/// separators, numbering ("1. abandon") and words cut to their first four
+/// letters or more; `None` unless all 12 are on the list and the checksum holds.
+pub fn normalize_words(input: &str) -> Option<String> {
+    if input.len() > 400 {
+        return None;
+    }
+    let list = word_list();
+    let mut indices = Vec::with_capacity(12);
+    for token in input.split(|c: char| !c.is_ascii_alphabetic()).filter(|t| !t.is_empty()) {
+        let token = token.to_ascii_lowercase();
+        let i = match list.binary_search(&token.as_str()) {
+            Ok(i) => i,
+            Err(_) if token.len() >= 4 => {
+                let mut hits = list.iter().enumerate().filter(|(_, w)| w.starts_with(token.as_str()));
+                match (hits.next(), hits.next()) {
+                    (Some((i, _)), None) => i,
+                    _ => return None,
+                }
+            }
+            Err(_) => return None,
+        };
+        indices.push(i);
+    }
+    if indices.len() != 12 {
+        return None;
+    }
+    // 12 x 11 bits = 128 bits of entropy, then the first 4 bits of its SHA-256.
+    let mut bits: u128 = 0;
+    for &i in &indices[..11] {
+        bits = (bits << 11) | i as u128;
+    }
+    let last = indices[11] as u128;
+    let entropy = (bits << 7) | (last >> 4);
+    let checksum = (last & 0x0f) as u8;
+    let hash = blind_rsa_signatures::reexports::hmac_sha256::Hash::hash(&entropy.to_be_bytes());
+    if hash[0] >> 4 != checksum {
+        return None;
+    }
+    Some(indices.iter().map(|&i| list[i]).collect::<Vec<_>>().join(" "))
+}
+
+/// 12 new recovery words (128 random bits), made on the device so the server
+/// never learns them.
+pub fn new_recovery_words() -> String {
+    words_from_entropy(rand::random::<[u8; 16]>())
+}
+
+/// The 12 words for 16 bytes of entropy (BIP-39).
+pub fn words_from_entropy(entropy: [u8; 16]) -> String {
+    let list = word_list();
+    let hash = blind_rsa_signatures::reexports::hmac_sha256::Hash::hash(&entropy);
+    let e = u128::from_be_bytes(entropy);
+    let mut words = Vec::with_capacity(12);
+    for k in 0..12 {
+        // Bits 11k..11k+11 of entropy || checksum (132 bits).
+        let start = 11 * k;
+        let index = if start + 11 <= 128 {
+            ((e >> (128 - start - 11)) & 0x7ff) as usize
+        } else {
+            // The last word: 7 bits of entropy and the 4 checksum bits.
+            (((e & 0x7f) << 4) as usize) | (hash[0] >> 4) as usize
+        };
+        words.push(list[index]);
+    }
+    words.join(" ")
+}
 
 /// The two things the account number gives a device.
 #[derive(Clone)]
@@ -40,15 +153,19 @@ pub fn normalize(number: &str) -> Option<String> {
     (digits.len() == 16).then_some(digits)
 }
 
-/// Derive the login key and the wallet seed from an account number. Slow on
-/// purpose (Argon2id, 64 MiB).
-pub fn account_keys(number: &str) -> anyhow::Result<AccountKeys> {
-    let digits = normalize(number).ok_or_else(|| anyhow::anyhow!("an account number has 16 digits"))?;
+/// Derive the login key and the wallet seed from an account number or 12
+/// recovery words. Slow on purpose (Argon2id, 64 MiB).
+pub fn account_keys(number_or_words: &str) -> anyhow::Result<AccountKeys> {
+    let (input, salt) = match normalize_credential(number_or_words) {
+        Some(Credential::Number(digits)) => (digits, MASTER_SALT),
+        Some(Credential::Words(words)) => (words, WORDS_SALT),
+        None => anyhow::bail!("an account number has 16 digits, and recovery words are 12 words from the list"),
+    };
     let params = argon2::Params::new(ARGON2_MEMORY_KIB, ARGON2_PASSES, 1, Some(32))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut master = [0u8; 32];
     argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-        .hash_password_into(digits.as_bytes(), MASTER_SALT, &mut master)
+        .hash_password_into(input.as_bytes(), salt, &mut master)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(AccountKeys {
         login_key: hex::encode(HMAC::mac(b"login", master)),

@@ -10,7 +10,7 @@
 //   const { loginKey, seed } = await sessions.keys(number); // send loginKey to sign in
 //   const u = await sessions.connect({ seed, apiKey });
 //   const res = await u.fetch('/v1/chat/completions', { method: 'POST', body }, { chat: conversationId });
-import init, { accountKeys, newAccountNumber, Manager } from './unlinkable_inference_wasm.js';
+import init, { accountKeys, newAccountNumber, newRecoveryWords, credentialKind, wordList, Manager } from './unlinkable_inference_wasm.js';
 
 let loaded;
 
@@ -20,8 +20,8 @@ export function load(wasmUrl) {
     return loaded;
 }
 
-/** `{ loginKey, seed }` for a 16-digit account number. Send `loginKey` to sign in
- *  instead of the number; keep `seed` (hex) for `connect`. Slow on purpose (~1 s). */
+/** `{ loginKey, seed }` for a 16-digit account number or 12 recovery words. Send
+ *  `loginKey` to sign in instead of them; keep `seed` (hex) for `connect`. Slow on purpose (~1 s). */
 export async function keys(number) {
     await load();
     const k = accountKeys(number);
@@ -32,6 +32,24 @@ export async function keys(number) {
 export async function newNumber() {
     await load();
     return newAccountNumber();
+}
+
+/** 12 new recovery words (128 random bits), made here: the server never learns them. */
+export async function newWords() {
+    await load();
+    return newRecoveryWords();
+}
+
+/** "number", "words" (12 words whose checksum holds) or "" for what was typed. */
+export async function kind(input) {
+    await load();
+    return credentialKind(input);
+}
+
+/** The 2048 words recovery words come from (BIP-39 English), for suggestions. */
+export async function words() {
+    await load();
+    return wordList();
 }
 
 /**
