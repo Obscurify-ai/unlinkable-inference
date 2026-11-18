@@ -86,7 +86,7 @@ enum Command {
         #[arg(long, env = "UNLINKABLE_LISTEN", default_value = "127.0.0.1:8899")]
         listen: String,
     },
-    /// Print the login key for account words or a number read from stdin: what
+    /// Print the login key for seed words or a number read from stdin: what
     /// `POST /login` and `/generate_token` take as `account_key` instead of
     /// the number, so the server never sees the number.
     LoginKey,
@@ -349,7 +349,7 @@ async fn start(
     if keys.is_some() {
         match client.restore(&mut wallet, api_key.as_deref()).await {
             Ok(0) => {}
-            Ok(c) => eprintln!("unlinkable-inference: restored {} from the account words", dollars(c)),
+            Ok(c) => eprintln!("unlinkable-inference: restored {} from the seed words", dollars(c)),
             Err(e) => eprintln!("unlinkable-inference: could not restore the wallet yet: {e:#}"),
         }
     }

@@ -10,7 +10,7 @@ How it works, in one paragraph: your device holds a wallet of blind-signed
 vouchers (Chaumian e-cash: David Chaum's blind signatures, 1982). Each conversation opens a session paid with a few of them and uses a
 random session secret instead of an API key. When the conversation goes quiet
 the session closes and the change comes back as fresh vouchers the server has
-never seen. Everything is derived from the account's 12 account words (BIP-39,
+never seen. Everything is derived from the account's 12 seed words (BIP-39,
 128 bits; older accounts have a 16-digit number), so a device that
 forgets it all gets the money back at the next sign-in. Nothing depends on a
 third party.
@@ -56,7 +56,7 @@ so no cookie goes with it, and tops the session up when it runs out.
 
 | Package | What | Licence |
 |---|---|---|
-| [`unlinkable-inference`](lib) (crate) | The library. Client: blind vouchers, wallet, sessions, key pinning, recovery from the account words or number, 12-word account words (BIP-39), `Manager` for apps. With the `server` feature: the session endpoints and voucher checks (axum) over your storage. | MIT or Apache-2.0 |
+| [`unlinkable-inference`](lib) (crate) | The library. Client: blind vouchers, wallet, sessions, key pinning, recovery from the seed words (12 BIP-39 words) or number, `Manager` for apps. With the `server` feature: the session endpoints and voucher checks (axum) over your storage. | MIT or Apache-2.0 |
 | `unlinkable-inference` (npm) | The same client compiled to WebAssembly for web pages ([`wasm`](wasm), `wasm/build.sh`) | MIT or Apache-2.0 |
 | [`unlinkable-inference-cli`](cli) (crate) | `unlinkable-inference`: local OpenAI/Anthropic proxy, MCP server, wallet CLI, `verify` | GPL-3.0-or-later |
 
