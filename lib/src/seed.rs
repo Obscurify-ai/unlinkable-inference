@@ -2,7 +2,7 @@
 //! made before codes, the account number.
 //!
 //! An account code is 20 characters (Crockford base 32: digits and letters
-//! without I, L, O and U), `7KQM2-XDP4R-9WZTH-C3NVB`: 96 random bits and a 4-bit
+//! without I, L, O and U), `RJQDX-WM6PR-2QV5M-8BX5G`: 96 random bits and a 4-bit
 //! typo check. No one, not even someone holding the server and all its
 //! secrets, can guess 96 bits through the slow hash below; 16 digits (about 53
 //! bits) can be searched by anyone willing to pay, so anything kept on a server
@@ -108,7 +108,7 @@ pub fn code_from_bytes(random: [u8; 12]) -> String {
     (0..20).rev().map(|k| CODE_ALPHABET[((bits >> (5 * k)) & 0x1f) as usize] as char).collect()
 }
 
-/// A code as people read it: four groups of five, `7KQM2-XDP4R-9WZTH-C3NVB`.
+/// A code as people read it: four groups of five, `RJQDX-WM6PR-2QV5M-8BX5G`.
 pub fn format_code(code: &str) -> String {
     code.as_bytes().chunks(5).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("-")
 }
