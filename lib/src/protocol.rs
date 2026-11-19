@@ -38,6 +38,11 @@ pub struct SessionStatus {
     /// The plan tier a pass gave this session, if any
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// `POST /u/sessions` answered an open of a session that already existed (the same secret
+    /// and vouchers). After a lost response that is the caller's own open; on a first try it is
+    /// another device on the account that made the same choices, so pick another secret.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat: bool,
 }
 
 /// `POST /u/passes` (bearer: the account's own API key): blind passes for
@@ -140,7 +145,15 @@ pub struct ErrorDetail {
     /// Indexes of vouchers that were already spent (nothing was spent then)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spent: Vec<usize>,
+    /// A withdrawal larger than the account can cover: what it can (whole cents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_cents: Option<i64>,
 }
+
+/// `GET /u/sessions/unclaimed` lists a session only once it is closed or has gone this long
+/// without a request, so a device rebuilding its wallet never closes one another device on the
+/// account is using (wallets close their own after five quiet minutes).
+pub const UNCLAIMED_AFTER_SECS: u64 = 15 * 60;
 
 /// `GET /u/sessions/unclaimed`: every session still open, or closed with
 /// change nobody has confirmed collecting. A seeded wallet finds its own by

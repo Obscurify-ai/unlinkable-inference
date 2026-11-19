@@ -63,6 +63,9 @@ struct SessionRow {
     last_used: Instant,
     #[serde(skip)]
     close_answer: Option<(String, ChangeResponse)>,
+    /// Which vouchers opened it (`open_digest`): only those make a retry.
+    #[serde(skip)]
+    open_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +114,9 @@ struct Db {
 pub struct MemoryBackend {
     db: Mutex<Db>,
     pub idle_timeout: Duration,
+    /// An open session is listed as unclaimed after this long unused
+    /// (`protocol::UNCLAIMED_AFTER_SECS`; tests shorten it).
+    unclaimed_after: Mutex<Duration>,
 }
 
 impl MemoryBackend {
@@ -118,7 +124,13 @@ impl MemoryBackend {
         Self {
             db: Mutex::new(Db::default()),
             idle_timeout,
+            unclaimed_after: Mutex::new(Duration::from_secs(unlinkable_inference::protocol::UNCLAIMED_AFTER_SECS)),
         }
+    }
+
+    /// How long an open session goes unused before `GET /u/sessions/unclaimed` lists it.
+    pub fn set_unclaimed_after(&self, after: Duration) {
+        *self.unclaimed_after.lock().unwrap() = after;
     }
 
     fn status_of(&self, row: &SessionRow) -> SessionStatus {
@@ -128,6 +140,7 @@ impl MemoryBackend {
             idle_timeout_seconds: self.idle_timeout.as_secs(),
             closed: row.closed_at.is_some(),
             tier: row.tier.clone(),
+            repeat: false,
         }
     }
 
@@ -237,11 +250,13 @@ impl Backend for MemoryBackend {
         pass: Option<&PassUse>,
     ) -> Result<SessionStatus, GatewayError> {
         let mut db = self.db.lock().unwrap();
+        let digest = unlinkable_inference::server::open_digest(spends);
         if let Some(row) = db.sessions.get(secret_hash) {
-            // A retried open presents the vouchers the first one spent. Any
-            // unspent voucher means a different open with the same secret.
-            if spends.iter().all(|s| db.spent.contains_key(&s.hash)) {
-                return Ok(self.status_of(row));
+            // A retried open presents exactly the vouchers the first one spent. Anything else,
+            // even vouchers spent elsewhere (another device's copy of a shared wallet), is a
+            // different open with the same secret.
+            if row.open_digest == digest {
+                return Ok(SessionStatus { repeat: true, ..self.status_of(row) });
             }
             return Err(GatewayError::Status(StatusCode::CONFLICT, "secret_taken", "That session secret is taken; pick another.".into()));
         }
@@ -268,6 +283,7 @@ impl Backend for MemoryBackend {
             closed_at: None,
             last_used: Instant::now(),
             close_answer: None,
+            open_digest: digest,
         };
         let status = self.status_of(&row);
         db.sessions.insert(secret_hash.to_string(), row);
@@ -432,8 +448,9 @@ impl Backend for MemoryBackend {
             )
         })?;
         if account.balance_cents < cents {
-            return Err(GatewayError::payment_required(
+            return Err(GatewayError::unaffordable(
                 "Not enough balance to withdraw that much.",
+                account.balance_cents,
             ));
         }
         account.balance_cents -= cents;
@@ -452,10 +469,12 @@ impl Backend for MemoryBackend {
     }
 
     async fn unclaimed(&self) -> Result<Vec<UnclaimedSession>, GatewayError> {
+        let after = *self.unclaimed_after.lock().unwrap();
         let db = self.db.lock().unwrap();
         let mut list: Vec<UnclaimedSession> = db
             .sessions
             .iter()
+            .filter(|(_, s)| s.closed_at.is_some() || s.last_used.elapsed() >= after)
             .map(|(h, s)| UnclaimedSession { h: h.clone(), m: s.opened_at / 60 })
             .collect();
         list.sort_by_key(|u| u.m);

@@ -59,7 +59,7 @@ obscurify.ai live in `lib/keys/obscurify.ai.pins`.
 ## Endpoints
 
 None of them reads a cookie or stores an IP. Errors are
-`{"error": {"message", "type", "spent"?}}`.
+`{"error": {"message", "type", "spent"?, "available_cents"?}}`.
 
 | Request | Auth | Body | Answer |
 |---|---|---|---|
@@ -72,7 +72,7 @@ None of them reads a cookie or stores an IP. Errors are
 | `GET /u/passes` | account API key | | `{"tier", "period", "remaining"}` |
 | `POST /u/passes` | account API key | `{"tier", "period", "blinded": [b64]}` | `{"tier", "period", "blind_signatures", "remaining"}` |
 
-- **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed", "tier"?}`.
+- **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed", "tier"?, "repeat"?}`.
 - **Change**: `{"change_cents", "family", "signed": [{"index", "blind_signature"}]}`;
   `index` points into the request's `blanks`.
 - **Session auth**: `Authorization: Bearer sk-unl1_<32 random bytes>`. The
@@ -84,10 +84,13 @@ Rules:
 - **Open** needs at least the server's minimum (10¢ by default) and spends
   every voucher or none. Vouchers must share a family and not
   repeat; up to 64. If any were spent before: 409 with `spent` = their indexes,
-  and nothing is spent. A repeat open with the same `secret_hash` (the same
-  vouchers, all spent by the first) returns the existing session and spends
-  nothing; with any voucher not yet spent it is someone else's secret: 409
-  `secret_taken`, nothing spent, pick another. With `"pass"`, the session gets the
+  and nothing is spent. A repeat open with the same `secret_hash` and exactly the
+  vouchers that opened it returns the existing session with `"repeat": true` and
+  spends nothing; with any other vouchers it is someone else's secret: 409
+  `secret_taken`, nothing spent, pick another. Devices sharing an account's wallet
+  derive the same secrets and hold copies of the same vouchers, so a client that
+  gets `repeat` on a first try (not a retry after a lost response) treats it as
+  another device's session: those vouchers are spent, pick another secret. With `"pass"`, the session gets the
   pass's tier (its plan's models); a pass opens one session (409
   `pass_spent` after that) and only in its own month.
 - **Close** rounds the balance **up** to the next millicent (a session never
@@ -100,10 +103,23 @@ Rules:
   same answer; a different one gets 410.
 - **Exchange** and **withdraw** sign every blank (dust or not); the blanks must
   add up to exactly the vouchers' total, or the amount, in millicents. Withdrawals are $1, $5, $20, $50
-  or $100 from the account's withdrawable balance (credit that was never paid
-  for stays in the account). A repeat with the same blanks gets the same answer.
+  or $100, or any amount under $1 (the last of a balance), from the account's balance. One the
+  account can't cover is 402 with `available_cents`, what it can; clients take that when it is
+  at least a session's minimum, and leave less in the account. A repeat with the same blanks
+  gets the same answer.
 - Sessions refuse model requests after `idle_timeout_seconds` without one but
   can always be closed for change: an open session's balance is never taken.
+
+## One wallet per account
+
+A seeded wallet is a function of the account's seed and the server's records, so every device
+signed in with the account's code spends one wallet. A device whose wallet runs low first
+rebuilds it (`GET /u/issued` with the account key, `GET /u/sessions/unclaimed`, `GET /u/spent`):
+that finds what the other devices withdrew, and the change of sessions they closed, before it
+takes more from the account. `GET /u/sessions/unclaimed` lists a session only once it is closed
+or unused for 15 minutes (`UNCLAIMED_AFTER_SECS`), so a device never closes a session another
+device is using. A voucher two devices hold is spent by whichever uses it first; the other gets
+409 `spent` (or `repeat`) and drops it.
 
 ## Passes
 

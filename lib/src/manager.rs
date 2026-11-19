@@ -23,8 +23,16 @@ pub struct Policy {
     pub funding_cents: i64,
     /// Top the wallet up when it holds less than this...
     pub keep_cents: i64,
-    /// ...by this much: one of `WITHDRAW_SIZES` (fixed, so withdrawals look alike).
+    /// ...by this much: one of `WITHDRAW_SIZES` (fixed, so withdrawals look alike). An account
+    /// holding less gives what it has, down to `min_session_cents`.
     pub refill_cents: i64,
+    /// The least a session can open with (the server's minimum): less stays in the account.
+    pub min_session_cents: i64,
+    /// After the account refused a top-up, wait this long before asking again.
+    pub refused_backoff_secs: u64,
+    /// The wallet is shared by every device with the account's code: when low, look for what the
+    /// others withdrew or got back as change (at most this often) before taking more from the account.
+    pub share_every_secs: u64,
     /// Keep this many of this month's passes (on a plan), getting `pass_batch` at a time.
     pub keep_passes: usize,
     pub pass_batch: i64,
@@ -34,7 +42,17 @@ pub struct Policy {
 
 impl Default for Policy {
     fn default() -> Self {
-        Policy { funding_cents: 50, keep_cents: 50, refill_cents: 100, keep_passes: 10, pass_batch: 30, idle_secs: 300 }
+        Policy {
+            funding_cents: 50,
+            keep_cents: 50,
+            refill_cents: 100,
+            min_session_cents: 10,
+            refused_backoff_secs: 600,
+            share_every_secs: 10,
+            keep_passes: 10,
+            pass_batch: 30,
+            idle_secs: 300,
+        }
     }
 }
 
@@ -57,6 +75,9 @@ struct State {
     /// held reply → the secret of the session that asked for it
     #[serde(default)]
     replies: BTreeMap<String, String>,
+    /// When the account last refused a top-up (Unix seconds), so a reload doesn't ask again at once
+    #[serde(default)]
+    refused_at: u64,
 }
 
 pub struct Manager {
@@ -68,6 +89,8 @@ pub struct Manager {
     /// The account's API key, used only to top the wallet up. Without it the
     /// wallet spends what it holds.
     pub api_key: Option<String>,
+    refused_at: u64,
+    shared_at: u64,
 }
 
 impl Manager {
@@ -99,13 +122,16 @@ impl Manager {
             replies: st.replies,
             policy: Policy::default(),
             api_key: None,
+            refused_at: st.refused_at,
+            shared_at: 0,
         })
     }
 
     /// Everything to save, as JSON.
     pub fn state(&self) -> String {
         let wallet = serde_json::from_str(&self.wallet.to_json()).ok();
-        serde_json::to_string(&State { wallet, chats: self.chats.clone(), replies: self.replies.clone() }).unwrap_or_default()
+        serde_json::to_string(&State { wallet, chats: self.chats.clone(), replies: self.replies.clone(), refused_at: self.refused_at })
+            .unwrap_or_default()
     }
 
     /// At app start: sessions this device opened that no conversation uses
@@ -195,8 +221,25 @@ impl Manager {
     /// money is fully spent. Failures wait for the next tick.
     pub async fn refill(&mut self) {
         let Some(key) = self.api_key.clone() else { return };
-        if self.wallet.balance_cents(Family::Paid) < self.policy.keep_cents {
-            let _ = self.client.withdraw(&mut self.wallet, &key, self.policy.refill_cents).await;
+        let now = unix_now();
+        let low = |m: &Self| m.wallet.balance_cents(Family::Paid) < m.policy.keep_cents;
+        // The wallet is the account's, not this device's: what another device withdrew, or got
+        // back as change from a session it closed, is found from the shared seed first. Nothing
+        // here names a chat: the lookups are the account's own records and anonymous lists.
+        if low(self) && now.saturating_sub(self.shared_at) >= self.policy.share_every_secs {
+            self.shared_at = now;
+            let _ = self.client.restore(&mut self.wallet, Some(&key)).await;
+        }
+        if low(self) && now.saturating_sub(self.refused_at) >= self.policy.refused_backoff_secs {
+            let min = self.policy.min_session_cents.min(self.policy.refill_cents);
+            match self.client.withdraw_up_to(&mut self.wallet, &key, self.policy.refill_cents, min).await {
+                Ok(_) => self.refused_at = 0,
+                // Refused (402: not enough in the account): wait. A network failure retries next tick.
+                Err(e) if matches!(e.downcast_ref::<crate::net::ApiError>(), Some(crate::net::ApiError::Server { status: 402, .. })) => {
+                    self.refused_at = now
+                }
+                Err(_) => {}
+            }
         }
         if self.wallet.passes(&crate::pass::current_period()).len() < self.policy.keep_passes {
             let _ = self.client.get_passes(&mut self.wallet, &key, self.policy.pass_batch).await;

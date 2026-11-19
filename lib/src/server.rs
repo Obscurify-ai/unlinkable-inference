@@ -49,6 +49,8 @@ pub enum GatewayError {
     /// These spent-voucher hashes were already spent; nothing was spent.
     Spent(Vec<String>),
     Status(StatusCode, &'static str, String),
+    /// A withdrawal the account can't cover: 402, with the whole cents it can.
+    Unaffordable(String, i64),
 }
 
 impl GatewayError {
@@ -64,6 +66,10 @@ impl GatewayError {
     }
     pub fn payment_required(message: impl Into<String>) -> Self {
         Self::Status(StatusCode::PAYMENT_REQUIRED, "insufficient_balance", message.into())
+    }
+    /// A withdrawal larger than the account holds; `available_cents` is what it can take.
+    pub fn unaffordable(message: impl Into<String>, available_cents: i64) -> Self {
+        Self::Unaffordable(message.into(), available_cents.max(0))
     }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Status(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message.into())
@@ -88,6 +94,7 @@ struct Answer(GatewayError, Vec<String>);
 
 impl IntoResponse for Answer {
     fn into_response(self) -> Response {
+        let mut available_cents = None;
         let (status, kind, message, spent) = match self.0 {
             GatewayError::Spent(hashes) => {
                 let spent: Vec<usize> = self
@@ -106,12 +113,17 @@ impl IntoResponse for Answer {
                 )
             }
             GatewayError::Status(status, kind, message) => (status, kind, message, Vec::new()),
+            GatewayError::Unaffordable(message, cents) => {
+                available_cents = Some(cents);
+                (StatusCode::PAYMENT_REQUIRED, "insufficient_balance", message, Vec::new())
+            }
         };
         let body = ErrorBody {
             error: ErrorDetail {
                 message,
                 kind: kind.to_string(),
                 spent,
+                available_cents,
             },
         };
         (status, Json(body)).into_response()
@@ -156,9 +168,11 @@ pub trait Backend: Send + Sync + 'static {
     }
     /// Spend `spends` (and `pass`, if given: answer 409 `pass_spent` if it was
     /// used before) and open a session holding their total, with the pass's
-    /// tier. If a session with `secret_hash` exists: when every voucher in
-    /// `spends` is already spent (a retry), return its status and spend
-    /// nothing; otherwise answer 409 `secret_taken` (another device's secret).
+    /// tier. If a session with `secret_hash` exists: when it was opened with exactly
+    /// these vouchers ([`open_digest`] matches: a retry), return its status and spend
+    /// nothing, with `repeat: true`; otherwise answer 409 `secret_taken` (another device's secret). Vouchers
+    /// merely being spent is not enough: devices sharing an account's wallet hold copies
+    /// of each other's vouchers and derive the same secrets.
     async fn open_session(
         &self,
         secret_hash: &str,
@@ -190,7 +204,9 @@ pub trait Backend: Send + Sync + 'static {
         let _ = (account_token, count, request_digest, answer, issued);
         Err(GatewayError::unavailable())
     }
-    /// Sessions still open, or closed and not marked done, oldest first.
+    /// Sessions closed and not marked done, or open and unused for
+    /// [`UNCLAIMED_AFTER_SECS`](crate::protocol::UNCLAIMED_AFTER_SECS), oldest first. Never one in
+    /// use: another device on the account rebuilding its wallet would close it.
     async fn unclaimed(&self) -> Result<Vec<UnclaimedSession>, GatewayError>;
     /// Forget a closed session (its holder has spent all its change). An
     /// open session is left alone.
@@ -657,6 +673,20 @@ async fn exchange(State(gw): Gw, Json(req): Json<ExchangeRequest>) -> Response {
     respond(run.await, &req.vouchers)
 }
 
+/// Which vouchers opened a session: SHA-256 over their spent hashes, sorted. A repeat open
+/// with the same secret is a retry only when this matches.
+pub fn open_digest(spends: &[Spend]) -> String {
+    let mut hashes: Vec<&str> = spends.iter().map(|s| s.hash.as_str()).collect();
+    hashes.sort_unstable();
+    crate::sha256_hex(hashes.join(","))
+}
+
+/// What a withdrawal may be: a fixed size, so most look alike, or what is left under $1, so no
+/// balance is stranded.
+pub fn withdrawable_amount(cents: i64) -> bool {
+    WITHDRAW_SIZES.contains(&cents) || (1..100).contains(&cents)
+}
+
 async fn withdraw(State(gw): Gw, headers: HeaderMap, Json(req): Json<WithdrawRequest>) -> Response {
     let run = async {
         ensure_enabled(&gw).await?;
@@ -667,9 +697,9 @@ async fn withdraw(State(gw): Gw, headers: HeaderMap, Json(req): Json<WithdrawReq
                 "Send the account's API key.".into(),
             )
         })?;
-        if !WITHDRAW_SIZES.contains(&req.amount_cents) {
+        if !withdrawable_amount(req.amount_cents) {
             return Err(GatewayError::bad_request(
-                "Withdrawals come in fixed sizes: $1, $5, $20, $50 or $100.",
+                "Withdrawals are $1, $5, $20, $50 or $100, or any amount under $1.",
             ));
         }
         check_blank_count(&req.blanks)?;

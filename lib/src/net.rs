@@ -226,6 +226,7 @@ impl Transport {
                         message: String::from_utf8_lossy(&body).chars().take(300).collect(),
                         kind: "unknown".into(),
                         spent: Vec::new(),
+                        available_cents: None,
                     },
                 }),
             })
@@ -444,7 +445,8 @@ impl Client {
             self.break_up(wallet, family, cents).await?;
         }
         let period = crate::pass::current_period();
-        for _attempt in 0..3 {
+        // Vouchers another device on the account spent turn up here; each round drops them.
+        for _attempt in 0..8 {
             // A pass, if we hold one for this month, gives the session our
             // plan's models. It is spent with the session.
             let pass = if self.keyset.pass_key.is_some() {
@@ -486,6 +488,13 @@ impl Client {
                 .json::<SessionStatus>(Request::post_json("/u/sessions", &req))
                 .await
             {
+                Ok(status) if status.repeat => {
+                    // Not ours: another device on the account opened this secret with these same
+                    // vouchers (a shared wallet's copy). They are spent; pick again.
+                    put_back(wallet, &pass);
+                    wallet.forget_session(&secret);
+                    wallet.save()?;
+                }
                 Ok(_) => {
                     wallet.save()?;
                     return Ok(Session { secret, family });
@@ -568,7 +577,7 @@ impl Client {
         match self
             .transport
             .json::<SessionStatus>(
-                Request::post_json("/u/sessions/topup", &TopupRequest { vouchers: codes })
+                Request::post_json("/u/sessions/topup", &TopupRequest { vouchers: codes.clone() })
                     .bearer(&session.secret),
             )
             .await
@@ -579,10 +588,14 @@ impl Client {
                 Ok(status)
             }
             Err(e) => {
-                if !matches!(e, ApiError::Server { status: 409, .. }) {
-                    wallet.add(session.family, vouchers);
-                    wallet.save()?;
-                }
+                // A 409 names the vouchers already spent (another device on the account spent
+                // them): nothing was spent this time, so the rest go back.
+                let spent: Vec<String> = match &e {
+                    ApiError::Server { status: 409, body } => body.error.spent.iter().filter_map(|&i| codes.get(i).cloned()).collect(),
+                    _ => Vec::new(),
+                };
+                wallet.add(session.family, vouchers.into_iter().filter(|v| !spent.contains(&v.encode())));
+                wallet.save()?;
                 Err(e.into())
             }
         }
@@ -634,11 +647,12 @@ impl Client {
             .await?)
     }
 
-    /// Move a fixed amount of account balance into the wallet.
+    /// Move account balance into the wallet: a fixed size ($1, $5, $20, $50, $100), or any
+    /// amount under $1.
     pub async fn withdraw(&self, wallet: &mut Wallet, api_key: &str, cents: i64) -> Result<i64> {
-        if !WITHDRAW_SIZES.contains(&cents) {
+        if !(WITHDRAW_SIZES.contains(&cents) || (1..100).contains(&cents)) {
             bail!(
-                "withdrawals come in fixed sizes: {}",
+                "withdrawals are {} or any amount under $1",
                 WITHDRAW_SIZES
                     .iter()
                     .map(|c| format!("${}", c / 100))
@@ -668,7 +682,17 @@ impl Client {
             pass_blanks: Vec::new(),
         });
         wallet.save()?;
-        let change = self.withdraw_with(api_key, cents, &blanks, nonce.as_deref()).await?;
+        let change = match self.withdraw_with(api_key, cents, &blanks, nonce.as_deref()).await {
+            Ok(change) => change,
+            Err(e) => {
+                // Refused (not enough balance, a bad request): nothing happened, nothing to retry.
+                if let Some(ApiError::Server { status: 400..=499, .. }) = e.downcast_ref::<ApiError>() {
+                    wallet.finish_pending(&id);
+                    wallet.save()?;
+                }
+                return Err(e);
+            }
+        };
         let vouchers = self.finish(&blanks, &change)?;
         match &nonce {
             Some(nonce) => wallet.add_from(Family::Paid, vouchers, &format!("w:{nonce}")),
@@ -677,6 +701,29 @@ impl Client {
         wallet.finish_pending(&id);
         wallet.save()?;
         Ok(change.change_cents)
+    }
+
+    /// Withdraw `cents`, or, when the account holds less, everything it has if that is at least
+    /// `min_cents` (all of it under $1, else the largest fixed size it covers). Returns the cents
+    /// moved; an account below `min_cents` is an error, and its balance stays in the account.
+    pub async fn withdraw_up_to(&self, wallet: &mut Wallet, api_key: &str, cents: i64, min_cents: i64) -> Result<i64> {
+        let err = match self.withdraw(wallet, api_key, cents).await {
+            Ok(got) => return Ok(got),
+            Err(e) => e,
+        };
+        let available = match err.downcast_ref::<ApiError>() {
+            Some(ApiError::Server { status: 402, body }) => body.error.available_cents,
+            _ => None,
+        };
+        let Some(available) = available.filter(|a| *a >= min_cents.max(1) && *a < cents) else {
+            return Err(err);
+        };
+        let take = if available < 100 {
+            available
+        } else {
+            WITHDRAW_SIZES.iter().copied().filter(|s| *s <= available).max().unwrap_or(100)
+        };
+        self.withdraw(wallet, api_key, take).await
     }
 
     async fn withdraw_with(
@@ -1086,6 +1133,14 @@ impl Client {
         let spent: std::collections::HashSet<String> = spent.hashes.into_iter().collect();
         let unspent = |message: &[u8]| !spent.contains(prefix(&crate::sha256_hex(message)));
 
+        // Vouchers already held that another device on the account has spent since go too.
+        let stale: Vec<String> = wallet
+            .vouchers()
+            .iter()
+            .filter(|h| !unspent(&h.voucher.message))
+            .map(|h| h.voucher.encode())
+            .collect();
+        wallet.forget(&stale);
         let mut cents = 0;
         let held: std::collections::HashSet<String> = wallet.vouchers().iter().map(|h| h.voucher.encode()).collect();
         for (family, vouchers, source) in found {

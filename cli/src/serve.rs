@@ -277,10 +277,18 @@ impl Proxy {
         }
         let mut wallet = self.wallet.lock().await;
         let mut failed = false;
+        // One wallet per account: what other devices withdrew, or got back as change from
+        // sessions they closed, comes first, before more is taken from the account.
+        if wallet.balance_cents(Family::Paid) < self.settings.keep_cents && self.client.seed.is_some() {
+            if let Err(e) = self.client.restore(&mut wallet, Some(&key)).await {
+                tracing::warn!("could not look for the account's other vouchers: {e:#}");
+            }
+        }
         if wallet.balance_cents(Family::Paid) < self.settings.keep_cents {
+            // The account's last cents (under $1) too, down to a session's 10¢.
             match self
                 .client
-                .withdraw(&mut wallet, &key, self.settings.refill_cents)
+                .withdraw_up_to(&mut wallet, &key, self.settings.refill_cents, 10)
                 .await
             {
                 Ok(c) => tracing::info!("topped up the wallet with {} from the account", dollars(c)),

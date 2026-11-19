@@ -22,7 +22,7 @@ request had to carry.
 
 | | Account | Payment | Address | Content |
 |---|---|---|---|---|
-| At withdrawal | yes | the amount (fixed sizes) | yes, unless hidden | blinded messages only |
+| At withdrawal | yes | the amount (fixed sizes, or the last of a balance under $1) | yes, unless hidden | blinded messages only |
 | At session use | no | no | yes, unless hidden | yes |
 
 What links a session to a withdrawal would have to be in what the server sees
@@ -70,6 +70,11 @@ use Tor or a VPN, or at least withdraw from a different network.
   Tor or a VPN the same address makes both, which links them.
 - **The web app**. Its scripts come from the server. The strong claim is the
   proxy and the Android app; the web gets published script hashes.
+- **One wallet per account**. Devices signed in with the same code share the wallet: a device
+  running low looks up the account's own withdrawals (already tied to the account) and the
+  anonymous lists of unclaimed sessions and spent vouchers, the same lookups as a restore. The
+  server learns nothing new: a session in use is never listed, so no device touches another's,
+  and which device spends a voucher is not visible.
 - **Loss**. Vouchers are bearer credit. A wallet seeded from the account
   number loses nothing: every voucher, pass and session secret is derived from
   the number, and the next sign-in rebuilds the wallet and closes stranded
