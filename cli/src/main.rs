@@ -90,10 +90,6 @@ enum Command {
     /// `POST /login`, `/generate_token` and `/create_account` take as
     /// `account_key`, so the server never sees the code.
     LoginKey,
-    /// Make a new account code here and print it with its login key (two
-    /// lines). Sign up with `POST /create_account {"accept_tos": true,
-    /// "account_key": "<login key>"}`; keep the code: it's the only way in.
-    AccountCode,
     /// Show the wallet
     Wallet,
     /// Move a fixed amount ($1, $5, $20, $50, $100) of account balance into
@@ -169,11 +165,6 @@ async fn main() -> Result<()> {
             .await?;
         }
         Command::Mcp(args) => mcp(&opts, args).await?,
-        Command::AccountCode => {
-            let code = unlinkable_inference::seed::new_account_code();
-            println!("{code}");
-            println!("{}", unlinkable_inference::seed::account_keys(&code)?.login_key);
-        }
         Command::LoginKey => {
             let mut number = String::new();
             std::io::stdin().read_to_string(&mut number)?;
