@@ -234,17 +234,14 @@ impl Wallet {
         let dust: Vec<usize> = (0..self.file.vouchers.len())
             .filter(|&i| self.file.vouchers[i].family == family && self.file.vouchers[i].voucher.dust)
             .collect();
-        let dust_cents = dust
-            .iter()
-            .map(|&i| self.file.vouchers[i].voucher.value_millicents())
-            .sum::<i64>()
-            / crate::denominations::MILLICENTS_PER_CENT;
         let mut mine: Vec<usize> = (0..self.file.vouchers.len())
             .filter(|&i| self.file.vouchers[i].family == family && !self.file.vouchers[i].voucher.dust)
             .collect();
         mine.sort_by_key(|&i| std::cmp::Reverse(self.file.vouchers[i].voucher.denomination_cents));
         let mut chosen = dust;
-        let mut left = cents - dust_cents;
+        // Dust always goes along, but counts for nothing towards a session's minimum on the
+        // server, so whole cents alone cover what was asked.
+        let mut left = cents;
         // Largest that fit first, then the smallest that covers what is left.
         for &i in &mine {
             let v = self.file.vouchers[i].voucher.denomination_cents;

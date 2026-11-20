@@ -269,7 +269,7 @@ const SEEDED_CLOSE_MAX_CENTS: i64 = 100_000;
 
 /// Withdrawals arrive in pieces of this size (seeded wallets), so a session
 /// never needs an exchange to get started.
-const PIECE_CENTS: i64 = 50;
+const PIECE_CENTS: i64 = 10;
 
 fn random_nonce() -> String {
     let mut bytes = [0u8; 16];
@@ -663,7 +663,9 @@ impl Client {
         let nonce = self.seed.as_ref().map(|_| random_nonce());
         let blanks = match (&self.seed, &nonce) {
             (Some(seed), Some(nonce)) => {
-                let pieces = (cents / PIECE_CENTS).min(20);
+                // Session-sized pieces (a session opens with 10¢ and has no change at opening):
+                // up to 40 of them, the rest split the standard way.
+                let pieces = (cents / PIECE_CENTS).min(40);
                 let mut values = vec![PIECE_CENTS; pieces as usize];
                 values.extend(split(cents - pieces * PIECE_CENTS));
                 let op = format!("withdraw:{nonce}");

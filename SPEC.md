@@ -121,6 +121,13 @@ or unused for 15 minutes (`UNCLAIMED_AFTER_SECS`), so a device never closes a se
 device is using. A voucher two devices hold is spent by whichever uses it first; the other gets
 409 `spent` (or `repeat`) and drops it.
 
+Clients open a conversation's session with the server's minimum (10¢) and top it up as it is
+used, so a small balance spreads over many open conversations; seeded withdrawals arrive in 10¢
+pieces for that. A device whose own quiet sessions hold the last of the money closes them for
+their change when nothing else can fund the conversation in use. After the account's code
+changes, a device that knew the old code or number keeps that seed and rebuilds with it too, so
+money withdrawn or left in sessions before the change is still found.
+
 ## Passes
 
 A pass proves "this session's holder has plan X this month" without saying

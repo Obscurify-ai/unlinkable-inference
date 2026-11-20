@@ -19,7 +19,8 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Policy {
-    /// What a session starts with.
+    /// What a session starts with: little, so a small balance spreads over many conversations
+    /// (a session that runs out is topped up, more each time).
     pub funding_cents: i64,
     /// Top the wallet up when it holds less than this...
     pub keep_cents: i64,
@@ -38,12 +39,14 @@ pub struct Policy {
     pub pass_batch: i64,
     /// Close a conversation's session after this long without a request.
     pub idle_secs: u64,
+    /// When nothing else can fund a conversation, close this device's sessions quiet this long.
+    pub quiet_secs: u64,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Policy {
-            funding_cents: 50,
+            funding_cents: 10,
             keep_cents: 50,
             refill_cents: 100,
             min_session_cents: 10,
@@ -52,6 +55,7 @@ impl Default for Policy {
             keep_passes: 10,
             pass_batch: 30,
             idle_secs: 300,
+            quiet_secs: 30,
         }
     }
 }
@@ -78,6 +82,13 @@ struct State {
     /// When the account last refused a top-up (Unix seconds), so a reload doesn't ask again at once
     #[serde(default)]
     refused_at: u64,
+    /// The seed this state was made with (hex), to notice when the account's code changes
+    #[serde(default)]
+    seed: Option<String>,
+    /// Seeds the account had before (its old number, an earlier code): money made with them
+    /// (withdrawals, sessions left open) is still the account's, found by rebuilding with each.
+    #[serde(default)]
+    previous_seeds: Vec<String>,
 }
 
 pub struct Manager {
@@ -91,6 +102,9 @@ pub struct Manager {
     pub api_key: Option<String>,
     refused_at: u64,
     shared_at: u64,
+    server: String,
+    seed_hex: String,
+    previous_seeds: Vec<String>,
 }
 
 impl Manager {
@@ -115,6 +129,13 @@ impl Manager {
             Some(_) => {}
             None => wallet.pin(Some(fp)),
         }
+        let seed_hex = hex::encode(seed.0);
+        let mut previous_seeds = st.previous_seeds.clone();
+        if let Some(old) = st.seed.as_ref().filter(|old| **old != seed_hex && !previous_seeds.contains(old)) {
+            // The account got a new code since this state was saved: keep the old seed too.
+            previous_seeds.insert(0, old.clone());
+            previous_seeds.truncate(4);
+        }
         Ok(Manager {
             client: Client::new(transport, keyset).with_seed(seed),
             wallet,
@@ -124,14 +145,24 @@ impl Manager {
             api_key: None,
             refused_at: st.refused_at,
             shared_at: 0,
+            server: server.to_string(),
+            seed_hex,
+            previous_seeds,
         })
     }
 
     /// Everything to save, as JSON.
     pub fn state(&self) -> String {
         let wallet = serde_json::from_str(&self.wallet.to_json()).ok();
-        serde_json::to_string(&State { wallet, chats: self.chats.clone(), replies: self.replies.clone(), refused_at: self.refused_at })
-            .unwrap_or_default()
+        serde_json::to_string(&State {
+            wallet,
+            chats: self.chats.clone(),
+            replies: self.replies.clone(),
+            refused_at: self.refused_at,
+            seed: Some(self.seed_hex.clone()),
+            previous_seeds: self.previous_seeds.clone(),
+        })
+        .unwrap_or_default()
     }
 
     /// At app start: sessions this device opened that no conversation uses
@@ -146,9 +177,45 @@ impl Manager {
                 let _ = self.client.close(&mut self.wallet, &Session { secret: open.secret, family: open.family }).await;
             }
         }
-        let got = self.client.restore(&mut self.wallet, self.api_key.as_deref()).await?;
+        let key = self.api_key.clone();
+        let got = self.client.restore(&mut self.wallet, key.as_deref()).await?;
+        let got = got + self.restore_previous(key.as_deref()).await;
         self.refill().await;
         Ok(got)
+    }
+
+    /// Rebuild with the account's earlier seeds too: what was withdrawn, or left in sessions,
+    /// before its code changed. Failures wait for the next time.
+    async fn restore_previous(&mut self, api_key: Option<&str>) -> i64 {
+        let mut got = 0;
+        for hex_seed in self.previous_seeds.clone() {
+            let Some(seed) = hex::decode(&hex_seed).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else { continue };
+            let old = Client::new(crate::net::Transport::new(&self.server), self.client.keyset.clone())
+                .with_seed(crate::seed::Seed(seed));
+            got += old.restore(&mut self.wallet, api_key).await.unwrap_or(0);
+        }
+        got
+    }
+
+    /// Close this device's sessions that have gone quiet (not `keep`) for their change: a small
+    /// balance spread over open conversations comes back to fund the one in use.
+    async fn free_quiet(&mut self, keep: Option<&str>) {
+        let now = unix_now();
+        let quiet: Vec<String> = self
+            .chats
+            .iter()
+            .filter(|(_, (secret, used))| Some(secret.as_str()) != keep && now.saturating_sub(*used) >= self.policy.quiet_secs)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for chat in quiet {
+            if let Some((secret, _)) = self.chats.remove(&chat) {
+                if self.replies.values().any(|s| *s == secret) {
+                    self.chats.insert(chat, (secret, now));
+                    continue; // a held reply still needs it
+                }
+                let _ = self.client.close(&mut self.wallet, &Session { secret, family: Family::Paid }).await;
+            }
+        }
     }
 
     /// The session secret for conversation `chat`, opening one if it has none.
@@ -163,7 +230,13 @@ impl Manager {
             Ok(s) => s,
             Err(_) => {
                 self.refill().await;
-                self.client.open(&mut self.wallet, Family::Paid, cents).await?
+                match self.client.open(&mut self.wallet, Family::Paid, cents).await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.free_quiet(None).await;
+                        self.client.open(&mut self.wallet, Family::Paid, cents).await?
+                    }
+                }
             }
         };
         self.chats.insert(chat.to_string(), (opened.secret.clone(), unix_now()));
@@ -187,7 +260,10 @@ impl Manager {
         let cents = self.policy.funding_cents << attempt.min(8);
         if self.client.topup(&mut self.wallet, &session, cents).await.is_err() {
             self.refill().await;
-            self.client.topup(&mut self.wallet, &session, cents).await?;
+            if self.client.topup(&mut self.wallet, &session, cents).await.is_err() {
+                self.free_quiet(Some(secret)).await;
+                self.client.topup(&mut self.wallet, &session, cents).await?;
+            }
         }
         Ok(())
     }
@@ -229,6 +305,7 @@ impl Manager {
         if low(self) && now.saturating_sub(self.shared_at) >= self.policy.share_every_secs {
             self.shared_at = now;
             let _ = self.client.restore(&mut self.wallet, Some(&key)).await;
+            self.restore_previous(Some(&key)).await;
         }
         if low(self) && now.saturating_sub(self.refused_at) >= self.policy.refused_backoff_secs {
             let min = self.policy.min_session_cents.min(self.policy.refill_cents);

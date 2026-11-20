@@ -663,16 +663,16 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     b.restore(&mut fresh, Some(&key)).await.unwrap();
     assert_eq!(fresh.balance_millicents(Family::Paid), had);
 
-    // The withdrawal is fully spent, so the server forgets it at once; the
-    // sessions are forgotten once their change is spent too.
+    // Once everything the withdrawal and the sessions gave is spent, the server forgets them;
+    // only the session whose change is still held stays.
     b.flush_done(&mut fresh, Some(&key)).await.unwrap();
-    let db = stack.backend.dump();
-    assert!(db["issued"].as_array().unwrap().iter().all(|i| i["kind"] == "passes"), "{}", db["issued"]);
-    assert_eq!(db["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(stack.backend.dump()["sessions"].as_array().unwrap().len(), 2);
     let s3 = b.open(&mut fresh, Family::Paid, had / 1000 + 1).await.unwrap();
+    assert_eq!(fresh.vouchers().iter().filter(|h| !h.voucher.dust).count(), 0, "everything went into s3");
     b.close(&mut fresh, &s3).await.unwrap();
     b.flush_done(&mut fresh, Some(&key)).await.unwrap();
     let db = stack.backend.dump();
+    assert!(db["issued"].as_array().unwrap().iter().all(|i| i["kind"] == "passes"), "{}", db["issued"]);
     let hashes: Vec<&str> = db["sessions"].as_array().unwrap().iter().map(|s| s["secret_hash"].as_str().unwrap()).collect();
     assert_eq!(hashes, vec![unlinkable_inference::sha256_hex(&s3.secret)], "only the session whose change is still held");
 }
@@ -848,30 +848,34 @@ async fn devices_on_one_account_share_one_wallet() {
     assert_eq!(echo(&stack.server, &p1).await, 200, "the phone chats on the shared wallet");
     assert_eq!(echo(&stack.server, &b1).await, 200, "the browser's session was never closed");
 
-    // The browser's held vouchers were spent by the phone: it drops them, finds nothing new in
-    // the shared wallet, and takes the account's last 50¢ (under $1 is allowed).
+    // Another conversation on the browser: sessions start small, so the shared dollar still
+    // covers it, with nothing more from the account.
     let b2 = browser.session("browser-chat-2").await.unwrap();
     assert_eq!(echo(&stack.server, &b2).await, 200);
-    assert_eq!(balance_cents(&stack.server, &key).await, 0, "the last 50¢ went into the wallet");
+    assert_eq!(balance_cents(&stack.server, &key).await, 50, "the shared wallet covered it");
 
     // The browser goes quiet and closes its sessions: their change is the phone's to spend too.
     browser.policy.idle_secs = 0;
     browser.policy.keep_cents = 0;
+    let held_before: Vec<String> = browser.wallet().vouchers().iter().map(|h| h.voucher.encode()).collect();
     browser.tick().await;
-    let change = browser.wallet().balance_millicents(Family::Paid);
-    assert!(change > 0, "the browser got change back");
+    let change: Vec<String> = browser
+        .wallet()
+        .vouchers()
+        .iter()
+        .map(|h| h.voucher.encode())
+        .filter(|c| !held_before.contains(c))
+        .collect();
+    assert!(!change.is_empty(), "the browser got change back");
     phone.policy.idle_secs = 0;
     phone.policy.keep_cents = 0;
     phone.tick().await; // closes the phone's own session for its change
-    let before = phone.wallet().balance_millicents(Family::Paid);
     phone.policy.keep_cents = 10_000; // low: look in the shared wallet
     phone.policy.share_every_secs = 0;
     phone.refill().await;
-    assert!(
-        phone.wallet().balance_millicents(Family::Paid) >= before + change,
-        "the browser's change is the phone's to spend: {} < {} + {}",
-        phone.wallet().balance_millicents(Family::Paid), before, change
-    );
+    let held: Vec<String> = phone.wallet().vouchers().iter().map(|h| h.voucher.encode()).collect();
+    let missing = change.iter().filter(|c| !held.contains(c)).count();
+    assert_eq!(missing, 0, "the browser's change is the phone's to spend too ({missing} of {} missing)", change.len());
 }
 
 /// No balance is stranded: 73¢ is spent privately, and 7¢ (below the 10¢ a session needs) stays
@@ -926,12 +930,102 @@ async fn a_refused_top_up_keeps_the_vouchers_that_were_not_spent() {
     let session = client.open(&mut wallet, Family::Paid, 50).await.unwrap();
     // Another device spends one of this wallet's vouchers.
     let mut copy = Wallet::from_json(&wallet.to_json()).unwrap();
-    let elsewhere = client.open(&mut copy, Family::Paid, 50).await.unwrap();
+    let elsewhere = client.open(&mut copy, Family::Paid, 10).await.unwrap();
     assert_ne!(elsewhere.secret, session.secret);
     let before = wallet.balance_millicents(Family::Paid);
-    assert!(client.topup(&mut wallet, &session, 100).await.is_err(), "refused: some were spent");
+    assert!(client.topup(&mut wallet, &session, 30).await.is_err(), "refused: some were spent");
     let after = wallet.balance_millicents(Family::Paid);
     assert!(after > 0 && after >= before - 50_000, "only the spent ones went: {before} -> {after}");
     // And the rest still top the session up.
     client.topup(&mut wallet, &session, 50).await.unwrap();
+}
+
+
+/// A dollar is many conversations: sessions start at 10¢ and grow as they are used, so two
+/// devices with four conversations open between them all chat on a $1 account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dollar_spreads_over_many_open_conversations_on_two_devices() {
+    use unlinkable_inference::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 100).await;
+    let seed = unlinkable_inference::seed::account_keys("5012 7743 1186 2209").unwrap().seed;
+    let mut phone = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
+    let mut browser = Manager::connect(&stack.server, seed, None).await.unwrap();
+    for m in [&mut phone, &mut browser] {
+        m.api_key = Some(key.clone());
+        m.start().await.unwrap();
+    }
+    for i in 0..4 {
+        let m = if i % 2 == 0 { &mut phone } else { &mut browser };
+        let s = m.session(&format!("chat-{i}")).await.expect("every conversation gets a session");
+        assert_eq!(echo(&stack.server, &s).await, 200, "chat {i}");
+    }
+}
+
+/// Money from before the account's code changed stays the account's: a device that knew the old
+/// number keeps its seed after entering the new code and still finds what was withdrawn under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn money_from_before_a_new_account_code_is_still_found() {
+    use unlinkable_inference::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 100).await;
+    let number = unlinkable_inference::seed::account_keys("7120 4433 0918 6652").unwrap().seed;
+    let code = unlinkable_inference::seed::account_keys("Q3RTN-8XW1K-ZD4PM-07HJ2").map(|k| k.seed).unwrap_or_else(|_| {
+        unlinkable_inference::seed::account_keys(&unlinkable_inference::seed::new_account_code()).unwrap().seed
+    });
+    // The phone, on the number, takes the dollar and spends 10¢ of it.
+    let mut phone = Manager::connect(&stack.server, number.clone(), None).await.unwrap();
+    phone.api_key = Some(key.clone());
+    phone.start().await.unwrap();
+    let s = phone.session("chat").await.unwrap();
+    assert_eq!(echo(&stack.server, &s).await, 200);
+    assert_eq!(balance_cents(&stack.server, &key).await, 0);
+    // The browser was signed in with the number too, then enters the new code.
+    let browser = Manager::connect(&stack.server, number, None).await.unwrap();
+    let saved = browser.state();
+    drop(browser);
+    let mut browser = Manager::connect(&stack.server, code, Some(&saved)).await.unwrap();
+    browser.api_key = Some(key.clone());
+    browser.policy.keep_cents = 100;
+    browser.start().await.unwrap();
+    assert!(browser.wallet().balance_cents(Family::Paid) >= 80, "the old number's withdrawal is found: {}", browser.wallet().balance_cents(Family::Paid));
+    let s = browser.session("chat").await.unwrap();
+    assert_eq!(echo(&stack.server, &s).await, 200);
+    assert!(browser.state().contains("previous_seeds"), "the old seed is kept");
+}
+
+/// When the wallet and the account are both empty, the money sitting in this device's quiet
+/// conversations comes back to fund the one in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiet_conversations_give_their_money_to_the_one_in_use() {
+    use unlinkable_inference::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 20).await;
+    let seed = unlinkable_inference::seed::account_keys("8834 2290 5571 0016").unwrap().seed;
+    let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.start().await.unwrap();
+    assert_eq!(m.wallet().balance_cents(Family::Paid), 20);
+    let short = |secret: String| {
+        let server = stack.server.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{server}/v1/chat/completions"))
+                .bearer_auth(secret)
+                .json(&json!({"model": "echo", "messages": [{"role": "user", "content": "hi"}]}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    for chat in ["a", "b"] {
+        let s = m.session(chat).await.unwrap();
+        assert_eq!(short(s).await, 200);
+    }
+    assert_eq!(balance_cents(&stack.server, &key).await, 0);
+    m.policy.quiet_secs = 0;
+    let s = m.session("c").await.expect("the quiet conversations' change funds it");
+    assert_eq!(short(s).await, 200);
 }
