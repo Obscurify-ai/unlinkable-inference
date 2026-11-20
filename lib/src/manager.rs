@@ -102,6 +102,8 @@ pub struct Manager {
     pub api_key: Option<String>,
     refused_at: u64,
     shared_at: u64,
+    /// The last look in the shared wallet found nothing new
+    share_empty: bool,
     server: String,
     seed_hex: String,
     previous_seeds: Vec<String>,
@@ -145,6 +147,7 @@ impl Manager {
             api_key: None,
             refused_at: st.refused_at,
             shared_at: 0,
+            share_empty: false,
             server: server.to_string(),
             seed_hex,
             previous_seeds,
@@ -290,22 +293,32 @@ impl Manager {
                 let _ = self.client.close(&mut self.wallet, &Session { secret, family: Family::Paid }).await;
             }
         }
-        self.refill().await;
+        self.top_up(false).await;
     }
 
     /// Top the wallet and passes up, and let the server forget records whose
     /// money is fully spent. Failures wait for the next tick.
     pub async fn refill(&mut self) {
+        self.top_up(true).await;
+    }
+
+    /// `refill`; `urgent` when a conversation is waiting for money. In the background (`tick`),
+    /// a wallet that stays low after a look found nothing looks again only after
+    /// `refused_backoff_secs`: an idle device on an empty account asks a few times an hour.
+    async fn top_up(&mut self, urgent: bool) {
         let Some(key) = self.api_key.clone() else { return };
         let now = unix_now();
         let low = |m: &Self| m.wallet.balance_cents(Family::Paid) < m.policy.keep_cents;
         // The wallet is the account's, not this device's: what another device withdrew, or got
         // back as change from a session it closed, is found from the shared seed first. Nothing
         // here names a chat: the lookups are the account's own records and anonymous lists.
-        if low(self) && now.saturating_sub(self.shared_at) >= self.policy.share_every_secs {
+        let every = if urgent || !self.share_empty { self.policy.share_every_secs } else { self.policy.refused_backoff_secs };
+        if low(self) && now.saturating_sub(self.shared_at) >= every {
             self.shared_at = now;
+            let before = self.wallet.balance_millicents(Family::Paid);
             let _ = self.client.restore(&mut self.wallet, Some(&key)).await;
             self.restore_previous(Some(&key)).await;
+            self.share_empty = self.wallet.balance_millicents(Family::Paid) <= before;
         }
         if low(self) && now.saturating_sub(self.refused_at) >= self.policy.refused_backoff_secs {
             let min = self.policy.min_session_cents.min(self.policy.refill_cents);

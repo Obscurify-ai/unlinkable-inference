@@ -903,10 +903,13 @@ async fn a_balance_under_a_dollar_is_spent_privately_and_crumbs_stay_in_the_acco
     assert_eq!(balance_cents(&stack.server, &key).await, 7, "crumbs stay in the account");
     assert!(m.session("chat").await.is_err(), "no session: the app pays from the account");
     let asked = withdraw_requests(&stack);
+    let looked = |stack: &Stack| stack.backend.dump()["requests"].as_array().unwrap().iter().filter(|r| r["path"] == "/u/issued").count();
+    let looks = looked(&stack);
     for _ in 0..5 {
         m.tick().await;
     }
     assert_eq!(withdraw_requests(&stack), asked, "a refusal isn't repeated every tick");
+    assert!(looked(&stack) <= looks + 1, "an idle device on an empty account doesn't keep searching the shared wallet");
     // A reload keeps the back-off too.
     let saved = m.state();
     let mut again = Manager::connect(&stack.server, seed, Some(&saved)).await.unwrap();
