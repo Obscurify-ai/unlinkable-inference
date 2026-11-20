@@ -55,13 +55,14 @@ fn rand_id() -> String {
 }
 
 async fn new_account(server: &str, cents: i64) -> String {
-    new_account_on(server, cents, "pay_as_you_go").await
+    new_account_with(server, cents, &[]).await
 }
 
-async fn new_account_on(server: &str, cents: i64, tier: &str) -> String {
+/// An account that can get passes for `labels`.
+async fn new_account_with(server: &str, cents: i64, labels: &[&str]) -> String {
     let v: Value = reqwest::Client::new()
         .post(format!("{server}/test/accounts"))
-        .json(&json!({"balance_cents": cents, "tier": tier}))
+        .json(&json!({"balance_cents": cents, "labels": labels}))
         .send()
         .await
         .unwrap()
@@ -263,7 +264,7 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
         let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
         assert_eq!(
             keys,
-            ["balance_usd", "closed_at", "family", "funded_millicents", "opened_at", "secret_hash", "spent_nano", "tier"],
+            ["balance_usd", "closed_at", "family", "funded_millicents", "labels", "opened_at", "secret_hash", "spent_nano"],
             "a session row holds nothing about who opened it"
         );
     }
@@ -357,68 +358,105 @@ async fn chat(url: &str, model: &str, text: &str) -> reqwest::Response {
         .unwrap()
 }
 
+async fn present_raw(server: &str, secret: &str, pass: &unlinkable_inference::pass::Pass) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{server}/u/sessions/pass"))
+        .bearer_auth(secret)
+        .json(&json!({"pass": pass.encode()}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_pass_gives_a_session_the_plan_models_without_naming_the_account() {
+async fn a_pass_gives_a_session_what_its_label_stands_for_without_naming_the_account() {
+    use unlinkable_inference_reference_server::{METERED, PASSES_PER_MONTH, PLUS};
     let stack = start_stack().await;
-    let pro = new_account_on(&stack.server, 2_000, "pro").await;
+    let key = new_account_with(&stack.server, 2_000, &[PLUS, METERED]).await;
     let opts = Options {
         server: stack.server.clone(),
         wallet: Some(temp_wallet()),
         pins: Vec::new(),
     };
-    let period = unlinkable_inference::pass::current_period();
     {
         let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
         let client = connect(&opts, &mut wallet).await.unwrap();
-        client.withdraw(&mut wallet, &pro, 500).await.unwrap();
-        // Asking for more than the month allows gets what is left.
-        let got = client.get_passes(&mut wallet, &pro, 3).await.unwrap();
-        assert_eq!(got, 3);
-        let got = client.get_passes(&mut wallet, &pro, 100).await.unwrap();
-        assert_eq!(got as i64, unlinkable_inference_reference_server::PASSES_PER_MONTH - 3);
-        assert_eq!(client.get_passes(&mut wallet, &pro, 1).await.unwrap(), 0);
-        assert_eq!(wallet.passes(&period).len() as i64, unlinkable_inference_reference_server::PASSES_PER_MONTH);
-        assert!(wallet.passes(&period).iter().all(|p| p.tier == "pro"));
+        client.withdraw(&mut wallet, &key, 500).await.unwrap();
+        // The account is told which labels it gets and how many of each are left.
+        let offered = client.pass_allowance(&key).await.unwrap();
+        let period = offered.period.clone();
+        let left = |a: &unlinkable_inference::protocol::PassAllowance, label: &str| {
+            a.labels.iter().find(|l| l.label == label).map(|l| l.remaining)
+        };
+        assert_eq!((left(&offered, PLUS), left(&offered, METERED)), (Some(PASSES_PER_MONTH), Some(PASSES_PER_MONTH)));
+        assert_eq!(client.get_passes(&mut wallet, &key, PLUS, &period, 3).await.unwrap(), 3);
+        assert_eq!(client.get_passes(&mut wallet, &key, PLUS, &period, PASSES_PER_MONTH - 3).await.unwrap() as i64, PASSES_PER_MONTH - 3);
+        // No more than the month allows, and no label the account doesn't get.
+        assert!(client.get_passes(&mut wallet, &key, PLUS, &period, 1).await.is_err());
+        assert!(client.get_passes(&mut wallet, &key, "gold", &period, 1).await.is_err());
+        assert!(wallet.pending().is_empty(), "a refused request leaves nothing to retry");
+        let offered = client.pass_allowance(&key).await.unwrap();
+        assert_eq!((left(&offered, PLUS), left(&offered, METERED)), (Some(0), Some(PASSES_PER_MONTH)));
+        assert_eq!(wallet.passes_of(&period, PLUS) as i64, PASSES_PER_MONTH);
 
-        // A pass opens one session. Putting a used one back (an old backup)
-        // gets it refused; the client drops it and uses the next one.
-        let before = wallet.passes(&period);
+        // A session opens with no pass, and shows one only when asked.
         let session = client.open(&mut wallet, Family::Paid, 50).await.unwrap();
-        assert_eq!(client.status(&session).await.unwrap().tier.as_deref(), Some("pro"));
-        client.close(&mut wallet, &session).await.unwrap();
+        assert!(client.status(&session).await.unwrap().labels.is_empty());
+        assert_eq!(wallet.passes_of(&period, PLUS) as i64, PASSES_PER_MONTH, "opening used none");
+        let before = wallet.passes(&period);
+        assert!(client.present_pass(&mut wallet, &session, PLUS).await.unwrap());
+        assert_eq!(client.status(&session).await.unwrap().labels, vec![PLUS.to_string()]);
         let after = wallet.passes(&period);
         let spent: Vec<_> = before.into_iter().filter(|p| !after.contains(p)).collect();
         assert_eq!(spent.len(), 1);
-        // Put the spent pass back, as if from an old backup, and make it the
-        // only one: the server refuses it and the session opens without a pass.
+        // A pass works once: on its own session again (a retry) nothing changes; on another
+        // session it is refused, and the client drops it (here it was the only one).
+        assert_eq!(present_raw(&stack.server, &session.secret, &spent[0]).await, 200);
+        let other = client.open(&mut wallet, Family::Paid, 50).await.unwrap();
+        assert_eq!(present_raw(&stack.server, &other.secret, &spent[0]).await, 409);
         let mut solo = Wallet::open(temp_wallet()).unwrap();
-        solo.add(Family::Paid, wallet.take(Family::Paid, 50));
         solo.add_passes(spent.clone());
-        let session = client.open(&mut solo, Family::Paid, 50).await.unwrap();
+        assert!(!client.present_pass(&mut solo, &other, PLUS).await.unwrap());
         assert!(solo.passes(&period).is_empty(), "the spent pass was dropped");
-        assert_eq!(client.status(&session).await.unwrap().tier, None);
-        client.close(&mut solo, &session).await.unwrap();
-        wallet.add(Family::Paid, solo.take(Family::Paid, 1000));
+        assert!(client.status(&other).await.unwrap().labels.is_empty());
+        // A label the wallet holds nothing of.
+        assert!(!client.present_pass(&mut wallet, &other, METERED).await.unwrap());
+        client.close(&mut wallet, &session).await.unwrap();
+        client.close(&mut wallet, &other).await.unwrap();
         assert_eq!(stack.backend.dump()["spent_passes"].as_array().unwrap().len(), 1);
         wallet.save().unwrap();
     }
 
-    let (proxy, url) = start_proxy(&opts, Settings::default()).await;
-    // A Pro-only model works in a session opened with a Pro pass.
-    let resp = chat(&url, "echo-pro", "plan model please").await;
+    let settings = Settings { account_key: Some(key.clone()), ..Settings::default() };
+    let (proxy, url) = start_proxy(&opts, settings).await;
+    proxy.refill(true).await;
+    // A model that needs a pass: the proxy shows one when the server asks, and the caller
+    // sees only the answer.
+    let resp = chat(&url, "echo-plus", "a model that needs a pass, please").await;
     assert_eq!(resp.status(), 200);
-    let st = status(&url).await;
-    assert_eq!(st["wallet"]["passes"], unlinkable_inference_reference_server::PASSES_PER_MONTH - 2);
+    assert!(resp.headers().get("x-pass-required").is_none());
+    // The same conversation again: the session has it already.
+    assert_eq!(chat(&url, "echo-plus", "a model that needs a pass, please").await.status(), 200);
+    assert_eq!(status(&url).await["wallet"]["pass_labels"][PLUS], PASSES_PER_MONTH - 2);
+    // A label that runs out: each pass covers two requests, so five requests take three.
+    for _ in 0..5 {
+        assert_eq!(chat(&url, "echo-metered", "a metered model").await.status(), 200);
+    }
+    assert_eq!(status(&url).await["wallet"]["pass_labels"][METERED], PASSES_PER_MONTH - 3);
+    // A conversation on a model that needs nothing shows nothing.
+    assert_eq!(chat(&url, "echo", "an open model").await.status(), 200);
     proxy.close_all().await;
 
-    // A pass works once.
     let db = stack.backend.dump();
-    assert_eq!(db["spent_passes"].as_array().unwrap().len(), 2);
-    let tiers: Vec<&Value> = db["sessions"].as_array().unwrap().iter().map(|s| &s["tier"]).collect();
-    assert_eq!(tiers.iter().filter(|t| **t == "pro").count(), 2);
+    assert_eq!(db["spent_passes"].as_array().unwrap().len(), 5);
+    let mut labels: Vec<String> = db["sessions"].as_array().unwrap().iter().map(|s| s["labels"].to_string()).collect();
+    labels.sort();
+    assert_eq!(labels, [r#"["metered"]"#, r#"["plus"]"#, r#"["plus"]"#, "[]", "[]"], "a session row holds only the labels it showed");
     // The account row records how many passes it got, nothing about which
-    // sessions used them; the session row records the tier, nothing else.
-    let account_hash = unlinkable_inference::sha256_hex(&pro);
+    // sessions used them.
+    let account_hash = unlinkable_inference::sha256_hex(&key);
     assert_eq!(db.to_string().matches(&account_hash).count(), 2);
     for p in db["spent_passes"].as_array().unwrap() {
         let hash = p["hash"].as_str().unwrap();
@@ -426,10 +464,38 @@ async fn a_pass_gives_a_session_the_plan_models_without_naming_the_account() {
     }
 }
 
+/// Who gets which passes is the server's business. On a model anyone can use, an account
+/// that gets every label and one that gets none look the same to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_a_pass_plan_models_are_refused_and_tiny_sessions_are_too() {
+async fn accounts_with_and_without_passes_look_the_same_until_a_pass_is_needed() {
+    use unlinkable_inference::manager::Manager;
+    use unlinkable_inference_reference_server::{METERED, PLUS};
     let stack = start_stack().await;
-    let payg = new_account(&stack.server, 1_000).await;
+    let mut rows = Vec::new();
+    for (labels, number) in [(&[PLUS, METERED][..], "1111 2222 3333 4444"), (&[][..], "5555 6666 7777 8888")] {
+        let key = new_account_with(&stack.server, 500, labels).await;
+        let seed = unlinkable_inference::seed::account_keys(number).unwrap().seed;
+        let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+        m.api_key = Some(key);
+        m.start().await.unwrap();
+        let secret = m.session("chat").await.unwrap();
+        assert_eq!(echo(&stack.server, &secret).await, 200);
+        let hash = unlinkable_inference::sha256_hex(&secret);
+        let db = stack.backend.dump();
+        let mut row = db["sessions"].as_array().unwrap().iter().find(|s| s["secret_hash"] == hash.as_str()).unwrap().clone();
+        for own in ["secret_hash", "opened_at"] {
+            row.as_object_mut().unwrap().remove(own);
+        }
+        rows.push(row);
+    }
+    assert_eq!(rows[0], rows[1], "the two sessions differ in nothing but their secrets");
+    assert!(stack.backend.dump()["spent_passes"].as_array().unwrap().is_empty(), "no pass was shown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_are_too() {
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 1_000).await;
     let opts = Options {
         server: stack.server.clone(),
         wallet: Some(temp_wallet()),
@@ -437,7 +503,7 @@ async fn without_a_pass_plan_models_are_refused_and_tiny_sessions_are_too() {
     };
     let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
     let client = connect(&opts, &mut wallet).await.unwrap();
-    client.withdraw(&mut wallet, &payg, 100).await.unwrap();
+    client.withdraw(&mut wallet, &key, 100).await.unwrap();
 
     // A session must hold at least 10¢: one of 5¢ is refused, and the
     // vouchers come back.
@@ -447,15 +513,26 @@ async fn without_a_pass_plan_models_are_refused_and_tiny_sessions_are_too() {
 
     wallet.save().unwrap();
     drop(wallet);
-    let (_proxy, url) = start_proxy(&opts, Settings { funding_cents: 20, ..Settings::default() }).await;
-    assert_eq!(chat(&url, "echo-pro", "x").await.status(), 403);
+    let settings = Settings { funding_cents: 20, account_key: Some(key), ..Settings::default() };
+    let (_proxy, url) = start_proxy(&opts, settings).await;
+    // The account gets no passes: the caller sees the server's refusal as it came.
+    let refused = chat(&url, "echo-plus", "x").await;
+    assert_eq!(refused.status(), 403);
+    assert_eq!(refused.headers().get("x-pass-required").unwrap(), "plus");
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!((&body["error"]["type"], &body["error"]["pass"]), (&json!("pass_required"), &json!("plus")));
     assert_eq!(chat(&url, "echo", "x").await.status(), 200);
+    // A server may ask for a pass and serve the request anyway when there is none (at
+    // another price, say): with none to show, the proxy sends the request once more.
+    assert_eq!(chat(&url, "echo-saver", "asked once").await.status(), 200);
+    let asked = stack.backend.dump()["requests"].as_array().unwrap().iter().filter(|r| r["path"] == "/v1/chat/completions").count();
+    assert_eq!(asked, 2 + 1 + 2, "echo-plus: refused, and again; echo; echo-saver: asked, then served");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_chat() {
     let stack = start_stack().await;
-    let key = new_account_on(&stack.server, 2_000, "pro").await;
+    let key = new_account_with(&stack.server, 2_000, &["plus"]).await;
     let opts = Options {
         server: stack.server.clone(),
         wallet: Some(temp_wallet()),
@@ -471,11 +548,11 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
     let resp = reqwest::Client::new()
         .post(format!("{url}/v1/chat/completions"))
         .header("authorization", format!("Bearer {key}"))
-        .json(&json!({"model": "echo-pro", "messages": [{"role": "user", "content": "hello"}]}))
+        .json(&json!({"model": "echo-plus", "messages": [{"role": "user", "content": "hello"}]}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "the plan model works, with nothing set up");
+    assert_eq!(resp.status(), 200, "the model that needs a pass works, with nothing set up");
     let st = status(&url).await;
     assert!(st["wallet"]["paid_cents"].as_i64().unwrap() > 0, "{st}");
     assert!(st["wallet"]["passes"].as_i64().unwrap() > 0);
@@ -503,7 +580,7 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
 async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session_secret() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let stack = start_stack().await;
-    let key = new_account(&stack.server, 2_000).await;
+    let key = new_account_with(&stack.server, 2_000, &["plus"]).await;
     let wallet = temp_wallet();
     let listen = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -547,9 +624,19 @@ async fn an_agent_attaches_the_mcp_server_and_talks_to_the_server_with_a_session
     let secret = get_key().await;
     assert!(secret.starts_with(unlinkable_inference::SESSION_SECRET_PREFIX), "{secret}");
 
+    let http = reqwest::Client::new();
+    // Nothing stands between the agent and the server to answer a request for a pass, so the
+    // helper session showed one of each label the account gets when it opened.
+    let resp = http
+        .post(format!("{}/v1/chat/completions", stack.server))
+        .bearer_auth(&secret)
+        .json(&json!({"model": "echo-plus", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
     // Straight to the server, no proxy in the way. 150k characters cost 30¢
     // of the session's 50¢.
-    let http = reqwest::Client::new();
     let resp = http
         .post(format!("{}/v1/chat/completions", stack.server))
         .bearer_auth(&secret)
@@ -610,7 +697,8 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     let stack = start_stack().await;
     // The dead device's open session counts as abandoned at once (normally after 15 quiet minutes).
     stack.backend.set_unclaimed_after(Duration::ZERO);
-    let key = new_account(&stack.server, 2_000).await;
+    let key = new_account_with(&stack.server, 2_000, &["plus"]).await;
+    let period = unlinkable_inference::pass::current_period();
     let keys = unlinkable_inference::seed::account_keys("4821 0937 5512 8846").unwrap();
     let keyset = Transport::new(&stack.server).fetch_keyset().await.unwrap();
     let client = || Client::new(Transport::new(&stack.server), keyset.clone()).with_seed(keys.seed.clone());
@@ -618,7 +706,7 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     let mut wallet = Wallet::in_memory();
 
     a.withdraw(&mut wallet, &key, 100).await.unwrap();
-    assert_eq!(a.get_passes(&mut wallet, &key, 3).await.unwrap(), 3);
+    assert_eq!(a.get_passes(&mut wallet, &key, "plus", &period, 3).await.unwrap(), 3);
     let chat = |secret: String| {
         let server = stack.server.clone();
         async move {
@@ -635,9 +723,11 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     // One session used and closed (its change is in the wallet), one used
     // and left open: the device dies before it can close it.
     let s1 = a.open(&mut wallet, Family::Paid, 50).await.unwrap();
+    assert!(a.present_pass(&mut wallet, &s1, "plus").await.unwrap());
     chat(s1.secret.clone()).await;
     a.close(&mut wallet, &s1).await.unwrap();
     let s2 = a.open(&mut wallet, Family::Paid, 50).await.unwrap();
+    assert!(a.present_pass(&mut wallet, &s2, "plus").await.unwrap());
     chat(s2.secret.clone()).await;
     let left_in_s2 = {
         let st = a.status(&s2).await.unwrap();
@@ -648,7 +738,7 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
         (nano + 999) / 1000
     };
     let had = wallet.balance_millicents(Family::Paid) + left_in_s2;
-    let passes_had = wallet.passes(&unlinkable_inference::pass::current_period()).len();
+    let passes_had = wallet.passes(&period).len();
     assert_eq!(passes_had, 1, "two of three passes went into sessions");
     drop(wallet);
 
@@ -657,7 +747,7 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     let mut fresh = Wallet::in_memory();
     b.restore(&mut fresh, Some(&key)).await.unwrap();
     assert_eq!(fresh.balance_millicents(Family::Paid), had, "every millicent is back");
-    assert_eq!(fresh.passes(&unlinkable_inference::pass::current_period()).len(), passes_had);
+    assert_eq!(fresh.passes_of(&period, "plus"), passes_had);
     assert!(b.status(&Session { secret: s2.secret.clone(), family: Family::Paid }).await.unwrap().closed);
     // Restoring again finds nothing new.
     b.restore(&mut fresh, Some(&key)).await.unwrap();
@@ -672,7 +762,7 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     b.close(&mut fresh, &s3).await.unwrap();
     b.flush_done(&mut fresh, Some(&key)).await.unwrap();
     let db = stack.backend.dump();
-    assert!(db["issued"].as_array().unwrap().iter().all(|i| i["kind"] == "passes"), "{}", db["issued"]);
+    assert!(db["issued"].as_array().unwrap().iter().all(|i| i["kind"] == "pass"), "{}", db["issued"]);
     let hashes: Vec<&str> = db["sessions"].as_array().unwrap().iter().map(|s| s["secret_hash"].as_str().unwrap()).collect();
     assert_eq!(hashes, vec![unlinkable_inference::sha256_hex(&s3.secret)], "only the session whose change is still held");
 }
@@ -750,67 +840,185 @@ async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_lo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn after_an_upgrade_the_plan_models_work_at_once_on_every_device() {
+async fn when_what_the_account_gets_changes_every_device_follows() {
     use unlinkable_inference::manager::Manager;
     let stack = start_stack().await;
     let key = new_account(&stack.server, 2_000).await;
     let seed = unlinkable_inference::seed::account_keys("5512 0937 6648 2201").unwrap().seed;
     let period = unlinkable_inference::pass::current_period();
-    let pro_chat = |secret: String| {
+    let plus_chat = |secret: String| {
         let server = stack.server.clone();
         async move {
-            reqwest::Client::new()
+            let r = reqwest::Client::new()
                 .post(format!("{server}/v1/chat/completions"))
                 .bearer_auth(secret)
-                .json(&json!({"model": "echo-pro", "messages": [{"role": "user", "content": "hi"}]}))
+                .json(&json!({"model": "echo-plus", "messages": [{"role": "user", "content": "hi"}]}))
                 .send()
                 .await
-                .unwrap()
-                .status()
-                .as_u16()
+                .unwrap();
+            (r.status().as_u16(), r.headers().get("x-pass-required").map(|v| v.to_str().unwrap().to_string()))
         }
     };
-    // The reference server gives 10 passes a month in all: small batches, so some are left
-    // after the upgrade. Holding more old passes than `keep_passes`, as a real wallet does
-    // (30 got, 10 kept), is what hid the new plan before.
+    let need = Some("plus".to_string());
+    let account_requests = |stack: &Stack| {
+        stack.backend.dump()["requests"].as_array().unwrap().iter().filter(|r| r["credential"] == "account").count()
+    };
     let small = |m: &mut Manager| {
         m.api_key = Some(key.clone());
         m.policy.keep_passes = 2;
         m.policy.pass_batch = 4;
     };
 
-    // On Pay As You Go the wallet stocks that plan's passes, and Pro models are refused.
+    // The account gets no passes: the wallet stocks none, and the model that needs one is
+    // refused. Asking again and again doesn't keep asking the account.
     let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
     small(&mut m);
     m.start().await.unwrap();
-    assert_eq!(m.wallet().passes_at(&period, "pay_as_you_go"), 4);
+    assert!(m.wallet().vouchers().len() > 0 && m.summary().1 == 0);
     let s = m.session("chat-a").await.unwrap();
-    assert_eq!(pro_chat(s.clone()).await, 403);
-    assert!(!m.not_on_plan(&s).await.unwrap(), "the plan really doesn't have it: show the error");
-    assert_eq!(m.wallet().passes_at(&period, "pay_as_you_go"), 3, "still more than keep_passes");
+    assert_eq!(plus_chat(s.clone()).await, (403, need.clone()));
+    assert!(!m.needs_pass(&s, "plus").await.unwrap(), "the account has none to give: show the error");
+    let asked = account_requests(&stack);
+    assert!(!m.needs_pass(&s, "plus").await.unwrap());
+    assert_eq!(account_requests(&stack), asked, "the account is asked about a label at most once a minute");
 
-    stack.backend.set_tier(&key, "pro");
+    // Billing gives the account the label (an upgrade).
+    stack.backend.set_labels(&key, &["plus"]);
 
-    // A new device rebuilds the wallet from the seed, the 3 old passes included. At start it
-    // asks the plan and stocks Pro passes: its very first conversation has the Pro models.
-    let mut phone = Manager::connect(&stack.server, seed, None).await.unwrap();
+    // A new device stocks the label at start, and shows a pass when its conversation is
+    // asked for one.
+    let mut phone = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
     small(&mut phone);
     phone.start().await.unwrap();
-    assert!(phone.wallet().passes_at(&period, "pro") >= 2);
+    assert_eq!(phone.wallet().passes_of(&period, "plus"), 4);
     let p = phone.session("chat-c").await.unwrap();
-    assert_eq!(pro_chat(p).await, 200);
+    assert_eq!(plus_chat(p.clone()).await, (403, need.clone()));
+    assert!(phone.needs_pass(&p, "plus").await.unwrap());
+    assert_eq!(plus_chat(p.clone()).await.0, 200);
+    assert_eq!(phone.wallet().passes_of(&period, "plus"), 3);
 
-    // The first device still remembers the old plan (it asks every 10 minutes): the
-    // conversation's 403 swaps its session for one with a Pro pass, and the retry works.
-    assert_eq!(pro_chat(s.clone()).await, 403);
-    assert!(m.not_on_plan(&s).await.unwrap(), "a session from before the upgrade: retry");
-    let s2 = m.session("chat-a").await.unwrap();
-    assert_ne!(s2, s);
-    assert_eq!(pro_chat(s2).await, 200);
-    // New conversations open with Pro passes first, though the old ones are still held.
+    // The first device still believes the account gets nothing (it asks every 10 minutes).
+    // A minute after its last refusal, the conversation's 403 makes it ask now: the same
+    // session gets a pass and the retry works. Nothing was closed or reopened.
+    m.policy.label_retry_secs = 0;
+    assert_eq!(plus_chat(s.clone()).await, (403, need.clone()));
+    assert!(m.needs_pass(&s, "plus").await.unwrap(), "the account gets the label now: retry");
+    assert_eq!(m.session("chat-a").await.unwrap(), s, "the conversation keeps its session");
+    assert_eq!(plus_chat(s.clone()).await.0, 200);
+    // Its other conversations have passes waiting.
     let s3 = m.session("chat-b").await.unwrap();
-    assert_eq!(pro_chat(s3).await, 200);
-    assert!(m.wallet().passes_at(&period, "pay_as_you_go") >= 3);
+    assert!(m.needs_pass(&s3, "plus").await.unwrap());
+    assert_eq!(plus_chat(s3).await.0, 200);
+
+    // A label used up for the month: sessions asked for it are told no without a word to the
+    // account (its request, right before the session's next one, would tie the two together).
+    {
+        let spender = new_account_with(&stack.server, 500, &["metered"]).await;
+        let seed = unlinkable_inference::seed::account_keys("7001 0937 6648 2201").unwrap().seed;
+        let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+        m.api_key = Some(spender);
+        m.policy.pass_batch = 100;
+        m.start().await.unwrap();
+        let all = unlinkable_inference_reference_server::PASSES_PER_MONTH as usize;
+        assert_eq!(m.wallet().passes_of(&period, "metered"), all, "the whole month's allowance");
+        let first = m.session("spender-0").await.unwrap();
+        for _ in 0..all {
+            assert!(m.needs_pass(&first, "metered").await.unwrap());
+        }
+        let before = account_requests(&stack);
+        for i in 1..4 {
+            let s = m.session(&format!("spender-{i}")).await.unwrap();
+            assert!(!m.needs_pass(&s, "metered").await.unwrap(), "none left this month");
+        }
+        assert_eq!(account_requests(&stack), before, "the account heard nothing when its sessions were refused");
+    }
+
+    // The label is taken away again (a downgrade): the wallet stops stocking it, and the
+    // passes already held work until the month ends.
+    stack.backend.set_labels(&key, &[]);
+    let held = phone.wallet().passes_of(&period, "plus");
+    assert!(held > 0);
+    phone.policy.labels_every_secs = 0;
+    phone.policy.keep_passes = 10;
+    phone.tick().await;
+    assert_eq!(phone.wallet().passes_of(&period, "plus"), held, "no more are fetched");
+    let p2 = phone.session("chat-d").await.unwrap();
+    assert!(phone.needs_pass(&p2, "plus").await.unwrap());
+    assert_eq!(plus_chat(p2).await.0, 200);
+}
+
+/// 0.1 clients said `tier` where 0.2 says `label`, in what they send and in what they save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_from_0_1_and_its_saved_wallet_still_work() {
+    use unlinkable_inference::manager::Manager;
+    use unlinkable_inference::net::{Client, Transport};
+    use unlinkable_inference::pass::PassBlank;
+    let stack = start_stack().await;
+    let key = new_account_with(&stack.server, 2_000, &["plus"]).await;
+    let keys = unlinkable_inference::seed::account_keys("9001 0937 6648 2201").unwrap();
+    let period = unlinkable_inference::pass::current_period();
+    let keyset = Transport::new(&stack.server).fetch_keyset().await.unwrap();
+    let http = reqwest::Client::new();
+
+    // What a 0.1 client sends for passes, and what it needs back.
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let blanks: Vec<PassBlank> = (0..2)
+        .map(|j| PassBlank::seeded(&keyset, "plus", &period, &keys.seed, format!("passes:{nonce}").as_bytes(), j).unwrap())
+        .collect();
+    let blinded: Vec<String> = blanks.iter().map(|b| unlinkable_inference::b64(&b.blinded)).collect();
+    let answer: Value = http
+        .post(format!("{}/u/passes", stack.server))
+        .bearer_auth(&key)
+        .json(&json!({"tier": "plus", "period": period, "blinded": blinded, "nonce": nonce}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(answer["tier"], "plus", "{answer}");
+    let old_pass = blanks[0].finish(&keyset, &unlinkable_inference::unb64(answer["blind_signatures"][0].as_str().unwrap()).unwrap()).unwrap();
+    // It opens a session with a pass, as 0.1 did for every session.
+    let secret = unlinkable_inference::new_session_secret();
+    let mut wallet = Wallet::in_memory();
+    let client = Client::new(Transport::new(&stack.server), keyset.clone()).with_seed(keys.seed.clone());
+    client.withdraw(&mut wallet, &key, 100).await.unwrap();
+    let vouchers: Vec<String> = wallet.take(Family::Paid, 10).iter().map(|v| v.encode()).collect();
+    let opened = http
+        .post(format!("{}/u/sessions", stack.server))
+        .json(&json!({"vouchers": vouchers, "secret_hash": unlinkable_inference::sha256_hex(&secret), "pass": old_pass.encode()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 200);
+    let r = http
+        .post(format!("{}/v1/chat/completions", stack.server))
+        .bearer_auth(&secret)
+        .json(&json!({"model": "echo-plus", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // Its record is kept under the kind it rebuilds from; a 0.2 client's under one it skips,
+    // so neither breaks the other's rebuild. A 0.2 client reads both.
+    let mut m = Manager::connect(&stack.server, keys.seed.clone(), None).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.policy.keep_passes = 2;
+    m.policy.pass_batch = 2;
+    m.start().await.unwrap();
+    let kinds: Vec<String> = stack.backend.dump()["issued"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap().to_string()).collect();
+    assert!(kinds.contains(&"passes".to_string()) && kinds.contains(&"pass".to_string()), "{kinds:?}");
+    assert_eq!(m.wallet().passes_of(&period, "plus"), 3, "the 0.1 device's unused pass, and two of its own");
+
+    // A wallet saved by 0.1 (passes carry `tier`) opens in 0.2 with its passes.
+    let saved = m.state();
+    assert!(saved.contains("\"label\":\"plus\""));
+    let old_state = saved.replace("\"label\":\"plus\"", "\"tier\":\"plus\"");
+    let mut again = Manager::connect(&stack.server, keys.seed, Some(&old_state)).await.unwrap();
+    again.api_key = Some(key);
+    assert_eq!(again.wallet().passes_of(&period, "plus"), 3);
+    let s = again.session("chat").await.unwrap();
+    assert!(again.needs_pass(&s, "plus").await.unwrap());
 }
 
 /// Two devices on one account opening many sessions in the same minute pick

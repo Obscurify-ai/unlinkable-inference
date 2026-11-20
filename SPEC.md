@@ -66,13 +66,14 @@ None of them reads a cookie or stores an IP. Errors are
 | `POST /u/sessions` | none | `{"vouchers": [codes], "secret_hash"}` | session status |
 | `GET /u/sessions/current` | session | | session status |
 | `POST /u/sessions/topup` | session | `{"vouchers": [codes]}` | session status |
+| `POST /u/sessions/pass` | session | `{"pass": code}` | session status |
 | `POST /u/sessions/close` | session | `{"blanks": [blanks]}` | change |
 | `POST /u/exchange` | none | `{"vouchers": [codes], "blanks": [blanks]}` | change |
 | `POST /u/withdraw` | account API key | `{"amount_cents", "blanks": [blanks]}` | change |
-| `GET /u/passes` | account API key | | `{"tier", "period", "remaining"}` |
-| `POST /u/passes` | account API key | `{"tier", "period", "blinded": [b64]}` | `{"tier", "period", "blind_signatures", "remaining"}` |
+| `GET /u/passes` | account API key | | `{"period", "labels": [{"label", "remaining"}]}` |
+| `POST /u/passes` | account API key | `{"label", "period", "blinded": [b64]}` | `{"label", "period", "blind_signatures", "remaining"}` |
 
-- **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed", "tier"?, "repeat"?}`.
+- **Session status**: `{"balance_usd", "family", "idle_timeout_seconds", "closed", "labels"?, "repeat"?}`.
 - **Change**: `{"change_cents", "family", "signed": [{"index", "blind_signature"}]}`;
   `index` points into the request's `blanks`.
 - **Session auth**: `Authorization: Bearer sk-unl1_<32 random bytes>`. The
@@ -90,9 +91,8 @@ Rules:
   `secret_taken`, nothing spent, pick another. Devices sharing an account's wallet
   derive the same secrets and hold copies of the same vouchers, so a client that
   gets `repeat` on a first try (not a retry after a lost response) treats it as
-  another device's session: those vouchers are spent, pick another secret. With `"pass"`, the session gets the
-  pass's tier (its plan's models); a pass opens one session (409
-  `pass_spent` after that) and only in its own month.
+  another device's session: those vouchers are spent, pick another secret. With `"pass"`, that pass
+  is presented as the session opens (see Passes).
 - **Close** rounds the balance **up** to the next millicent (a session never
   costs more than its tokens) and signs the standard split (largest first,
   1-2-5 steps) of it: whole cents from the normal blanks, the rest from dust
@@ -130,19 +130,52 @@ money withdrawn or left in sessions before the change is still found.
 
 ## Passes
 
-A pass proves "this session's holder has plan X this month" without saying
-which account. It is a partially blind RSA signature
-(draft-irtf-cfrg-partially-blind-rsa, SHA-384, PSS, deterministic) under the
-keyset's `pass_key`, with public metadata `unlinkable-inference-pass:v1:<tier>:<YYYY-MM>`;
-the client blinds against the key derived for that metadata. Tiers:
-`pay_as_you_go`, `casual`, `pro`. Text form:
-`obp1.<tier>.<YYYY-MM>.<message>.<signature>`, message 32 random bytes; spent
+A pass proves "this session's holder was given X this month" without saying
+which account. X is a **label**: 1 to 32 of `a-z`, `0-9`, `_`, `-`, chosen by
+the server for whatever it gives some accounts and not others (a group of
+models, an allowance). The protocol and this library give labels no meaning:
+which accounts get which labels, and what a label is good for, is the
+server's business.
+
+A pass is a partially blind RSA signature (draft-irtf-cfrg-partially-blind-rsa,
+SHA-384, PSS, deterministic) under the keyset's `pass_key`, with public
+metadata `unlinkable-inference-pass:v1:<label>:<YYYY-MM>`; the client blinds
+against the key derived for that metadata. Text form:
+`obp1.<label>.<YYYY-MM>.<message>.<signature>`, message 32 random bytes; spent
 as SHA-256(message).
 
-An account asks with its API key for passes at its own tier, for the current
-month, up to a monthly allowance set by the server. The server learns how many
-passes an account took, never which sessions used them. A repeat request with
-the same blinded messages gets the same answer.
+**Getting them.** `GET /u/passes` (account API key) lists the labels the
+account can get this month and how many of each are left. `POST /u/passes`
+asks for some with one label; the server signs them if the account gets that
+label (403 otherwise, 429 `pass_limit` past the month's allowance). It learns
+how many passes of each label an account took, never which sessions used
+them. A repeat request with the same blinded messages gets the same answer.
+Clients keep a small stock of each label and refill it in the background, so
+the moment an account asks says nothing about any one conversation.
+
+**Using them.** A session opens with no pass. When a request needs one the
+session has not presented, the server refuses it with **403**, the response
+header `X-Pass-Required: <label>`, and
+`{"error": {"type": "pass_required", "pass": "<label>", "message"}}`. The
+client presents one with that label (`POST /u/sessions/pass`, the session's
+secret) and sends the request again. With none to present it sends the request
+once more as it was (a server may then serve it another way, at another price),
+and shows the error if that is refused too.
+A server may ask again later (a label that stands for an allowance that runs
+out) or for another label; clients stop after a few rounds. A client never
+presents a pass it was not asked for, so a session shows only what its
+requests needed. A pass works once and only in its own month: presented again
+by the same session (a retry) nothing changes; by another, 409 `pass_spent`,
+and the client drops it and presents the next (devices sharing a wallet hold
+copies of the same passes).
+
+**0.1 clients** called the label `tier`: they send `{"tier", …}` to
+`POST /u/passes` and read `tier` in the answer, in `GET /u/passes`
+(`{"tier", "period", "remaining"}`) and in the session status, and present
+their pass in `POST /u/sessions`. The server module still accepts and answers
+in those words when asked that way, and a server's backend may name one label
+in `GET /u/passes` for them; their records in `GET /u/issued` keep the kind
+`passes` (0.2 clients' are `pass`, which 0.1 clients skip).
 
 ## Abuse limits
 

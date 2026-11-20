@@ -44,8 +44,11 @@ use Tor or a VPN, or at least withdraw from a different network.
   account into the wallet in fixed sizes.
 - **Chat → chat**: one session per conversation; turns within it are linked to
   each other only.
-- **Plan → chat**: passes. The server sees "a Pro session", never which Pro
-  account; the crowd is everyone on that plan that month.
+- **What an account is given → chat**: passes. Where the server gives some
+  accounts more than others (certain models, an allowance), a session proves
+  it with a pass. The server sees "a session that holds label X", never which
+  account; the crowd is everyone given that label that month. A session that
+  needs no pass shows none, so it hides among all sessions.
 - **Tagging a user with a unique key**: keysets are pinned; `unlinkable-inference verify`
   compares the keys the server gives you with your pins and the published pins.
 - **A website spending your wallet through the proxy**: the proxy refuses
@@ -66,7 +69,13 @@ use Tor or a VPN, or at least withdraw from a different network.
   client had a session before".
 - **Automatic top-ups**. With the account key, the proxy withdraws when the
   wallet runs low and fetches passes when they run low, in the background,
-  never at the moment a session opens (unless the wallet is empty). Without
+  never at the moment a session opens (unless the wallet is empty). The one
+  exception for passes: when a session is asked for a label the account was
+  not offered when last asked (its plan may have just changed), the client
+  asks the account right then (at most once a minute per label), and that
+  request and the session's next one are seconds apart. A label the account
+  gets but has used up for the month never causes this: the client already
+  knows there is none and says nothing to the account. Without
   Tor or a VPN the same address makes both, which links them.
 - **The web app**. Its scripts come from the server. The strong claim is the
   proxy and the Android app; the web gets published script hashes.
@@ -85,9 +94,19 @@ use Tor or a VPN, or at least withdraw from a different network.
 - **Abuse controls**. The server cannot ban a person in this mode, only refuse
   a session.
 
-## Passes leak the tier
+## Passes show their label
 
-A session opened with a pass shows its tier. On a plan with few users, or with
-an unusual number of sessions a month, that narrows things. The allowance is
-the same for everyone on a plan, and clients use a pass for every session
-they open, so pass counts carry no more than "has this plan".
+A session that presents a pass shows the label, and so belongs to the group of
+accounts given that label this month. A label few accounts get, or an unusual
+mix of labels in one session, narrows things. What limits it:
+
+- A session presents a pass only when the server asks for that label, so a
+  conversation that needs none looks like everyone else's.
+- The allowance of a label is the same for every account that gets it, so
+  pass counts carry no more than "gets this label".
+- Servers should keep labels few and broad, and tie them to what a request
+  needs (this model group), not to who the account is (this plan).
+
+The proxy's helper session (`unlinkable-inference key`, for agents that talk
+to the server directly) is the exception: nothing sees the server ask, so it
+presents one pass of each label the account gets when it opens.

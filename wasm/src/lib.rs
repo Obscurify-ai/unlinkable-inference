@@ -134,12 +134,12 @@ impl Manager {
         })
     }
 
-    /// A 403 (model not on the plan): true if the session had a lower plan's pass than the
-    /// account has now; it is replaced, so ask for a new session and retry.
-    #[wasm_bindgen(js_name = notOnPlan)]
-    pub fn not_on_plan(&self, secret: String) -> js_sys::Promise {
+    /// A 403 with the `x-pass-required` header: present a pass with that label for this
+    /// session. True: it has one now, send the request again.
+    #[wasm_bindgen(js_name = needsPass)]
+    pub fn needs_pass(&self, secret: String, label: String) -> js_sys::Promise {
         promise!(self, |m| {
-            let retry = m.not_on_plan(&secret).await.map_err(err)?;
+            let retry = m.needs_pass(&secret, &label).await.map_err(err)?;
             Ok(JsValue::from_bool(retry))
         })
     }

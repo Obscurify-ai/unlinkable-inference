@@ -106,8 +106,10 @@ pub struct Proxy {
     account_key: Mutex<Option<String>>,
     /// After a failed top-up, wait before trying again
     refill_backoff: Mutex<Option<std::time::Instant>>,
-    /// The account's plan tier as last asked (at most every 10 minutes), and when
-    plan: Mutex<Option<(String, std::time::Instant)>>,
+    /// The labels the account gets passes for, as last asked (at most every 10 minutes), and when
+    offered: tokio::sync::Mutex<Option<(unlinkable_inference::protocol::PassAllowance, std::time::Instant)>>,
+    /// label → when a session last needed one and there was none to present
+    refused_labels: Mutex<HashMap<String, std::time::Instant>>,
     /// The helper session's last seen balance (see [`Proxy::helper_secret`])
     helper_balance: Mutex<String>,
 }
@@ -229,7 +231,8 @@ impl Proxy {
             opening: tokio::sync::Mutex::new(()),
             account_key: Mutex::new(settings.account_key.clone()),
             refill_backoff: Mutex::new(None),
-            plan: Mutex::new(None),
+            offered: tokio::sync::Mutex::new(None),
+            refused_labels: Mutex::new(HashMap::new()),
             helper_balance: Mutex::new(String::new()),
             settings,
             opts,
@@ -301,34 +304,12 @@ impl Proxy {
                 }
             }
         }
-        if self.client.keyset.pass_key.is_some() {
-            let period = unlinkable_inference::pass::current_period();
-            // Only passes for the account's current plan count: ones got before an upgrade
-            // don't give its models.
-            let known = self.plan.lock().unwrap().clone().filter(|(_, at)| at.elapsed() < Duration::from_secs(600));
-            let tier = match known {
-                Some((tier, _)) => Some(tier),
-                None => match self.client.pass_allowance(&key).await {
-                    Ok(a) => {
-                        *self.plan.lock().unwrap() = Some((a.tier.clone(), std::time::Instant::now()));
-                        Some(a.tier)
-                    }
-                    Err(_) => None,
-                },
-            };
-            let held = match &tier {
-                Some(tier) => wallet.passes_at(&period, tier),
-                None => wallet.passes(&period).len(),
-            };
-            if held < self.settings.keep_passes {
-                match self.client.get_passes(&mut wallet, &key, 30).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!("got {n} passes for this month"),
-                    Err(e) => {
-                        failed = true;
-                        tracing::warn!("could not get passes: {e:#}");
-                    }
-                }
+        match self.stock(&mut wallet, &key, None, false).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("got {n} passes for this month"),
+            Err(e) => {
+                failed = true;
+                tracing::warn!("could not get passes: {e:#}");
             }
         }
         if self.client.seed.is_some() {
@@ -340,6 +321,60 @@ impl Proxy {
         }
         let _ = wallet.save();
         *self.refill_backoff.lock().unwrap() = failed.then(std::time::Instant::now);
+    }
+
+    /// Keep `keep_passes` of each label the account gets (only `only`, when given). The
+    /// account is asked which labels those are at most every 10 minutes, or now with `fresh`.
+    async fn stock(&self, wallet: &mut Wallet, key: &str, only: Option<&str>, fresh: bool) -> Result<usize> {
+        if self.client.keyset.pass_key.is_none() {
+            return Ok(0);
+        }
+        let mut offered = self.offered.lock().await;
+        if fresh || offered.as_ref().is_none_or(|(_, at)| at.elapsed() >= Duration::from_secs(600)) {
+            *offered = Some((self.client.pass_allowance(key).await?, std::time::Instant::now()));
+        }
+        let Some((allowance, _)) = offered.as_mut() else { return Ok(0) };
+        Ok(self.client.stock_passes(wallet, key, allowance, self.settings.keep_passes, 30, only).await)
+    }
+
+    /// The server asked this session for a pass with `label`: present one. With none held,
+    /// what the account was last told decides: a label it has used up for the month means no,
+    /// with no word to the account (its request right before this session's next one would
+    /// tie the two by their timing); one it wasn't offered may be new, so the account is
+    /// asked (at most once a minute per label) and some are fetched. False: none to present.
+    async fn present_pass(&self, entry: &Entry, label: &str) -> bool {
+        let mut wallet = self.wallet.lock().await;
+        match self.client.present_pass(&mut wallet, &entry.session, label).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("could not present a {label} pass: {e:#}");
+                return false;
+            }
+        }
+        let Some(key) = self.account_key.lock().unwrap().clone() else { return false };
+        let known = self
+            .offered
+            .lock()
+            .await
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(600))
+            .and_then(|(a, _)| a.labels.iter().find(|l| l.label == label))
+            .map(|l| l.remaining);
+        let fresh = match known {
+            Some(left) if left <= 0 => return false,
+            Some(_) => false,
+            None => {
+                let mut refused = self.refused_labels.lock().unwrap();
+                if refused.get(label).is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+                    return false;
+                }
+                refused.insert(label.to_string(), std::time::Instant::now());
+                true
+            }
+        };
+        let _ = self.stock(&mut wallet, &key, Some(label), fresh).await;
+        self.client.present_pass(&mut wallet, &entry.session, label).await.unwrap_or(false)
     }
 
     fn learn_account_key(&self, headers: &HeaderMap) {
@@ -408,7 +443,24 @@ impl Proxy {
                 _ => return Ok(entry.session.secret.clone()),
             }
         }
-        Ok(self.entry(HELPER).await?.session.secret.clone())
+        let entry = self.entry(HELPER).await?;
+        // Its requests go straight to the server, so nothing here sees the server ask for a
+        // pass: present one of each label the account gets now.
+        let key = self.account_key.lock().unwrap().clone();
+        let mut wallet = self.wallet.lock().await;
+        if let Some(key) = key {
+            let _ = self.stock(&mut wallet, &key, None, false).await;
+        }
+        let period = unlinkable_inference::pass::current_period();
+        let mut labels: Vec<String> = wallet.passes(&period).into_iter().map(|p| p.label).collect();
+        labels.sort();
+        labels.dedup();
+        for label in labels {
+            if let Err(e) = self.client.present_pass(&mut wallet, &entry.session, &label).await {
+                tracing::warn!("could not present a {label} pass for the helper session: {e:#}");
+            }
+        }
+        Ok(entry.session.secret.clone())
     }
 
     /// The helper session's requests never pass through here, so watch its
@@ -546,6 +598,8 @@ impl Proxy {
 
         let mut reopened = false;
         let mut topups = 0;
+        let mut presented = 0;
+        let mut none: Vec<String> = Vec::new();
         loop {
             let entry = match self.entry(&key).await {
                 Ok(e) => e,
@@ -581,6 +635,22 @@ impl Proxy {
                     }
                     continue;
                 }
+                403 if presented < 8 && response.header(unlinkable_inference::protocol::PASS_REQUIRED_HEADER).is_some() => {
+                    // The server wants a pass for this request: present one (it links only
+                    // to this session) and try again. With none to present, send it once more
+                    // as it was: a server may serve it another way (at another price).
+                    let label = response.header(unlinkable_inference::protocol::PASS_REQUIRED_HEADER).unwrap_or_default().to_string();
+                    if self.present_pass(&entry, &label).await {
+                        presented += 1;
+                        entry.busy.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    if !none.contains(&label) {
+                        none.push(label);
+                        entry.busy.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                }
                 401 if !reopened && !has_thread => {
                     // The session expired: close it for its change, start a new one.
                     entry.busy.fetch_sub(1, Ordering::SeqCst);
@@ -605,6 +675,10 @@ impl Proxy {
         let mut wallet = self.wallet.lock().await;
         let period = unlinkable_inference::pass::current_period();
         let passes = wallet.passes(&period);
+        let mut pass_labels = std::collections::BTreeMap::<String, usize>::new();
+        for p in &passes {
+            *pass_labels.entry(p.label.clone()).or_default() += 1;
+        }
         let sessions: Vec<Value> = self
             .sessions
             .lock()
@@ -637,7 +711,7 @@ impl Proxy {
                 "promo_cents": wallet.balance_cents(Family::Promo),
                 "vouchers": wallet.vouchers().len(),
                 "passes": passes.len(),
-                "pass_tier": passes.first().map(|p| p.tier.clone()),
+                "pass_labels": pass_labels,
             },
             "settings": {
                 "session_funding_cents": self.settings.funding_cents,
@@ -673,9 +747,15 @@ impl Proxy {
         self.client.withdraw(&mut wallet, api_key, cents).await
     }
 
+    /// Get up to `count` passes of each label the account gets.
     async fn passes(&self, api_key: &str, count: i64) -> Result<usize> {
         let mut wallet = self.wallet.lock().await;
-        self.client.get_passes(&mut wallet, api_key, count).await
+        let allowance = self.client.pass_allowance(api_key).await?;
+        let mut got = 0;
+        for l in &allowance.labels {
+            got += self.client.get_passes(&mut wallet, api_key, &l.label, &allowance.period, count.min(l.remaining)).await?;
+        }
+        Ok(got)
     }
 
     async fn import(&self, codes: &[String]) -> Result<i64> {
@@ -927,7 +1007,7 @@ async function load(){
  $('summary').innerHTML=`Server <code>${esc(s.server)}</code><br>`+
   `The server sees your IP address unless Tor or a VPN hides it. It never sees your account or how you paid.`+
   `<br>Keyset <code>${esc(s.keyset)}</code><br>Wallet ${usd(s.wallet.paid_cents)} paid, ${usd(s.wallet.promo_cents)} promo, in ${s.wallet.vouchers} vouchers`+
-  `<br>Passes this month: ${s.wallet.passes}${s.wallet.pass_tier?' ('+esc(s.wallet.pass_tier)+')':''}. Each new conversation uses one, so it gets your plan's models.`;
+  `<br>Passes this month: ${s.wallet.passes}${s.wallet.passes?' ('+Object.entries(s.wallet.pass_labels).map(([l,n])=>esc(l)+' '+n).join(', ')+')':''}. A conversation presents one when the server asks for it.`;
  $('sessions').innerHTML=s.sessions.length?s.sessions.map(x=>`${x.requests} request${x.requests==1?'':'s'}, open ${x.age_seconds}s, idle ${x.idle_seconds}s`).join('<br>'):'None. Sessions close after '+s.settings.idle_close_seconds+'s without a request; change goes back to the wallet.';
  $('traffic').innerHTML=s.traffic.map(t=>`<tr><td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><span class="server">server sees</span> ${esc(t.server_sees)}</td></tr>`).join('')||'<tr><td>Nothing sent yet.</td></tr>';
 }

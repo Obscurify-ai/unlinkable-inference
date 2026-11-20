@@ -23,16 +23,16 @@ use std::sync::Arc;
 use crate::{
     denominations::{pick_blanks, pick_dust_blanks, MILLICENTS_PER_CENT, WITHDRAW_SIZES},
     keyset::{Keyset, PassKeyInfo, VoucherKeyInfo, SCHEME},
-    pass::{current_period, Pass, TIERS},
+    pass::{current_period, valid_label, Pass},
     protocol::*,
     Family, Voucher,
 };
 
-/// A pass being used to open a session.
+/// A pass a session presents.
 #[derive(Debug, Clone)]
 pub struct PassUse {
     pub hash: String,
-    pub tier: String,
+    pub label: String,
     pub period: String,
 }
 
@@ -140,7 +140,7 @@ impl IntoResponse for GatewayError {
 /// with its answer, linked to the account, until the account says it is done.
 #[derive(Debug, Clone)]
 pub struct IssuedRecord {
-    /// "withdraw" or "passes"
+    /// "withdraw" or "pass" ("passes": asked for by a 0.1 client)
     pub kind: &'static str,
     pub nonce: String,
     pub request: serde_json::Value,
@@ -166,9 +166,8 @@ pub trait Backend: Send + Sync + 'static {
     async fn min_session_cents(&self) -> i64 {
         10
     }
-    /// Spend `spends` (and `pass`, if given: answer 409 `pass_spent` if it was
-    /// used before) and open a session holding their total, with the pass's
-    /// tier. If a session with `secret_hash` exists: when it was opened with exactly
+    /// Spend `spends` and open a session holding their total; with `pass`, as
+    /// [`Backend::present_pass`] in the same step. If a session with `secret_hash` exists: when it was opened with exactly
     /// these vouchers ([`open_digest`] matches: a retry), return its status and spend
     /// nothing, with `repeat: true`; otherwise answer 409 `secret_taken` (another device's secret). Vouchers
     /// merely being spent is not enough: devices sharing an account's wallet hold copies
@@ -180,8 +179,16 @@ pub trait Backend: Send + Sync + 'static {
         spends: &[Spend],
         pass: Option<&PassUse>,
     ) -> Result<SessionStatus, GatewayError>;
-    /// The tier and the passes left this month for the account `account_token`
-    /// authenticates.
+    /// A session presents a pass: mark it used and give the session what its
+    /// label stands for (the gateway has checked the signature and month). A
+    /// pass used before answers 409 `pass_spent`, except by this same session
+    /// (a retry), which changes nothing and succeeds.
+    async fn present_pass(&self, secret_hash: &str, pass: &PassUse) -> Result<SessionStatus, GatewayError> {
+        let _ = (secret_hash, pass);
+        Err(GatewayError::unavailable())
+    }
+    /// The labels the account `account_token` authenticates can get passes
+    /// for, and how many of each are left this month.
     async fn pass_allowance(
         &self,
         account_token: &str,
@@ -190,9 +197,9 @@ pub trait Backend: Send + Sync + 'static {
         let _ = (account_token, period);
         Err(GatewayError::unavailable())
     }
-    /// Count `count` passes against the account's monthly allowance and record
-    /// `answer` under `request_digest`, atomically; a repeat with the same
-    /// digest gets the stored answer.
+    /// Count `count` passes with `answer.label` against the account's monthly
+    /// allowance and record `answer` under `request_digest`, atomically; a
+    /// repeat with the same digest gets the stored answer.
     async fn record_passes(
         &self,
         account_token: &str,
@@ -270,9 +277,9 @@ pub trait Signer: Send + Sync + 'static {
     fn pass_key(&self) -> Option<PassKeyInfo> {
         None
     }
-    /// Sign a blinded pass for `tier` in `period`.
-    fn sign_pass(&self, tier: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let _ = (tier, period, blinded);
+    /// Sign a blinded pass with `label` for `period`.
+    fn sign_pass(&self, label: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let _ = (label, period, blinded);
         anyhow::bail!("this server does not issue passes")
     }
 }
@@ -434,7 +441,7 @@ fn blank_millicents(blank: &BlindedVoucher) -> i64 {
 }
 
 impl Gateway {
-    /// A pass that opens a session: valid signature, this month.
+    /// A pass a session presents: valid signature, this month.
     fn check_pass(&self, code: &str) -> Result<PassUse, GatewayError> {
         let pass = Pass::parse(code).ok_or_else(|| GatewayError::bad_request("That is not a pass."))?;
         if pass.period != current_period() {
@@ -448,7 +455,7 @@ impl Gateway {
         }
         Ok(PassUse {
             hash: pass.spent_hash(),
-            tier: pass.tier,
+            label: pass.label,
             period: pass.period,
         })
     }
@@ -489,21 +496,22 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
         if req.blinded.is_empty() || req.blinded.len() > 100 {
             return Err(GatewayError::bad_request("Ask for between 1 and 100 passes."));
         }
-        if !TIERS.contains(&req.tier.as_str()) || req.period != current_period() {
-            return Err(GatewayError::bad_request("Ask for passes for this month."));
+        let label = req.label().to_string();
+        if !valid_label(&label) || req.period != current_period() {
+            return Err(GatewayError::bad_request("Ask for passes with one label, for this month."));
         }
-        let mut digest = format!("passes|{}|{}", req.tier, req.period);
+        let mut digest = format!("passes|{label}|{}", req.period);
         for b in &req.blinded {
             digest.push('|');
             digest.push_str(b);
         }
         let digest = crate::sha256_hex(digest);
         let allowance = gw.backend.pass_allowance(&token, &req.period).await?;
-        if allowance.tier != req.tier {
+        if !allowance.labels.iter().any(|l| l.label == label) && allowance.tier.as_deref() != Some(&label) {
             return Err(GatewayError::Status(
                 StatusCode::FORBIDDEN,
                 "permission_error",
-                format!("This account gets {} passes.", allowance.tier),
+                format!("This account does not get {label} passes."),
             ));
         }
         // Signing first is safe: nothing counts until record_passes checks the
@@ -514,20 +522,34 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
                 .ok_or_else(|| GatewayError::bad_request("Invalid blinded pass."))?;
             let sig = gw
                 .signer
-                .sign_pass(&req.tier, &req.period, &blinded)
+                .sign_pass(&label, &req.period, &blinded)
                 .map_err(|e| GatewayError::bad_request(format!("Cannot sign that pass: {e}")))?;
             signatures.push(crate::b64(sig));
         }
         let answer = PassResponse {
+            label: label.clone(),
+            // A 0.1 client asked (it says `tier`): answer in its words, and record it under
+            // the kind it rebuilds from. It skips kinds it does not know.
             tier: req.tier.clone(),
             period: req.period.clone(),
             blind_signatures: signatures,
             remaining: 0,
         };
-        let issued = issued_record("passes", req.nonce.as_deref(), &req)?;
+        let kind = if req.tier.is_some() { "passes" } else { "pass" };
+        let issued = issued_record(kind, req.nonce.as_deref(), &req)?;
         gw.backend
             .record_passes(&token, req.blinded.len() as i64, &digest, &answer, issued.as_ref())
             .await
+    };
+    respond(run.await, &[])
+}
+
+async fn present_pass(State(gw): Gw, headers: HeaderMap, Json(req): Json<PresentPassRequest>) -> Response {
+    let run = async {
+        ensure_enabled(&gw).await?;
+        let hash = session_hash(&headers)?;
+        let pass = gw.check_pass(&req.pass)?;
+        gw.backend.present_pass(&hash, &pass).await
     };
     respond(run.await, &[])
 }
@@ -818,6 +840,7 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/u/sessions", post(open))
         .route("/u/sessions/current", get(current))
         .route("/u/sessions/topup", post(topup))
+        .route("/u/sessions/pass", post(present_pass))
         .route("/u/sessions/close", post(close))
         .route("/u/exchange", post(exchange))
         .route("/u/withdraw", post(withdraw))

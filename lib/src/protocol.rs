@@ -22,10 +22,26 @@ pub struct OpenSessionRequest {
     /// SHA-256 (hex) of a session secret the client picked. The secret itself
     /// is only ever sent as the bearer token on later requests.
     pub secret_hash: String,
-    /// A pass (`obp1.…`) for this month: the session gets that tier's models
+    /// A pass (`obp1.…`) to present as the session opens (the same as
+    /// `POST /u/sessions/pass` straight after)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass: Option<String>,
 }
+
+/// `POST /u/sessions/pass` (bearer: session secret): present a pass. The
+/// session gets whatever the server gives for its label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresentPassRequest {
+    pub pass: String,
+}
+
+/// A request that needs a pass the session has not presented is refused with
+/// 403, this response header naming the label, and
+/// `{"error": {"type": "pass_required", "pass": "<label>", …}}`. The client
+/// presents one (`POST /u/sessions/pass`) and sends the request again.
+pub const PASS_REQUIRED_HEADER: &str = "x-pass-required";
+/// The error `type` of that refusal.
+pub const PASS_REQUIRED: &str = "pass_required";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStatus {
@@ -35,7 +51,10 @@ pub struct SessionStatus {
     /// The session stops working after this long without a request
     pub idle_timeout_seconds: u64,
     pub closed: bool,
-    /// The plan tier a pass gave this session, if any
+    /// Labels of the passes this session has presented
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// 0.1 clients: the label of the pass the session opened with
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
     /// `POST /u/sessions` answered an open of a session that already existed (the same secret
@@ -45,11 +64,15 @@ pub struct SessionStatus {
     pub repeat: bool,
 }
 
-/// `POST /u/passes` (bearer: the account's own API key): blind passes for
-/// this month at the account's tier.
+/// `POST /u/passes` (bearer: the account's own API key): blind passes with
+/// one label for this month.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassRequest {
-    pub tier: String,
+    #[serde(default)]
+    pub label: String,
+    /// 0.1 clients send the label under this name (and get it back so)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     pub period: String,
     /// base64url blinded messages
     pub blinded: Vec<String>,
@@ -58,22 +81,45 @@ pub struct PassRequest {
     pub nonce: Option<String>,
 }
 
+impl PassRequest {
+    pub fn label(&self) -> &str {
+        self.tier.as_deref().unwrap_or(&self.label)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PassResponse {
-    pub tier: String,
+    #[serde(default)]
+    pub label: String,
+    /// 0.1 clients (see [`PassRequest::tier`])
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     pub period: String,
     /// Blind signatures, in request order (base64url)
     pub blind_signatures: Vec<String>,
-    /// Passes this account can still get this month
+    /// Passes with this label the account can still get this month
+    pub remaining: i64,
+}
+
+/// One label an account can get passes for, and how many are left this month.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LabelAllowance {
+    pub label: String,
     pub remaining: i64,
 }
 
 /// `GET /u/passes` (bearer: account key): what the account may ask for.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PassAllowance {
-    pub tier: String,
     pub period: String,
-    pub remaining: i64,
+    #[serde(default)]
+    pub labels: Vec<LabelAllowance>,
+    /// 0.1 clients read one label here (`tier`, `remaining`); servers that
+    /// never had such clients leave both out
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<i64>,
 }
 
 /// `POST /u/sessions/topup` (bearer: session secret)
@@ -171,7 +217,7 @@ pub struct UnclaimedSession {
 /// unblind them again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issued {
-    /// "withdraw" or "passes"
+    /// "withdraw" or "pass" ("passes": asked for by a 0.1 client)
     pub kind: String,
     pub nonce: String,
     /// Unix time it was made

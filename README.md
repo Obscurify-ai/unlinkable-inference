@@ -121,7 +121,7 @@ ANTHROPIC_MODEL=deepseek/deepseek-v4.1-flash claude
 
 OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, your usual key.
 The proxy uses that key for one thing: keeping the wallet (and this month's
-passes, on a plan) topped up in the background. Chats go out with a session
+passes, where the server gives the account any) topped up in the background. Chats go out with a session
 secret instead and are charged exactly their tokens, down to 0.001¢.
 
 `http://127.0.0.1:8899/_unlinkable` shows what the server received for each

@@ -101,11 +101,13 @@ enum Command {
         #[arg(long, env = "OBSCURIFY_API_KEY")]
         api_key: String,
     },
-    /// Get this month's passes for your plan (Casual or Pro), so sessions can
-    /// use your plan's models without saying which account they belong to.
-    /// One pass per session; get them ahead of time.
+    /// Get this month's passes: tokens a session shows when the server asks,
+    /// to prove the account was given something (certain models, an allowance)
+    /// without saying which account it is. The server names them with labels;
+    /// this gets some of each label the account can have. `serve` does it by
+    /// itself; get them ahead of time, not when a session needs one.
     Passes {
-        /// How many (at most what is left this month)
+        /// How many of each label (at most what is left this month)
         #[arg(long, default_value_t = 30)]
         count: i64,
         #[arg(long, env = "OBSCURIFY_API_KEY")]
@@ -190,12 +192,12 @@ async fn main() -> Result<()> {
         Command::Wallet => {
             let mut wallet = Wallet::open(opts.wallet_path())?;
             let period = unlinkable_inference::pass::current_period();
-            let passes = wallet.passes(&period);
+            let passes = pass_counts(&mut wallet, &period);
             println!("wallet   {}", wallet.path().display());
             println!("paid     {}", dollars(wallet.balance_cents(Family::Paid)));
             println!("promo    {}", dollars(wallet.balance_cents(Family::Promo)));
             println!("vouchers {}", wallet.vouchers().len());
-            println!("passes   {} for {period}", passes.len());
+            println!("passes   {passes}");
             println!("sessions {} left open", wallet.sessions().len());
             let since = |days: u64| -> i64 {
                 let cutoff = unlinkable_inference::unix_now().saturating_sub(days * 86_400);
@@ -223,15 +225,16 @@ async fn main() -> Result<()> {
             let _lock = lock_wallet(&opts)?;
             let mut wallet = Wallet::open(opts.wallet_path())?;
             let client = connect(&opts, &mut wallet).await?;
-            let got = client.get_passes(&mut wallet, &api_key, count).await?;
-            let period = unlinkable_inference::pass::current_period();
-            let held = wallet.passes(&period);
+            let allowance = client.pass_allowance(&api_key).await?;
+            let mut got = 0;
+            for l in &allowance.labels {
+                got += client.get_passes(&mut wallet, &api_key, &l.label, &allowance.period, count.min(l.remaining)).await?;
+            }
             wallet.save()?;
             println!(
-                "Got {got} pass{}. The wallet holds {} for {period} ({}).",
+                "Got {got} pass{}. The wallet holds {}.",
                 if got == 1 { "" } else { "es" },
-                held.len(),
-                held.first().map(|p| p.tier.as_str()).unwrap_or("none")
+                pass_counts(&mut wallet, &allowance.period)
             );
         }
         Command::Import { codes } => {
@@ -487,4 +490,18 @@ async fn verify(opts: &Options, published: Option<String>) -> Result<()> {
     }
     println!("\nAll checks passed.");
     Ok(())
+}
+
+/// "12 for 2026-11 (plus 10, metered 2)"
+fn pass_counts(wallet: &mut Wallet, period: &str) -> String {
+    let held = wallet.passes(period);
+    let mut by_label = std::collections::BTreeMap::<&str, usize>::new();
+    for p in &held {
+        *by_label.entry(p.label.as_str()).or_default() += 1;
+    }
+    let labels: Vec<String> = by_label.iter().map(|(l, n)| format!("{l} {n}")).collect();
+    match labels.is_empty() {
+        true => format!("0 for {period}"),
+        false => format!("{} for {period} ({})", held.len(), labels.join(", ")),
+    }
 }

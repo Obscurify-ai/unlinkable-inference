@@ -1,14 +1,17 @@
-//! Passes: proof that a session's holder has a plan this month, without
-//! saying which account.
+//! Passes: proof that a session's holder was given something this month,
+//! without saying which account.
 //!
 //! A pass is a partially blind RSA signature (draft-irtf-cfrg-partially-blind-rsa)
-//! under one master key, with the tier and the month as public metadata. The
-//! account asks for passes while signed in; the server sees the tier and month
-//! (it has to, to check the plan) but never the message. Opening a session
-//! with a pass gives that session the tier's model access. Each pass opens
-//! one session; an account gets a fixed number per month.
+//! under one master key, with a label and the month as public metadata. The
+//! label is the server's word for what the pass is good for (a group of
+//! models, an allowance): this library never reads meaning into it. The
+//! account asks for passes while signed in; the server sees the label and
+//! month (it decides which labels the account gets) but never the message.
+//! A session presents a pass when the server asks for one with that label.
+//! Each pass is used once; an account gets a fixed number of each label per
+//! month.
 //!
-//! `obp1.<tier>.<period>.<message>.<signature>`, period = `YYYY-MM` (UTC).
+//! `obp1.<label>.<period>.<message>.<signature>`, period = `YYYY-MM` (UTC).
 
 use crate::keyset::Keyset;
 use anyhow::{anyhow, Context, Result};
@@ -17,16 +20,16 @@ use blind_rsa_signatures::{BlindMessage, BlindSignature, BlindingResult, Default
 use serde::{Deserialize, Serialize};
 
 const PREFIX: &str = "obp1";
-pub const TIERS: [&str; 3] = ["pay_as_you_go", "casual", "pro"];
 
-/// A tier's place in `TIERS` (higher gives more models); unknown tiers rank lowest.
-pub fn rank(tier: &str) -> usize {
-    TIERS.iter().position(|t| *t == tier).unwrap_or(0)
+/// A label is 1 to 32 of `a-z`, `0-9`, `_` and `-`.
+pub fn valid_label(label: &str) -> bool {
+    (1..=32).contains(&label.len())
+        && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// The public metadata a pass is bound to.
-pub fn metadata(tier: &str, period: &str) -> Vec<u8> {
-    format!("unlinkable-inference-pass:v1:{tier}:{period}").into_bytes()
+pub fn metadata(label: &str, period: &str) -> Vec<u8> {
+    format!("unlinkable-inference-pass:v1:{label}:{period}").into_bytes()
 }
 
 /// `YYYY-MM` for a Unix time, UTC.
@@ -50,7 +53,9 @@ pub fn current_period() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pass {
-    pub tier: String,
+    /// (`tier` in wallets saved by 0.1)
+    #[serde(alias = "tier")]
+    pub label: String,
     pub period: String,
     #[serde(with = "crate::voucher::b64bytes")]
     pub message: Vec<u8>,
@@ -62,7 +67,7 @@ impl Pass {
     pub fn encode(&self) -> String {
         format!(
             "{PREFIX}.{}.{}.{}.{}",
-            self.tier,
+            self.label,
             self.period,
             crate::b64(&self.message),
             crate::b64(&self.signature)
@@ -78,16 +83,16 @@ impl Pass {
         if parts.next()? != PREFIX {
             return None;
         }
-        let tier = parts.next()?.to_string();
+        let label = parts.next()?.to_string();
         let period = parts.next()?.to_string();
         let message = crate::unb64(parts.next()?)?;
         let signature = crate::unb64(parts.next()?)?;
         (parts.next().is_none()
-            && TIERS.contains(&tier.as_str())
+            && valid_label(&label)
             && period.len() == 7
             && message.len() == 32)
             .then_some(Self {
-                tier,
+                label,
                 period,
                 message,
                 signature,
@@ -109,16 +114,17 @@ fn master(keyset: &Keyset) -> Result<PassPublicKey> {
     PassPublicKey::from_der(&der).map_err(|e| anyhow!("bad pass key: {e}"))
 }
 
-fn derived(keyset: &Keyset, tier: &str, period: &str) -> Result<PassPublicKey> {
+fn derived(keyset: &Keyset, label: &str, period: &str) -> Result<PassPublicKey> {
     master(keyset)?
-        .derive_public_key_for_metadata(&metadata(tier, period))
-        .map_err(|e| anyhow!("pass key for {tier} {period}: {e}"))
+        .derive_public_key_for_metadata(&metadata(label, period))
+        .map_err(|e| anyhow!("pass key for {label} {period}: {e}"))
 }
 
 /// A pass message blinded on the device, waiting for the server's signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassBlank {
-    pub tier: String,
+    #[serde(alias = "tier")]
+    pub label: String,
     pub period: String,
     #[serde(with = "crate::voucher::b64bytes")]
     pub message: Vec<u8>,
@@ -129,17 +135,17 @@ pub struct PassBlank {
 }
 
 impl PassBlank {
-    pub fn new(keyset: &Keyset, tier: &str, period: &str) -> Result<Self> {
+    pub fn new(keyset: &Keyset, label: &str, period: &str) -> Result<Self> {
         let mut message = vec![0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut message);
-        Self::build(keyset, tier, period, message, &mut DefaultRng)
+        Self::build(keyset, label, period, message, &mut DefaultRng)
     }
 
     /// The `j`th pass blank of operation `op`, derived from the seed (see
     /// [`crate::Blank::seeded`]).
     pub fn seeded(
         keyset: &Keyset,
-        tier: &str,
+        label: &str,
         period: &str,
         seed: &crate::seed::Seed,
         op: &[u8],
@@ -148,23 +154,23 @@ impl PassBlank {
         let j = j.to_be_bytes();
         let message = seed.derive(&[b"pass", op, &j]).to_vec();
         let mut rng = seed.rng(&[b"pass-blinding", op, &j]);
-        Self::build(keyset, tier, period, message, &mut rng)
+        Self::build(keyset, label, period, message, &mut rng)
     }
 
     fn build<R: blind_rsa_signatures::reexports::rsa::rand_core::CryptoRng + ?Sized>(
         keyset: &Keyset,
-        tier: &str,
+        label: &str,
         period: &str,
         message: Vec<u8>,
         rng: &mut R,
     ) -> Result<Self> {
-        let pk = derived(keyset, tier, period)?;
-        let meta = metadata(tier, period);
+        let pk = derived(keyset, label, period)?;
+        let meta = metadata(label, period);
         let blinding = pk
             .blind(rng, &message, Some(&meta))
             .map_err(|e| anyhow!("blinding failed: {e}"))?;
         Ok(Self {
-            tier: tier.to_string(),
+            label: label.to_string(),
             period: period.to_string(),
             message,
             blinded: blinding.blind_message.0,
@@ -173,13 +179,13 @@ impl PassBlank {
     }
 
     pub fn finish(&self, keyset: &Keyset, blind_signature: &[u8]) -> Result<Pass> {
-        let pk = derived(keyset, &self.tier, &self.period)?;
+        let pk = derived(keyset, &self.label, &self.period)?;
         let blinding = BlindingResult {
             blind_message: BlindMessage(self.blinded.clone()),
             secret: Secret(self.secret.clone()),
             msg_randomizer: None,
         };
-        let meta = metadata(&self.tier, &self.period);
+        let meta = metadata(&self.label, &self.period);
         let sig = pk
             .finalize(
                 &BlindSignature(blind_signature.to_vec()),
@@ -189,7 +195,7 @@ impl PassBlank {
             )
             .map_err(|e| anyhow!("the server's pass signature does not verify: {e}"))?;
         Ok(Pass {
-            tier: self.tier.clone(),
+            label: self.label.clone(),
             period: self.period.clone(),
             message: self.message.clone(),
             signature: sig.0,
@@ -197,12 +203,12 @@ impl PassBlank {
     }
 }
 
-/// Check a pass's signature for its tier and month.
+/// Check a pass's signature for its label and month.
 pub fn verify(keyset: &Keyset, pass: &Pass) -> bool {
-    let Ok(pk) = derived(keyset, &pass.tier, &pass.period) else {
+    let Ok(pk) = derived(keyset, &pass.label, &pass.period) else {
         return false;
     };
-    let meta = metadata(&pass.tier, &pass.period);
+    let meta = metadata(&pass.label, &pass.period);
     pk.verify(
         &blind_rsa_signatures::Signature(pass.signature.clone()),
         None,

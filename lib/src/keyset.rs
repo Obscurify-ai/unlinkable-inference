@@ -31,7 +31,7 @@ impl VoucherKeyInfo {
     }
 }
 
-/// The master key passes are signed under (tier and month are metadata).
+/// The master key passes are signed under (label and month are metadata).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassKeyInfo {
     pub key_id: String,

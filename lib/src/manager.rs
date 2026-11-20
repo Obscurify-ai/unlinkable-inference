@@ -8,8 +8,9 @@
 //! after every call; a crash between saves loses nothing, `start` restores
 //! it from the seed) and sends `session(chat)` as `Authorization: Bearer`.
 //! On a 402 it calls `ran_out` and retries; on a 401, `expired` and asks for a
-//! new session; on a 403 (model not on the plan), `not_on_plan`, and if that
-//! says so, asks for a new session and retries.
+//! new session; on a 403 that names a pass (the `x-pass-required` header),
+//! `needs_pass` with that label, then sends the request again: when that said
+//! no (none to show), once only, in case the server serves it another way.
 
 use crate::net::{Client, Session, Transport};
 use crate::seed::Seed;
@@ -35,12 +36,15 @@ pub struct Policy {
     /// The wallet is shared by every device with the account's code: when low, look for what the
     /// others withdrew or got back as change (at most this often) before taking more from the account.
     pub share_every_secs: u64,
-    /// Keep this many of this month's passes (on a plan), getting `pass_batch` at a time.
+    /// Keep this many of this month's passes of each label the account gets, asking for
+    /// `pass_batch` at a time.
     pub keep_passes: usize,
     pub pass_batch: i64,
-    /// Ask the account which plan it is on at most this often (a plan change shows within this),
-    /// so the passes kept are the current plan's.
-    pub plan_check_secs: u64,
+    /// Ask the account which labels it gets at most this often (a change shows within this).
+    pub labels_every_secs: u64,
+    /// A session needed a pass the wallet has none of: ask the account at most this often
+    /// (per label) whether it gets that label now.
+    pub label_retry_secs: u64,
     /// Close a conversation's session after this long without a request.
     pub idle_secs: u64,
     /// When nothing else can fund a conversation, close this device's sessions quiet this long.
@@ -58,7 +62,8 @@ impl Default for Policy {
             share_every_secs: 10,
             keep_passes: 10,
             pass_batch: 30,
-            plan_check_secs: 600,
+            labels_every_secs: 600,
+            label_retry_secs: 60,
             idle_secs: 300,
             quiet_secs: 30,
         }
@@ -109,8 +114,11 @@ pub struct Manager {
     shared_at: u64,
     /// The last look in the shared wallet found nothing new
     share_empty: bool,
-    /// The account's plan tier as last asked, and when (Unix seconds)
-    plan: Option<(String, u64)>,
+    /// The labels the account gets and how many of each are left, as last asked, and when
+    /// (Unix seconds)
+    offered: Option<(crate::protocol::PassAllowance, u64)>,
+    /// label → when a session last needed one the account could not give
+    refused_labels: BTreeMap<String, u64>,
     server: String,
     seed_hex: String,
     previous_seeds: Vec<String>,
@@ -155,7 +163,8 @@ impl Manager {
             refused_at: st.refused_at,
             shared_at: 0,
             share_empty: false,
-            plan: None,
+            offered: None,
+            refused_labels: BTreeMap::new(),
             server: server.to_string(),
             seed_hex,
             previous_seeds,
@@ -279,26 +288,65 @@ impl Manager {
         Ok(())
     }
 
-    /// The server refused a model to this session (403, not on the plan). If the session was
-    /// opened with a lower plan's pass than the account has now (passes got before an upgrade,
-    /// or none), it is closed for its change, passes for the current plan are fetched, and this
-    /// resolves to true: ask for a new session and retry. False: the plan doesn't include the
-    /// model; show the error.
-    pub async fn not_on_plan(&mut self, secret: &str) -> Result<bool> {
-        let Some(key) = self.api_key.clone() else { return Ok(false) };
+    /// The server asked this session for a pass with `label` (403 with the
+    /// `x-pass-required` header). Presents one from the wallet. With none held, what the
+    /// account was last told decides: a label it gets and has used up for the month means no,
+    /// with no word to the account (a request from the account right before this session's
+    /// next one would tie the two by their timing); a label it wasn't offered may be new (its
+    /// plan just changed), so the account is asked once (then at most every
+    /// `label_retry_secs`) and some are fetched.
+    /// True: the session has it, send the request again. False: the account has none to
+    /// give; send the request once more as it was (the server may serve it another way),
+    /// and show its error if it refuses again.
+    pub async fn needs_pass(&mut self, secret: &str, label: &str) -> Result<bool> {
         let session = Session { secret: secret.to_string(), family: Family::Paid };
-        let had = self.client.status(&session).await.ok().and_then(|s| s.tier);
-        let plan = self.client.pass_allowance(&key).await?.tier;
-        self.plan = Some((plan.clone(), unix_now()));
-        let had_rank = had.as_deref().map(|t| crate::pass::rank(t) as i64).unwrap_or(-1);
-        if had_rank >= crate::pass::rank(&plan) as i64 {
-            return Ok(false);
+        if self.client.present_pass(&mut self.wallet, &session, label).await? {
+            return Ok(true);
         }
-        self.chats.retain(|_, (s, _)| s != secret);
-        self.replies.retain(|_, s| s != secret);
-        let _ = self.client.close(&mut self.wallet, &session).await;
-        self.top_up(true).await;
-        Ok(self.wallet.passes_at(&crate::pass::current_period(), &plan) > 0)
+        let Some(key) = self.api_key.clone() else { return Ok(false) };
+        let now = unix_now();
+        let known = self
+            .offered
+            .as_ref()
+            .filter(|(_, at)| now.saturating_sub(*at) < self.policy.labels_every_secs)
+            .and_then(|(a, _)| a.labels.iter().find(|l| l.label == label))
+            .map(|l| l.remaining);
+        match known {
+            // Used up: nothing to ask.
+            Some(left) if left <= 0 => return Ok(false),
+            // Offered, and the stock ran out between two looks: fetch more.
+            Some(_) => {}
+            // Not offered when last asked (or never asked): it may be new.
+            None => {
+                let asked = self.refused_labels.get(label).copied().unwrap_or(0);
+                if now.saturating_sub(asked) < self.policy.label_retry_secs {
+                    return Ok(false);
+                }
+                self.refused_labels.insert(label.to_string(), now);
+                self.offered = None;
+            }
+        }
+        self.stock(&key, Some(label)).await;
+        self.client.present_pass(&mut self.wallet, &session, label).await
+    }
+
+    /// Keep `keep_passes` of each label the account gets (just `only`, when given).
+    async fn stock(&mut self, key: &str, only: Option<&str>) {
+        if self.client.keyset.pass_key.is_none() {
+            return;
+        }
+        let now = unix_now();
+        if self.offered.as_ref().is_none_or(|(_, at)| now.saturating_sub(*at) >= self.policy.labels_every_secs) {
+            match self.client.pass_allowance(key).await {
+                Ok(a) => self.offered = Some((a, now)),
+                Err(_) => return,
+            }
+        }
+        if let Some((allowance, _)) = self.offered.as_mut() {
+            self.client
+                .stock_passes(&mut self.wallet, key, allowance, self.policy.keep_passes, self.policy.pass_batch, only)
+                .await;
+        }
     }
 
     /// The server no longer takes this session (401): its conversation gets a new one.
@@ -361,21 +409,7 @@ impl Manager {
                 Err(_) => {}
             }
         }
-        // Keep passes for the plan the account is on now: ones got before an upgrade don't
-        // give its models, so they don't count (they stay, and are spent last).
-        if self.plan.as_ref().is_none_or(|(_, at)| now.saturating_sub(*at) >= self.policy.plan_check_secs) {
-            if let Ok(a) = self.client.pass_allowance(&key).await {
-                self.plan = Some((a.tier, now));
-            }
-        }
-        let period = crate::pass::current_period();
-        let held = match &self.plan {
-            Some((tier, _)) => self.wallet.passes_at(&period, tier),
-            None => self.wallet.passes(&period).len(),
-        };
-        if held < self.policy.keep_passes {
-            let _ = self.client.get_passes(&mut self.wallet, &key, self.policy.pass_batch).await;
-        }
+        self.stock(&key, None).await;
         let _ = self.client.flush_done(&mut self.wallet, Some(&key)).await;
     }
 

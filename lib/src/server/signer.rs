@@ -66,9 +66,9 @@ impl PassKey {
         self.info.clone()
     }
 
-    pub fn sign(&self, tier: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub fn sign(&self, label: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(blinded.len() == 256, "blinded pass has the wrong length");
-        let meta = crate::pass::metadata(tier, period);
+        let meta = crate::pass::metadata(label, period);
         let mut cache = self.derived.lock().unwrap();
         if !cache.contains_key(&meta) {
             let sk = self

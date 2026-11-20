@@ -300,22 +300,14 @@ impl Wallet {
             .collect()
     }
 
-    /// How many passes for `period` are at `tier` or higher. Passes from before the account
-    /// moved to a higher plan stay in the wallet but don't give the new plan's models.
-    pub fn passes_at(&self, period: &str, tier: &str) -> usize {
-        let want = crate::pass::rank(tier);
-        self.file
-            .passes
-            .iter()
-            .filter(|p| p.period == period && crate::pass::rank(&p.tier) >= want)
-            .count()
+    /// How many unused passes with `label` there are for `period`.
+    pub fn passes_of(&self, period: &str, label: &str) -> usize {
+        self.file.passes.iter().filter(|p| p.period == period && p.label == label).count()
     }
 
-    /// Take one pass for `period`, the highest tier first.
-    pub fn take_pass(&mut self, period: &str) -> Option<Pass> {
-        let i = (0..self.file.passes.len())
-            .filter(|&i| self.file.passes[i].period == period)
-            .max_by_key(|&i| crate::pass::rank(&self.file.passes[i].tier))?;
+    /// Take one pass with `label` for `period`.
+    pub fn take_pass(&mut self, period: &str, label: &str) -> Option<Pass> {
+        let i = self.file.passes.iter().position(|p| p.period == period && p.label == label)?;
         Some(self.file.passes.remove(i))
     }
 

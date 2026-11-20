@@ -444,24 +444,10 @@ impl Client {
         if self.seed.is_none() {
             self.break_up(wallet, family, cents).await?;
         }
-        let period = crate::pass::current_period();
         // Vouchers another device on the account spent turn up here; each round drops them.
         for _attempt in 0..8 {
-            // A pass, if we hold one for this month, gives the session our
-            // plan's models. It is spent with the session.
-            let pass = if self.keyset.pass_key.is_some() {
-                wallet.take_pass(&period)
-            } else {
-                None
-            };
-            let put_back = |wallet: &mut Wallet, pass: &Option<Pass>| {
-                if let Some(p) = pass {
-                    wallet.add_passes([p.clone()]);
-                }
-            };
             let vouchers = wallet.take(family, cents);
             if vouchers.is_empty() {
-                put_back(wallet, &pass);
                 wallet.save()?;
                 bail!(
                     "the wallet has no {} vouchers; withdraw or import some first",
@@ -481,7 +467,7 @@ impl Client {
             let req = OpenSessionRequest {
                 vouchers: codes.clone(),
                 secret_hash: crate::sha256_hex(&secret),
-                pass: pass.as_ref().map(Pass::encode),
+                pass: None,
             };
             match self
                 .transport
@@ -491,7 +477,6 @@ impl Client {
                 Ok(status) if status.repeat => {
                     // Not ours: another device on the account opened this secret with these same
                     // vouchers (a shared wallet's copy). They are spent; pick again.
-                    put_back(wallet, &pass);
                     wallet.forget_session(&secret);
                     wallet.save()?;
                 }
@@ -502,19 +487,11 @@ impl Client {
                 Err(ApiError::Server { status: 409, body }) if body.error.kind == "secret_taken" => {
                     // Another device on this account opened a session with
                     // this secret: nothing was spent, pick another.
-                    put_back(wallet, &pass);
-                    wallet.add(family, vouchers);
-                    wallet.forget_session(&secret);
-                    wallet.save()?;
-                }
-                Err(ApiError::Server { status: 409, body }) if body.error.kind == "pass_spent" => {
-                    // That pass was used already: drop it, nothing else was spent.
                     wallet.add(family, vouchers);
                     wallet.forget_session(&secret);
                     wallet.save()?;
                 }
                 Err(ApiError::Server { status: 409, body }) if !body.error.spent.is_empty() => {
-                    put_back(wallet, &pass);
                     // Some were spent already (another device, an old backup).
                     // Nothing was spent this time: drop those, keep the rest.
                     let spent: Vec<String> = body
@@ -529,7 +506,6 @@ impl Client {
                     wallet.save()?;
                 }
                 Err(e @ ApiError::Server { .. }) => {
-                    put_back(wallet, &pass);
                     wallet.add(family, vouchers);
                     wallet.forget_session(&secret);
                     wallet.save()?;
@@ -545,7 +521,6 @@ impl Client {
                     {
                         Ok(_) => return Ok(Session { secret, family }),
                         Err(_) => {
-                            put_back(wallet, &pass);
                             wallet.add(family, vouchers);
                             wallet.forget_session(&secret);
                             wallet.save()?;
@@ -599,6 +574,38 @@ impl Client {
                 Err(e.into())
             }
         }
+    }
+
+    /// The server asked this session for a pass with `label` (403,
+    /// [`PASS_REQUIRED_HEADER`]): present one from the wallet. False when the
+    /// wallet holds none for this month. A pass another device on the account
+    /// used already is dropped and the next one tried.
+    pub async fn present_pass(&self, wallet: &mut Wallet, session: &Session, label: &str) -> Result<bool> {
+        let period = crate::pass::current_period();
+        while let Some(pass) = wallet.take_pass(&period, label) {
+            let req = Request::post_json("/u/sessions/pass", &PresentPassRequest { pass: pass.encode() })
+                .bearer(&session.secret);
+            let mut answer = self.transport.json::<SessionStatus>(req.clone()).await;
+            if matches!(answer, Err(ApiError::Network(_))) {
+                // Unknown outcome: the same pass on the same session is safe to repeat.
+                answer = self.transport.json::<SessionStatus>(req).await;
+            }
+            match answer {
+                Ok(_) => {
+                    wallet.save()?;
+                    return Ok(true);
+                }
+                Err(ApiError::Server { status: 409, body }) if body.error.kind == "pass_spent" => {
+                    wallet.save()?;
+                }
+                Err(e) => {
+                    wallet.add_passes([pass]);
+                    wallet.save()?;
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Close a session and put its change in the wallet. Returns the change in cents.
@@ -829,7 +836,7 @@ impl Client {
             .await?)
     }
 
-    /// How many passes the account can still get this month, at which tier.
+    /// The labels the account can get passes for, and how many of each are left this month.
     pub async fn pass_allowance(&self, api_key: &str) -> Result<PassAllowance> {
         Ok(self
             .transport
@@ -837,26 +844,20 @@ impl Client {
             .await?)
     }
 
-    /// Get up to `count` passes for this month into the wallet. Do it ahead
-    /// of time: the server sees when the account asks.
-    pub async fn get_passes(&self, wallet: &mut Wallet, api_key: &str, count: i64) -> Result<usize> {
-        let allowance = self.pass_allowance(api_key).await?;
-        let count = count.min(allowance.remaining).max(0);
-        if count == 0 {
+    /// Get `count` passes with `label` for `period` (both from
+    /// [`Client::pass_allowance`]) into the wallet. Do it ahead of time: the
+    /// server sees when the account asks.
+    pub async fn get_passes(&self, wallet: &mut Wallet, api_key: &str, label: &str, period: &str, count: i64) -> Result<usize> {
+        if count <= 0 {
             return Ok(0);
         }
         let nonce = self.seed.as_ref().map(|_| random_nonce());
         let blanks: Vec<PassBlank> = (0..count)
             .map(|j| match (&self.seed, &nonce) {
-                (Some(seed), Some(nonce)) => PassBlank::seeded(
-                    &self.keyset,
-                    &allowance.tier,
-                    &allowance.period,
-                    seed,
-                    format!("passes:{nonce}").as_bytes(),
-                    j as u32,
-                ),
-                _ => PassBlank::new(&self.keyset, &allowance.tier, &allowance.period),
+                (Some(seed), Some(nonce)) => {
+                    PassBlank::seeded(&self.keyset, label, period, seed, format!("passes:{nonce}").as_bytes(), j as u32)
+                }
+                _ => PassBlank::new(&self.keyset, label, period),
             })
             .collect::<Result<_>>()?;
         let id = nonce.clone().unwrap_or_else(crate::new_session_secret);
@@ -870,7 +871,17 @@ impl Client {
             pass_blanks: blanks.clone(),
         });
         wallet.save()?;
-        let answer = self.passes_with(api_key, &blanks, nonce.as_deref()).await?;
+        let answer = match self.passes_with(api_key, &blanks, nonce.as_deref()).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                // Refused (none left, a label the account no longer gets): nothing to retry.
+                if let Some(ApiError::Server { status: 400..=499, .. }) = e.downcast_ref::<ApiError>() {
+                    wallet.finish_pending(&id);
+                    wallet.save()?;
+                }
+                return Err(e);
+            }
+        };
         let passes = self.finish_passes(&blanks, &answer)?;
         let got = passes.len();
         if let Some(nonce) = &nonce {
@@ -882,11 +893,49 @@ impl Client {
         Ok(got)
     }
 
+    /// Bring the wallet up to `keep` passes of each label in `allowance` (only `only`, when
+    /// given), asking for `batch` at a time, and count what was got off `allowance`. A label
+    /// the server says is used up (another device took the rest) counts as empty.
+    /// Returns how many passes were got.
+    pub async fn stock_passes(
+        &self,
+        wallet: &mut Wallet,
+        api_key: &str,
+        allowance: &mut PassAllowance,
+        keep: usize,
+        batch: i64,
+        only: Option<&str>,
+    ) -> usize {
+        // Passes from earlier months no longer work: drop them.
+        wallet.passes(&allowance.period);
+        let mut total = 0;
+        for l in allowance.labels.iter_mut().filter(|l| only.is_none_or(|o| o == l.label)) {
+            if l.remaining <= 0 || wallet.passes_of(&allowance.period, &l.label) >= keep {
+                continue;
+            }
+            match self.get_passes(wallet, api_key, &l.label, &allowance.period, batch.min(l.remaining)).await {
+                Ok(n) => {
+                    l.remaining -= n as i64;
+                    total += n;
+                }
+                // The month's allowance is used up (another device took the rest), or the account
+                // no longer gets this label. Anything else (a busy server, a rate limit) is
+                // tried again at the next look.
+                Err(e) if matches!(e.downcast_ref::<ApiError>(), Some(ApiError::Server { status, body }) if *status == 403 || body.error.kind == "pass_limit") => {
+                    l.remaining = 0
+                }
+                Err(_) => {}
+            }
+        }
+        total
+    }
+
     async fn passes_with(&self, api_key: &str, blanks: &[PassBlank], nonce: Option<&str>) -> Result<PassResponse> {
         let first = blanks.first().ok_or_else(|| anyhow!("no passes asked for"))?;
         let req = PassRequest {
             nonce: nonce.map(str::to_string),
-            tier: first.tier.clone(),
+            label: first.label.clone(),
+            tier: None,
             period: first.period.clone(),
             blinded: blanks.iter().map(|b| crate::b64(&b.blinded)).collect(),
         };
@@ -1083,12 +1132,12 @@ impl Client {
                         }
                         found.push((Family::Paid, self.finish(&blanks, &answer)?, format!("w:{}", it.nonce)));
                     }
-                    "passes" => {
+                    "pass" | "passes" => {
                         let req: PassRequest = serde_json::from_value(it.request)?;
                         let answer: PassResponse = serde_json::from_value(it.answer)?;
                         let op = format!("passes:{}", it.nonce);
                         let blanks = (0..req.blinded.len())
-                            .map(|j| PassBlank::seeded(&self.keyset, &req.tier, &req.period, &seed, op.as_bytes(), j as u32))
+                            .map(|j| PassBlank::seeded(&self.keyset, req.label(), &req.period, &seed, op.as_bytes(), j as u32))
                             .collect::<Result<Vec<_>>>()?;
                         if blanks.iter().zip(&req.blinded).any(|(b, w)| crate::b64(&b.blinded) != *w) {
                             continue;

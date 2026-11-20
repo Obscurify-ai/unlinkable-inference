@@ -21,7 +21,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use unlinkable_inference::protocol::{ChangeResponse, Issued, PassAllowance, PassResponse, SessionStatus, UnclaimedSession};
+use unlinkable_inference::protocol::{
+    ChangeResponse, Issued, LabelAllowance, PassAllowance, PassResponse, SessionStatus, UnclaimedSession, PASS_REQUIRED,
+    PASS_REQUIRED_HEADER,
+};
 use unlinkable_inference::{sha256_hex, Family};
 use unlinkable_inference::server::{
     signer::KeyStore,
@@ -29,7 +32,14 @@ use unlinkable_inference::server::{
 };
 
 /// Passes each account gets per month.
+/// Passes of each label an account gets a month.
 pub const PASSES_PER_MONTH: i64 = 10;
+/// `echo-plus` needs a session that presented a pass with this label.
+pub const PLUS: &str = "plus";
+/// `echo-metered` needs one pass with this label for every [`METERED_REQUESTS`] requests.
+/// (`echo-saver` asks a session for a `plus` pass once and serves it either way.)
+pub const METERED: &str = "metered";
+pub const METERED_REQUESTS: i64 = 2;
 
 /// Balances are kept in nanodollars (1e-9 USD).
 const NANO_PER_MILLICENT: i64 = 10_000;
@@ -56,7 +66,14 @@ struct SessionRow {
     balance_nano: i64,
     /// What the session's requests cost, in nanodollars
     spent_nano: i64,
-    tier: Option<String>,
+    /// Labels of the passes it presented
+    labels: Vec<String>,
+    /// Requests to `echo-metered` its passes still cover
+    #[serde(skip)]
+    metered_left: i64,
+    /// `echo-saver` asked it for a pass already
+    #[serde(skip)]
+    saver_asked: bool,
     opened_at: u64,
     closed_at: Option<u64>,
     #[serde(skip)]
@@ -71,8 +88,9 @@ struct SessionRow {
 #[derive(Debug, Clone, Serialize)]
 struct AccountRow {
     balance_cents: i64,
-    tier: String,
-    /// Passes issued per month
+    /// Labels it can get passes for
+    labels: Vec<String>,
+    /// Passes issued, per "month label"
     passes: HashMap<String, i64>,
 }
 
@@ -99,7 +117,8 @@ pub struct RequestRow {
 #[derive(Default)]
 struct Db {
     spent: HashMap<String, u64>,
-    spent_passes: HashMap<String, u64>,
+    /// pass hash → (when, the session that presented it)
+    spent_passes: HashMap<String, (u64, String)>,
     pass_answers: HashMap<String, PassResponse>,
     sessions: HashMap<String, SessionRow>,
     accounts: HashMap<String, AccountRow>,
@@ -139,7 +158,8 @@ impl MemoryBackend {
             family: row.family,
             idle_timeout_seconds: self.idle_timeout.as_secs(),
             closed: row.closed_at.is_some(),
-            tier: row.tier.clone(),
+            labels: row.labels.clone(),
+            tier: None,
             repeat: false,
         }
     }
@@ -160,9 +180,9 @@ impl MemoryBackend {
         Ok(spends.iter().map(|s| s.millicents).sum())
     }
 
-    /// A usable session for a model request: open and not idle too long.
-    /// Returns the tier its pass gave it.
-    fn usable(&self, secret_hash: &str) -> Result<Option<String>, GatewayError> {
+    /// A usable session for a request to `model`: open, not idle too long, and holding the
+    /// pass the model needs. `Ok(Err(label))`: it must present a pass with that label first.
+    fn usable(&self, secret_hash: &str, model: &str) -> Result<Result<(), &'static str>, GatewayError> {
         let mut db = self.db.lock().unwrap();
         let row = db
             .sessions
@@ -177,7 +197,42 @@ impl MemoryBackend {
             ));
         }
         row.last_used = Instant::now();
-        Ok(row.tier.clone())
+        if model == "echo-plus" && !row.labels.iter().any(|l| l == PLUS) {
+            return Ok(Err(PLUS));
+        }
+        if model == "echo-metered" {
+            if row.metered_left <= 0 {
+                return Ok(Err(METERED));
+            }
+            row.metered_left -= 1;
+        }
+        // A pass that is asked for but not insisted on: a session without `plus` is asked
+        // once, and served anyway when it comes back without one.
+        if model == "echo-saver" && !row.labels.iter().any(|l| l == PLUS) && !row.saver_asked {
+            row.saver_asked = true;
+            return Ok(Err(PLUS));
+        }
+        Ok(Ok(()))
+    }
+
+    /// Mark `pass` used by this session and give it what the label stands for.
+    fn take_pass(db: &mut Db, secret_hash: &str, pass: &PassUse) -> Result<(), GatewayError> {
+        match db.spent_passes.get(&pass.hash) {
+            Some((_, by)) if by == secret_hash => return Ok(()),
+            Some(_) => {
+                return Err(GatewayError::Status(StatusCode::CONFLICT, "pass_spent", "That pass was used already.".into()))
+            }
+            None => {}
+        }
+        let row = db.sessions.get_mut(secret_hash).filter(|r| r.closed_at.is_none()).ok_or_else(GatewayError::unauthorized)?;
+        if !row.labels.contains(&pass.label) {
+            row.labels.push(pass.label.clone());
+        }
+        if pass.label == METERED {
+            row.metered_left += METERED_REQUESTS;
+        }
+        db.spent_passes.insert(pass.hash.clone(), (unix(), secret_hash.to_string()));
+        Ok(())
     }
 
     fn charge(&self, secret_hash: &str, nano: i64) {
@@ -187,23 +242,24 @@ impl MemoryBackend {
         }
     }
 
-    pub fn create_account(&self, balance_cents: i64, tier: &str) -> String {
+    /// An account with play money that can get passes for `labels`.
+    pub fn create_account(&self, balance_cents: i64, labels: &[String]) -> String {
         let token = format!("sk-test_{}", unlinkable_inference::b64(rand::random::<[u8; 18]>()));
         self.db.lock().unwrap().accounts.insert(
             sha256_hex(&token),
             AccountRow {
                 balance_cents,
-                tier: tier.to_string(),
+                labels: labels.to_vec(),
                 passes: HashMap::new(),
             },
         );
         token
     }
 
-    /// Move an account to another plan (an upgrade or downgrade), as billing would.
-    pub fn set_tier(&self, token: &str, tier: &str) {
+    /// Change which labels an account gets from now on, as billing would.
+    pub fn set_labels(&self, token: &str, labels: &[&str]) {
         if let Some(a) = self.db.lock().unwrap().accounts.get_mut(&sha256_hex(token)) {
-            a.tier = tier.to_string();
+            a.labels = labels.iter().map(|l| l.to_string()).collect();
         }
     }
 
@@ -225,12 +281,12 @@ impl MemoryBackend {
         let db = self.db.lock().unwrap();
         json!({
             "spent_vouchers": db.spent.iter().map(|(h, at)| json!({"hash": h, "at": at})).collect::<Vec<_>>(),
-            "spent_passes": db.spent_passes.iter().map(|(h, at)| json!({"hash": h, "at": at})).collect::<Vec<_>>(),
+            "spent_passes": db.spent_passes.iter().map(|(h, (at, _))| json!({"hash": h, "at": at})).collect::<Vec<_>>(),
             "sessions": db.sessions.iter().map(|(h, s)| json!({
-                "secret_hash": h, "family": s.family, "funded_millicents": s.funded_millicents, "spent_nano": s.spent_nano, "tier": s.tier,
+                "secret_hash": h, "family": s.family, "funded_millicents": s.funded_millicents, "spent_nano": s.spent_nano, "labels": s.labels,
                 "balance_usd": usd(s.balance_nano), "opened_at": s.opened_at, "closed_at": s.closed_at,
             })).collect::<Vec<_>>(),
-            "accounts": db.accounts.iter().map(|(h, a)| json!({"token_hash": h, "balance_cents": a.balance_cents, "tier": a.tier, "passes_issued": a.passes})).collect::<Vec<_>>(),
+            "accounts": db.accounts.iter().map(|(h, a)| json!({"token_hash": h, "balance_cents": a.balance_cents, "labels": a.labels, "passes_issued": a.passes})).collect::<Vec<_>>(),
             "withdrawals": db.withdrawals,
             "signed_change": db.signed_change.iter().map(|(at, h)| json!({"at": at, "blinded_hashes": h})).collect::<Vec<_>>(),
             "requests": db.requests,
@@ -267,34 +323,36 @@ impl Backend for MemoryBackend {
             }
             return Err(GatewayError::Status(StatusCode::CONFLICT, "secret_taken", "That session secret is taken; pick another.".into()));
         }
-        if let Some(p) = pass {
-            if db.spent_passes.contains_key(&p.hash) {
-                return Err(GatewayError::Status(
-                    StatusCode::CONFLICT,
-                    "pass_spent",
-                    "That pass was used already.".into(),
-                ));
-            }
+        if pass.is_some_and(|p| db.spent_passes.contains_key(&p.hash)) {
+            return Err(GatewayError::Status(StatusCode::CONFLICT, "pass_spent", "That pass was used already.".into()));
         }
         let cents = Self::spend(&mut db, spends)?;
-        if let Some(p) = pass {
-            db.spent_passes.insert(p.hash.clone(), unix());
-        }
         let row = SessionRow {
             family,
             funded_millicents: cents,
             balance_nano: cents * NANO_PER_MILLICENT,
             spent_nano: 0,
-            tier: pass.map(|p| p.tier.clone()),
+            labels: Vec::new(),
+            metered_left: 0,
+            saver_asked: false,
             opened_at: unix(),
             closed_at: None,
             last_used: Instant::now(),
             close_answer: None,
             open_digest: digest,
         };
-        let status = self.status_of(&row);
         db.sessions.insert(secret_hash.to_string(), row);
-        Ok(status)
+        if let Some(p) = pass {
+            Self::take_pass(&mut db, secret_hash, p)?;
+        }
+        Ok(self.status_of(&db.sessions[secret_hash]))
+    }
+
+    async fn present_pass(&self, secret_hash: &str, pass: &PassUse) -> Result<SessionStatus, GatewayError> {
+        let mut db = self.db.lock().unwrap();
+        Self::take_pass(&mut db, secret_hash, pass)?;
+        let row = db.sessions.get(secret_hash).ok_or_else(GatewayError::unauthorized)?;
+        Ok(self.status_of(row))
     }
 
     async fn topup(
@@ -393,9 +451,16 @@ impl Backend for MemoryBackend {
             .get(&sha256_hex(account_token))
             .ok_or_else(GatewayError::unauthorized)?;
         Ok(PassAllowance {
-            tier: account.tier.clone(),
             period: period.to_string(),
-            remaining: PASSES_PER_MONTH - account.passes.get(period).copied().unwrap_or(0),
+            labels: account
+                .labels
+                .iter()
+                .map(|l| LabelAllowance {
+                    label: l.clone(),
+                    remaining: PASSES_PER_MONTH - account.passes.get(&format!("{period} {l}")).copied().unwrap_or(0),
+                })
+                .collect(),
+            ..Default::default()
         })
     }
 
@@ -415,7 +480,10 @@ impl Backend for MemoryBackend {
             .accounts
             .get_mut(&sha256_hex(account_token))
             .ok_or_else(GatewayError::unauthorized)?;
-        let used = account.passes.entry(answer.period.clone()).or_insert(0);
+        if !account.labels.contains(&answer.label) {
+            return Err(GatewayError::Status(StatusCode::FORBIDDEN, "permission_error", "This account does not get those passes.".into()));
+        }
+        let used = account.passes.entry(format!("{} {}", answer.period, answer.label)).or_insert(0);
         if *used + count > PASSES_PER_MONTH {
             return Err(GatewayError::Status(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -520,8 +588,9 @@ impl Backend for MemoryBackend {
         Ok(db
             .spent
             .iter()
-            .chain(db.spent_passes.iter())
-            .filter(|(_, at)| **at >= since)
+            .map(|(h, at)| (h, *at))
+            .chain(db.spent_passes.iter().map(|(h, (at, _))| (h, *at)))
+            .filter(|(_, at)| *at >= since)
             .map(|(h, _)| h.clone())
             .collect())
     }
@@ -635,12 +704,10 @@ async fn chat(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value
     let Some(session) = session_of(&headers) else {
         return GatewayError::unauthorized().into_response();
     };
-    let tier = match app.backend.usable(&session) {
-        Ok(t) => t,
+    match app.backend.usable(&session, body["model"].as_str().unwrap_or("echo")) {
+        Ok(Ok(())) => {}
+        Ok(Err(label)) => return pass_required(label),
         Err(e) => return e.into_response(),
-    };
-    if let Some(refusal) = plan_check(&body, tier.as_deref()) {
-        return refusal;
     }
     let words = reply_words(&body);
     app.backend.charge(&session, price(&body, &words));
@@ -668,12 +735,10 @@ async fn messages(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
     let Some(session) = session_of(&headers) else {
         return GatewayError::unauthorized().into_response();
     };
-    let tier = match app.backend.usable(&session) {
-        Ok(t) => t,
+    match app.backend.usable(&session, body["model"].as_str().unwrap_or("echo")) {
+        Ok(Ok(())) => {}
+        Ok(Err(label)) => return pass_required(label),
         Err(e) => return e.into_response(),
-    };
-    if let Some(refusal) = plan_check(&body, tier.as_deref()) {
-        return refusal;
     }
     let words = reply_words(&body);
     app.backend.charge(&session, price(&body, &words));
@@ -699,23 +764,24 @@ async fn messages(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
     .into_response()
 }
 
-/// `echo-pro` stands in for a model that needs a plan: only sessions opened
-/// with a Pro pass may use it.
-fn plan_check(body: &Value, tier: Option<&str>) -> Option<Response> {
-    (body["model"] == "echo-pro" && tier != Some("pro")).then(|| {
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": {"message": "echo-pro needs a Pro pass", "type": "permission_error"}})),
-        )
-            .into_response()
-    })
+/// The refusal a client answers by presenting a pass with `label` (`POST /u/sessions/pass`)
+/// and sending the request again.
+fn pass_required(label: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(PASS_REQUIRED_HEADER, label.to_string())],
+        Json(json!({"error": {"message": format!("This model needs a {label} pass."), "type": PASS_REQUIRED, "pass": label}})),
+    )
+        .into_response()
 }
 
 async fn models() -> Json<Value> {
     Json(json!({"object": "list", "data": [
         {"id": "echo", "object": "model"},
         {"id": "echo-slow", "object": "model"},
-        {"id": "echo-pro", "object": "model"},
+        {"id": "echo-plus", "object": "model"},
+        {"id": "echo-metered", "object": "model"},
+        {"id": "echo-saver", "object": "model"},
     ]}))
 }
 
@@ -723,12 +789,9 @@ async fn models() -> Json<Value> {
 struct NewAccount {
     #[serde(default = "default_balance")]
     balance_cents: i64,
-    #[serde(default = "default_tier")]
-    tier: String,
-}
-
-fn default_tier() -> String {
-    "pay_as_you_go".into()
+    /// Labels the account can get passes for (`plus`, `metered`, or anything)
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 fn default_balance() -> i64 {
@@ -737,11 +800,11 @@ fn default_balance() -> i64 {
 
 /// Test payment: an account with play money.
 async fn create_account(State(app): State<App>, Json(req): Json<NewAccount>) -> Json<Value> {
-    if !unlinkable_inference::pass::TIERS.contains(&req.tier.as_str()) {
-        return Json(json!({"error": {"message": "tier is pay_as_you_go, casual or pro"}}));
+    if !req.labels.iter().all(|l| unlinkable_inference::pass::valid_label(l)) {
+        return Json(json!({"error": {"message": "a label is 1 to 32 of a-z, 0-9, _ and -"}}));
     }
-    let token = app.backend.create_account(req.balance_cents, &req.tier);
-    Json(json!({"api_key": token, "balance_cents": req.balance_cents, "tier": req.tier}))
+    let token = app.backend.create_account(req.balance_cents, &req.labels);
+    Json(json!({"api_key": token, "balance_cents": req.balance_cents, "labels": req.labels}))
 }
 
 async fn account(State(app): State<App>, headers: HeaderMap) -> Response {
