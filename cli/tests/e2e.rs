@@ -529,6 +529,28 @@ async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_are_t
     assert_eq!(asked, 2 + 1 + 2, "echo-plus: refused, and again; echo; echo-saver: asked, then served");
 }
 
+/// A wallet that holds a few cents, less than a session can open with, is topped up when a
+/// request is waiting (it used to fail with the server's "at least 10¢" until the background
+/// top-up came round).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wallet_with_less_than_a_session_needs_is_topped_up_for_a_waiting_request() {
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 1_000).await;
+    let opts = Options { server: stack.server.clone(), wallet: Some(temp_wallet()), pins: Vec::new() };
+    {
+        let mut wallet = Wallet::open(opts.wallet_path()).unwrap();
+        let client = connect(&opts, &mut wallet).await.unwrap();
+        client.withdraw(&mut wallet, &key, 9).await.unwrap();
+        assert_eq!(wallet.balance_cents(Family::Paid), 9);
+        wallet.save().unwrap();
+    }
+    let settings = Settings { account_key: Some(key.clone()), ..Settings::default() };
+    let (proxy, url) = start_proxy(&opts, settings).await;
+    assert_eq!(chat(&url, "echo", "a few cents in the wallet").await.status(), 200);
+    assert_eq!(stack.backend.account_balance(&key), Some(1_000 - 9 - 100), "one $1 top-up");
+    proxy.close_all().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_chat() {
     let stack = start_stack().await;

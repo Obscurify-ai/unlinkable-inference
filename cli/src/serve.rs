@@ -404,16 +404,16 @@ impl Proxy {
         };
         let session = match opened {
             Ok(s) => s,
-            Err(e) if e.to_string().contains("has no") => {
-                // Empty wallet and a request waiting: top up now rather
-                // than fail (the background refill should prevent this).
+            Err(_) => {
+                // The wallet is empty, or holds less than a session's minimum, and a request
+                // is waiting: top up now rather than fail (the background refill should
+                // prevent this).
                 self.refill(true).await;
                 let mut wallet = self.wallet.lock().await;
                 self.client
                     .open(&mut wallet, family, self.settings.funding_cents)
                     .await?
             }
-            Err(e) => return Err(e),
         };
         let entry = Arc::new(Entry {
             session,
