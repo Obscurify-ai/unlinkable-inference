@@ -106,6 +106,8 @@ pub struct Proxy {
     account_key: Mutex<Option<String>>,
     /// After a failed top-up, wait before trying again
     refill_backoff: Mutex<Option<std::time::Instant>>,
+    /// The account's plan tier as last asked (at most every 10 minutes), and when
+    plan: Mutex<Option<(String, std::time::Instant)>>,
     /// The helper session's last seen balance (see [`Proxy::helper_secret`])
     helper_balance: Mutex<String>,
 }
@@ -227,6 +229,7 @@ impl Proxy {
             opening: tokio::sync::Mutex::new(()),
             account_key: Mutex::new(settings.account_key.clone()),
             refill_backoff: Mutex::new(None),
+            plan: Mutex::new(None),
             helper_balance: Mutex::new(String::new()),
             settings,
             opts,
@@ -300,7 +303,23 @@ impl Proxy {
         }
         if self.client.keyset.pass_key.is_some() {
             let period = unlinkable_inference::pass::current_period();
-            let held = wallet.passes(&period).len();
+            // Only passes for the account's current plan count: ones got before an upgrade
+            // don't give its models.
+            let known = self.plan.lock().unwrap().clone().filter(|(_, at)| at.elapsed() < Duration::from_secs(600));
+            let tier = match known {
+                Some((tier, _)) => Some(tier),
+                None => match self.client.pass_allowance(&key).await {
+                    Ok(a) => {
+                        *self.plan.lock().unwrap() = Some((a.tier.clone(), std::time::Instant::now()));
+                        Some(a.tier)
+                    }
+                    Err(_) => None,
+                },
+            };
+            let held = match &tier {
+                Some(tier) => wallet.passes_at(&period, tier),
+                None => wallet.passes(&period).len(),
+            };
             if held < self.settings.keep_passes {
                 match self.client.get_passes(&mut wallet, &key, 30).await {
                     Ok(0) => {}

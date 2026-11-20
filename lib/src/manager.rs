@@ -8,7 +8,8 @@
 //! after every call; a crash between saves loses nothing, `start` restores
 //! it from the seed) and sends `session(chat)` as `Authorization: Bearer`.
 //! On a 402 it calls `ran_out` and retries; on a 401, `expired` and asks for a
-//! new session.
+//! new session; on a 403 (model not on the plan), `not_on_plan`, and if that
+//! says so, asks for a new session and retries.
 
 use crate::net::{Client, Session, Transport};
 use crate::seed::Seed;
@@ -37,6 +38,9 @@ pub struct Policy {
     /// Keep this many of this month's passes (on a plan), getting `pass_batch` at a time.
     pub keep_passes: usize,
     pub pass_batch: i64,
+    /// Ask the account which plan it is on at most this often (a plan change shows within this),
+    /// so the passes kept are the current plan's.
+    pub plan_check_secs: u64,
     /// Close a conversation's session after this long without a request.
     pub idle_secs: u64,
     /// When nothing else can fund a conversation, close this device's sessions quiet this long.
@@ -54,6 +58,7 @@ impl Default for Policy {
             share_every_secs: 10,
             keep_passes: 10,
             pass_batch: 30,
+            plan_check_secs: 600,
             idle_secs: 300,
             quiet_secs: 30,
         }
@@ -104,6 +109,8 @@ pub struct Manager {
     shared_at: u64,
     /// The last look in the shared wallet found nothing new
     share_empty: bool,
+    /// The account's plan tier as last asked, and when (Unix seconds)
+    plan: Option<(String, u64)>,
     server: String,
     seed_hex: String,
     previous_seeds: Vec<String>,
@@ -148,6 +155,7 @@ impl Manager {
             refused_at: st.refused_at,
             shared_at: 0,
             share_empty: false,
+            plan: None,
             server: server.to_string(),
             seed_hex,
             previous_seeds,
@@ -271,6 +279,28 @@ impl Manager {
         Ok(())
     }
 
+    /// The server refused a model to this session (403, not on the plan). If the session was
+    /// opened with a lower plan's pass than the account has now (passes got before an upgrade,
+    /// or none), it is closed for its change, passes for the current plan are fetched, and this
+    /// resolves to true: ask for a new session and retry. False: the plan doesn't include the
+    /// model; show the error.
+    pub async fn not_on_plan(&mut self, secret: &str) -> Result<bool> {
+        let Some(key) = self.api_key.clone() else { return Ok(false) };
+        let session = Session { secret: secret.to_string(), family: Family::Paid };
+        let had = self.client.status(&session).await.ok().and_then(|s| s.tier);
+        let plan = self.client.pass_allowance(&key).await?.tier;
+        self.plan = Some((plan.clone(), unix_now()));
+        let had_rank = had.as_deref().map(|t| crate::pass::rank(t) as i64).unwrap_or(-1);
+        if had_rank >= crate::pass::rank(&plan) as i64 {
+            return Ok(false);
+        }
+        self.chats.retain(|_, (s, _)| s != secret);
+        self.replies.retain(|_, s| s != secret);
+        let _ = self.client.close(&mut self.wallet, &session).await;
+        self.top_up(true).await;
+        Ok(self.wallet.passes_at(&crate::pass::current_period(), &plan) > 0)
+    }
+
     /// The server no longer takes this session (401): its conversation gets a new one.
     pub fn expired(&mut self, secret: &str) {
         self.chats.retain(|_, (s, _)| s != secret);
@@ -331,7 +361,19 @@ impl Manager {
                 Err(_) => {}
             }
         }
-        if self.wallet.passes(&crate::pass::current_period()).len() < self.policy.keep_passes {
+        // Keep passes for the plan the account is on now: ones got before an upgrade don't
+        // give its models, so they don't count (they stay, and are spent last).
+        if self.plan.as_ref().is_none_or(|(_, at)| now.saturating_sub(*at) >= self.policy.plan_check_secs) {
+            if let Ok(a) = self.client.pass_allowance(&key).await {
+                self.plan = Some((a.tier, now));
+            }
+        }
+        let period = crate::pass::current_period();
+        let held = match &self.plan {
+            Some((tier, _)) => self.wallet.passes_at(&period, tier),
+            None => self.wallet.passes(&period).len(),
+        };
+        if held < self.policy.keep_passes {
             let _ = self.client.get_passes(&mut self.wallet, &key, self.policy.pass_batch).await;
         }
         let _ = self.client.flush_done(&mut self.wallet, Some(&key)).await;

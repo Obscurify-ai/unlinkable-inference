@@ -200,6 +200,13 @@ impl MemoryBackend {
         token
     }
 
+    /// Move an account to another plan (an upgrade or downgrade), as billing would.
+    pub fn set_tier(&self, token: &str, tier: &str) {
+        if let Some(a) = self.db.lock().unwrap().accounts.get_mut(&sha256_hex(token)) {
+            a.tier = tier.to_string();
+        }
+    }
+
     pub fn account_balance(&self, token: &str) -> Option<i64> {
         self.db
             .lock()

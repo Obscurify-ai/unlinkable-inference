@@ -74,7 +74,8 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
 
     return {
         /** fetch() for conversation `chat` (or held reply `reply`), with its
-         *  session secret and no cookie. Tops the session up when it runs out. */
+         *  session secret and no cookie. Tops the session up when it runs out, and
+         *  replaces one opened before a plan upgrade. */
         async fetch(url, init = {}, { chat = 'default', reply } = {}) {
             const held = reply ? await m.reply(reply) : null;
             let secret = held || (await run(m.session(chat)));
@@ -84,6 +85,12 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
                 const res = await fetch(url, { ...init, headers, credentials: 'omit' });
                 if (attempt < 4 && !held && res.status === 402) {
                     await run(m.ranOut(secret, attempt)).catch(() => {});
+                    continue;
+                }
+                // Refused a model the account's plan has: the session's pass was from a lower
+                // plan (got before an upgrade). It is replaced; retry on the new one.
+                if (attempt < 4 && !held && res.status === 403 && await run(m.notOnPlan(secret)).catch(() => false)) {
+                    secret = await run(m.session(chat));
                     continue;
                 }
                 if (attempt < 4 && !held && res.status === 401) {

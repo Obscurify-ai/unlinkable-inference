@@ -749,6 +749,70 @@ async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_lo
     two_devices_never_share_a_session(&stack.server, &new_account(&stack.server, 2_000).await).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_an_upgrade_the_plan_models_work_at_once_on_every_device() {
+    use unlinkable_inference::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 2_000).await;
+    let seed = unlinkable_inference::seed::account_keys("5512 0937 6648 2201").unwrap().seed;
+    let period = unlinkable_inference::pass::current_period();
+    let pro_chat = |secret: String| {
+        let server = stack.server.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{server}/v1/chat/completions"))
+                .bearer_auth(secret)
+                .json(&json!({"model": "echo-pro", "messages": [{"role": "user", "content": "hi"}]}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    // The reference server gives 10 passes a month in all: small batches, so some are left
+    // after the upgrade. Holding more old passes than `keep_passes`, as a real wallet does
+    // (30 got, 10 kept), is what hid the new plan before.
+    let small = |m: &mut Manager| {
+        m.api_key = Some(key.clone());
+        m.policy.keep_passes = 2;
+        m.policy.pass_batch = 4;
+    };
+
+    // On Pay As You Go the wallet stocks that plan's passes, and Pro models are refused.
+    let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
+    small(&mut m);
+    m.start().await.unwrap();
+    assert_eq!(m.wallet().passes_at(&period, "pay_as_you_go"), 4);
+    let s = m.session("chat-a").await.unwrap();
+    assert_eq!(pro_chat(s.clone()).await, 403);
+    assert!(!m.not_on_plan(&s).await.unwrap(), "the plan really doesn't have it: show the error");
+    assert_eq!(m.wallet().passes_at(&period, "pay_as_you_go"), 3, "still more than keep_passes");
+
+    stack.backend.set_tier(&key, "pro");
+
+    // A new device rebuilds the wallet from the seed, the 3 old passes included. At start it
+    // asks the plan and stocks Pro passes: its very first conversation has the Pro models.
+    let mut phone = Manager::connect(&stack.server, seed, None).await.unwrap();
+    small(&mut phone);
+    phone.start().await.unwrap();
+    assert!(phone.wallet().passes_at(&period, "pro") >= 2);
+    let p = phone.session("chat-c").await.unwrap();
+    assert_eq!(pro_chat(p).await, 200);
+
+    // The first device still remembers the old plan (it asks every 10 minutes): the
+    // conversation's 403 swaps its session for one with a Pro pass, and the retry works.
+    assert_eq!(pro_chat(s.clone()).await, 403);
+    assert!(m.not_on_plan(&s).await.unwrap(), "a session from before the upgrade: retry");
+    let s2 = m.session("chat-a").await.unwrap();
+    assert_ne!(s2, s);
+    assert_eq!(pro_chat(s2).await, 200);
+    // New conversations open with Pro passes first, though the old ones are still held.
+    let s3 = m.session("chat-b").await.unwrap();
+    assert_eq!(pro_chat(s3).await, 200);
+    assert!(m.wallet().passes_at(&period, "pay_as_you_go") >= 3);
+}
+
 /// Two devices on one account opening many sessions in the same minute pick
 /// some of the same secrets (64 a minute); the server refuses the second
 /// (`secret_taken`) and it picks again, so none is shared and nothing is lost.

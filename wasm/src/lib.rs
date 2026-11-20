@@ -134,6 +134,16 @@ impl Manager {
         })
     }
 
+    /// A 403 (model not on the plan): true if the session had a lower plan's pass than the
+    /// account has now; it is replaced, so ask for a new session and retry.
+    #[wasm_bindgen(js_name = notOnPlan)]
+    pub fn not_on_plan(&self, secret: String) -> js_sys::Promise {
+        promise!(self, |m| {
+            let retry = m.not_on_plan(&secret).await.map_err(err)?;
+            Ok(JsValue::from_bool(retry))
+        })
+    }
+
     /// A 401: the conversation gets a new session next time.
     pub fn expired(&self, secret: String) -> js_sys::Promise {
         promise!(self, |m| {
