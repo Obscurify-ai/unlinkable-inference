@@ -649,10 +649,17 @@ impl Proxy {
                     // (the top-up links only to this session) and try again.
                     topups += 1;
                     let cents = self.settings.funding_cents << topups;
-                    let result = {
+                    let mut result = {
                         let mut wallet = self.wallet.lock().await;
                         self.client.topup(&mut wallet, &entry.session, cents).await
                     };
+                    if result.is_err() {
+                        // The wallet is empty (or what it held was spent elsewhere) and a
+                        // request is waiting: top it up now rather than fail, as in `entry`.
+                        self.refill(true).await;
+                        let mut wallet = self.wallet.lock().await;
+                        result = self.client.topup(&mut wallet, &entry.session, cents).await;
+                    }
                     entry.busy.fetch_sub(1, Ordering::SeqCst);
                     if let Err(e) = result {
                         return text(

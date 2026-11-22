@@ -69,7 +69,8 @@ use Tor or a VPN, or at least withdraw from a different network.
   client had a session before".
 - **Automatic top-ups**. With the account key, the proxy withdraws when the
   wallet runs low and fetches passes when they run low, in the background,
-  never at the moment a session opens (unless the wallet is empty). The one
+  never at the moment a session opens or is topped up (unless the wallet is
+  empty: then that withdrawal and the session are seconds apart). The one
   exception for passes: when a session is asked for a label the account was
   not offered when last asked (its plan may have just changed), the client
   asks the account right then (at most once a minute per label), and that

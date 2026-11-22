@@ -527,6 +527,41 @@ async fn accounts_with_and_without_passes_look_the_same_until_a_pass_is_needed()
     assert!(stack.backend.dump()["spent_passes"].as_array().unwrap().is_empty(), "no pass was shown");
 }
 
+/// A conversation that runs out while the wallet is empty is topped up from the account on
+/// the spot; it doesn't fail until the background refill comes round (up to a minute later).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_runs_out_on_an_empty_wallet_is_topped_up_from_the_account() {
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 150).await;
+    let opts = Options {
+        server: stack.server.clone(),
+        wallet: Some(temp_wallet()),
+        pins: vec![],
+    };
+    // Each session takes the whole $1 refill, so the wallet is empty while it runs.
+    let settings = Settings { account_key: Some(key.clone()), funding_cents: 100, ..Settings::default() };
+    let (proxy, url) = start_proxy(&opts, settings).await;
+    proxy.refill(true).await;
+    // Costs more than $1 ($2 per million characters): the session's next request gets a 402.
+    let long = "x".repeat(600_000);
+    let body = |more: &str| json!({"model": "echo", "messages": [
+        {"role": "user", "content": long.clone()}, {"role": "user", "content": more}]});
+    let http = reqwest::Client::new();
+    let post = |b: Value| http.post(format!("{url}/v1/chat/completions")).json(&b).send();
+    assert_eq!(post(body("one")).await.unwrap().status(), 200);
+    assert_eq!(status(&url).await["wallet"]["paid_cents"], 0);
+    let again = post(body("one")).await.unwrap();
+    let code = again.status();
+    assert_eq!(code, 200, "topped up from the account: {}", again.text().await.unwrap());
+    assert_eq!(status(&url).await["sessions"].as_array().unwrap().len(), 1, "still the same session");
+    // Nothing left anywhere: it fails, and says why.
+    assert_eq!(balance_cents(&stack.server, &key).await, 0);
+    let broke = post(body("one")).await.unwrap();
+    assert_eq!(broke.status(), 402);
+    assert!(broke.text().await.unwrap().contains("the wallet is empty"));
+    proxy.close_all().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_are_too() {
     let stack = start_stack().await;
