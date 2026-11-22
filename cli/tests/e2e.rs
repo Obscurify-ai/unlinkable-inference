@@ -193,6 +193,41 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
     assert!(st["traffic"][0]["server_sees"].as_str().unwrap().contains("session secret"));
     assert!(!st["traffic"][0]["server_sees"].as_str().unwrap().contains("claude-code"));
 
+    // Claude Code's path has a query, and its body a fixed device id (Codex: an installation id).
+    // Each conversation still gets its own session, and the ids stay on this machine.
+    for text in ["first task", "second task"] {
+        let plain = json!({"model": "echo", "max_tokens": 50, "messages": [{"role": "user", "content": text}]});
+        let mut body = plain.clone();
+        body["metadata"] = json!({"user_id": "device-1234"});
+        body["client_metadata"] = json!({"x-codex-installation-id": "install-1234"});
+        let resp = http
+            .post(format!("{url}/v1/messages?beta=true"))
+            .header("x-api-key", "claude-code")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let st = status(&url).await;
+        let sent = st["traffic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["server_sees"].as_str().unwrap().contains("/v1/messages?beta=true"))
+            .unwrap();
+        assert_eq!(sent["bytes_sent"], plain.to_string().len(), "the ids were sent: {sent}");
+    }
+    assert_eq!(status(&url).await["sessions"].as_array().unwrap().len(), 4);
+
+    // Counting tokens for a conversation goes in that conversation's session, not one shared by all.
+    http.post(format!("{url}/v1/messages/count_tokens?beta=true"))
+        .header("x-api-key", "claude-code")
+        .json(&json!({"model": "echo", "messages": [{"role": "user", "content": "first task"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status(&url).await["sessions"].as_array().unwrap().len(), 4);
+
     // A web page cannot spend the wallet.
     let refused = http
         .post(format!("{url}/v1/chat/completions"))
@@ -206,7 +241,7 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
     // A browser's favicon request is answered here and opens no session.
     let favicon = http.get(format!("{url}/favicon.ico")).send().await.unwrap();
     assert_eq!(favicon.status(), 404);
-    assert_eq!(status(&url).await["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(status(&url).await["sessions"].as_array().unwrap().len(), 4);
 
     // Close everything: change comes back to the wallet.
     proxy.close_all().await;
@@ -259,7 +294,7 @@ async fn a_chat_cannot_be_tied_to_the_account_that_paid_for_it() {
     assert!(withdrawn.iter().all(|w| !spent.contains(w)));
     let dump_text = db.to_string();
     let sessions = db["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions.len(), 4);
     for s in sessions {
         let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
         assert_eq!(

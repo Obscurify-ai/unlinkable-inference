@@ -88,7 +88,9 @@ to a session secret from the proxy. In `.claude/settings.json`:
 ```
 
 One session lasts until Claude Code goes quiet for 5 minutes; the proxy tops
-it up as it runs low. Codex has no key helper, so it goes through the proxy
+it up as it runs low. Claude Code then sends its own requests, with the fixed
+device id it puts in them; to keep that id on your machine, set
+`ANTHROPIC_BASE_URL` to the proxy instead (below), which drops it. Codex has no key helper, so it goes through the proxy
 instead, as a provider in `~/.codex/config.toml`:
 
 ```toml

@@ -173,6 +173,8 @@ fn text(status: StatusCode, message: &str) -> Response {
 
 /// The part of a request that stays the same for a whole conversation.
 pub fn conversation_fingerprint(path: &str, body: &Value) -> String {
+    // Claude Code posts to /v1/messages?beta=true.
+    let path = path.split('?').next().unwrap_or(path);
     let parts = if path.ends_with("/chat/completions") {
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
         let end = messages
@@ -181,7 +183,7 @@ pub fn conversation_fingerprint(path: &str, body: &Value) -> String {
             .map(|i| i + 1)
             .unwrap_or(messages.len());
         json!(messages[..end])
-    } else if path.ends_with("/messages") {
+    } else if path.ends_with("/messages") || path.ends_with("/messages/count_tokens") {
         json!([body["system"], body["messages"][0]])
     } else if path.ends_with("/responses") {
         let first = match &body["input"] {
@@ -193,6 +195,30 @@ pub fn conversation_fingerprint(path: &str, body: &Value) -> String {
         Value::Null
     };
     unlinkable_inference::sha256_hex(parts.to_string())[..16].to_string()
+}
+
+/// Body fields that say who or what is calling and that no model reads: Claude Code puts a fixed
+/// device id in `metadata`, Codex an installation id in `client_metadata`. Any of them would tie
+/// one conversation to the next.
+const DROPPED_BODY_FIELDS: &[&str] = &[
+    "metadata",
+    "client_metadata",
+    "user",
+    "safety_identifier",
+    "prompt_cache_key",
+];
+
+/// The body without [`DROPPED_BODY_FIELDS`]; untouched when it has none.
+fn without_client_ids(body: bytes::Bytes, json: &Value) -> bytes::Bytes {
+    let Some(fields) = json.as_object() else {
+        return body;
+    };
+    if !DROPPED_BODY_FIELDS.iter().any(|f| fields.contains_key(*f)) {
+        return body;
+    }
+    let mut fields = fields.clone();
+    fields.retain(|k, _| !DROPPED_BODY_FIELDS.contains(&k.as_str()));
+    Value::Object(fields).to_string().into()
 }
 
 fn client_key(headers: &HeaderMap) -> String {
@@ -595,6 +621,7 @@ impl Proxy {
         let json_body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         let key = self.session_key(path, &headers, &json_body);
         let has_thread = json_body["thread"]["rev"].is_string();
+        let body = without_client_ids(body, &json_body);
 
         let mut reopened = false;
         let mut topups = 0;
