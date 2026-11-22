@@ -563,7 +563,7 @@ async fn a_session_that_runs_out_on_an_empty_wallet_is_topped_up_from_the_accoun
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_are_too() {
+async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_work() {
     let stack = start_stack().await;
     let key = new_account(&stack.server, 1_000).await;
     let opts = Options {
@@ -575,11 +575,11 @@ async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_are_t
     let client = connect(&opts, &mut wallet).await.unwrap();
     client.withdraw(&mut wallet, &key, 100).await.unwrap();
 
-    // A session must hold at least 10¢: one of 5¢ is refused, and the
-    // vouchers come back.
-    let err = client.open(&mut wallet, Family::Paid, 5).await.unwrap_err();
-    assert!(err.to_string().contains("at least 10¢"), "{err}");
-    assert_eq!(wallet.balance_cents(Family::Paid), 100);
+    // A session can hold as little as a cent.
+    let tiny = client.open(&mut wallet, Family::Paid, 1).await.unwrap();
+    assert_eq!(wallet.balance_cents(Family::Paid), 99);
+    assert_eq!(echo(&stack.server, &tiny.secret).await, 200);
+    client.close(&mut wallet, &tiny).await.unwrap();
 
     wallet.save().unwrap();
     drop(wallet);
@@ -596,14 +596,12 @@ async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_are_t
     // another price, say): with none to show, the proxy sends the request once more.
     assert_eq!(chat(&url, "echo-saver", "asked once").await.status(), 200);
     let asked = stack.backend.dump()["requests"].as_array().unwrap().iter().filter(|r| r["path"] == "/v1/chat/completions").count();
-    assert_eq!(asked, 2 + 1 + 2, "echo-plus: refused, and again; echo; echo-saver: asked, then served");
+    assert_eq!(asked, 1 + 2 + 1 + 2, "the tiny session; echo-plus: refused, and again; echo; echo-saver: asked, then served");
 }
 
-/// A wallet that holds a few cents, less than a session can open with, is topped up when a
-/// request is waiting (it used to fail with the server's "at least 10¢" until the background
-/// top-up came round).
+/// A wallet that holds only a few cents, with no account to top it up, spends them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_wallet_with_less_than_a_session_needs_is_topped_up_for_a_waiting_request() {
+async fn a_few_cents_in_the_wallet_can_be_spent() {
     let stack = start_stack().await;
     let key = new_account(&stack.server, 1_000).await;
     let opts = Options { server: stack.server.clone(), wallet: Some(temp_wallet()), pins: Vec::new() };
@@ -614,10 +612,8 @@ async fn a_wallet_with_less_than_a_session_needs_is_topped_up_for_a_waiting_requ
         assert_eq!(wallet.balance_cents(Family::Paid), 9);
         wallet.save().unwrap();
     }
-    let settings = Settings { account_key: Some(key.clone()), ..Settings::default() };
-    let (proxy, url) = start_proxy(&opts, settings).await;
+    let (proxy, url) = start_proxy(&opts, Settings::default()).await;
     assert_eq!(chat(&url, "echo", "a few cents in the wallet").await.status(), 200);
-    assert_eq!(stack.backend.account_balance(&key), Some(1_000 - 9 - 100), "one $1 top-up");
     proxy.close_all().await;
 }
 
@@ -1245,7 +1241,7 @@ async fn devices_on_one_account_share_one_wallet() {
 /// No balance is stranded: 73¢ is spent privately, and 7¢ (below the 10¢ a session needs) stays
 /// in the account for the app to spend there, without asking again on every tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_balance_under_a_dollar_is_spent_privately_and_crumbs_stay_in_the_account() {
+async fn every_cent_of_a_small_balance_is_spent_privately() {
     use unlinkable_inference::manager::Manager;
     let stack = start_stack().await;
     let key = new_account(&stack.server, 73).await;
@@ -1263,9 +1259,11 @@ async fn a_balance_under_a_dollar_is_spent_privately_and_crumbs_stay_in_the_acco
     let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
     m.api_key = Some(key.clone());
     m.start().await.unwrap();
-    assert_eq!(m.wallet().balance_cents(Family::Paid), 0);
-    assert_eq!(balance_cents(&stack.server, &key).await, 7, "crumbs stay in the account");
-    assert!(m.session("chat").await.is_err(), "no session: the app pays from the account");
+    assert_eq!(m.wallet().balance_cents(Family::Paid), 7, "7¢ move too");
+    assert_eq!(balance_cents(&stack.server, &key).await, 0);
+    let s = m.session("chat").await.unwrap();
+    assert_eq!(echo(&stack.server, &s).await, 200);
+    m.tick().await;
     let asked = withdraw_requests(&stack);
     let looked = |stack: &Stack| stack.backend.dump()["requests"].as_array().unwrap().iter().filter(|r| r["path"] == "/u/issued").count();
     let looks = looked(&stack);
@@ -1280,6 +1278,93 @@ async fn a_balance_under_a_dollar_is_spent_privately_and_crumbs_stay_in_the_acco
     again.api_key = Some(key);
     again.tick().await;
     assert_eq!(withdraw_requests(&stack), asked);
+}
+
+/// An account with no money at all: a conversation opens with one of its passes, which says
+/// nothing of which account it is, and uses what costs nothing. It stays open while it is quiet,
+/// one pass for all of it; what costs money is refused; and money added later goes into the same
+/// session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_with_no_money_chats_on_free_models_by_pass() {
+    use unlinkable_inference::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account_with(&stack.server, 0, &["metered"]).await;
+    let seed = unlinkable_inference::seed::account_keys("7204 5518 3360 9127").unwrap().seed;
+    let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.start().await.unwrap();
+    let s = m.session("chat").await.unwrap();
+    let ask = |s: String, model: &'static str| {
+        let url = format!("{}/v1/chat/completions", stack.server);
+        async move {
+            let body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+            reqwest::Client::new().post(url).bearer_auth(s).json(&body).send().await.unwrap().status().as_u16()
+        }
+    };
+    assert_eq!(ask(s.clone(), "echo-free").await, 200);
+    assert_eq!(ask(s.clone(), "echo").await, 402, "what costs money is refused");
+    assert!(m.ran_out(&s, 0).await.is_err(), "nothing to add");
+    // Quiet for longer than a paid session stays open: still the same session.
+    m.policy.idle_secs = 0;
+    m.policy.quiet_secs = 0;
+    m.tick().await;
+    assert_eq!(m.session("chat").await.unwrap(), s);
+    assert_ne!(m.session("other").await.unwrap(), s, "another conversation has its own");
+    // Nothing of the account is on the sessions.
+    let dump = stack.backend.dump();
+    assert!(!dump["sessions"].to_string().contains(&unlinkable_inference::sha256_hex(&key)));
+    // Money arrives: the account is asked again when the app says so, and the conversation goes on.
+    stack.backend.add_balance(&key, 5);
+    assert!(m.ran_out(&s, 0).await.is_err(), "not asked again yet");
+    m.ask_again();
+    m.ran_out(&s, 0).await.unwrap();
+    assert_eq!(ask(s.clone(), "echo").await, 200);
+
+    // Without passes there is no session at all.
+    let none = new_account(&stack.server, 0).await;
+    let seed = unlinkable_inference::seed::account_keys("1190 4427 8853 6602").unwrap().seed;
+    let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+    m.api_key = Some(none);
+    m.start().await.unwrap();
+    assert!(m.session("chat").await.is_err());
+
+    // The proxy does the same.
+    let key = new_account_with(&stack.server, 0, &["metered"]).await;
+    let opts = Options { server: stack.server.clone(), wallet: Some(temp_wallet()), pins: Vec::new() };
+    let (proxy, url) = start_proxy(&opts, Settings { account_key: Some(key), ..Settings::default() }).await;
+    proxy.refill(true).await;
+    assert_eq!(chat(&url, "echo-free", "free").await.status(), 200);
+    assert_eq!(chat(&url, "echo", "paid").await.status(), 402);
+    proxy.close_all().await;
+}
+
+/// A refused request costs the server no signatures, and a repeated one gets the answer it got.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_is_signed_for_a_request_that_is_refused() {
+    use unlinkable_inference::blank::Blank;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 100).await;
+    let mut wallet = Wallet::in_memory();
+    let opts = Options { server: stack.server.clone(), wallet: Some(temp_wallet()), pins: Vec::new() };
+    let client = connect(&opts, &mut wallet).await.unwrap();
+    let blanks = Blank::many(&client.keyset, Family::Paid, &[50, 50]).unwrap();
+    let body = json!({"amount_cents": 100, "blanks": blanks.iter().map(|b| b.to_wire()).collect::<Vec<_>>()});
+    let post = |token: String, body: Value| {
+        let url = format!("{}/u/withdraw", stack.server);
+        async move { reqwest::Client::new().post(url).bearer_auth(token).json(&body).send().await.unwrap() }
+    };
+    let signed = || stack.backend.signatures();
+    let before = signed();
+    assert_eq!(post("sk-nobody".into(), body.clone()).await.status(), 401);
+    assert_eq!(signed(), before, "an unknown key");
+    let first: Value = post(key.clone(), body.clone()).await.json().await.unwrap();
+    assert_eq!(signed(), before + 2);
+    let again: Value = post(key.clone(), body.clone()).await.json().await.unwrap();
+    assert_eq!((again, signed()), (first, before + 2), "a repeat");
+    let more = Blank::many(&client.keyset, Family::Paid, &[100]).unwrap();
+    let broke = json!({"amount_cents": 100, "blanks": [more[0].to_wire()]});
+    assert_eq!(post(key, broke).await.status(), 402);
+    assert_eq!(signed(), before + 2, "an empty account");
 }
 
 /// Topping a session up with vouchers another device spent already: the server refuses (409,

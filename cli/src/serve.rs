@@ -85,8 +85,13 @@ impl Default for Settings {
     }
 }
 
+/// A session without money is closed after this long without a request.
+const FREE_IDLE_SECS: u64 = 6 * 3600;
+
 struct Entry {
     session: Session,
+    /// Opened with a pass and no money: nothing to bring back, so it stays open longer
+    free: bool,
     last_used: AtomicU64,
     busy: AtomicUsize,
     opened_at: u64,
@@ -317,10 +322,10 @@ impl Proxy {
             }
         }
         if wallet.balance_cents(Family::Paid) < self.settings.keep_cents {
-            // The account's last cents (under $1) too, down to a session's 10¢.
+            // The account's last cents (under $1) too.
             match self
                 .client
-                .withdraw_up_to(&mut wallet, &key, self.settings.refill_cents, 10)
+                .withdraw_up_to(&mut wallet, &key, self.settings.refill_cents, 1)
                 .await
             {
                 Ok(c) => tracing::info!("topped up the wallet with {} from the account", dollars(c)),
@@ -413,6 +418,13 @@ impl Proxy {
         }
     }
 
+    /// A session without money, opened with one of the passes the server takes for that.
+    async fn open_free(&self) -> Option<Session> {
+        let label = self.client.free_open_label().await.ok()??;
+        let mut wallet = self.wallet.lock().await;
+        self.client.open_with_pass(&mut wallet, &label).await.ok()?
+    }
+
     async fn entry(&self, key: &str) -> Result<Arc<Entry>> {
         if let Some(e) = self.sessions.lock().unwrap().get(key) {
             return Ok(e.clone());
@@ -422,6 +434,7 @@ impl Proxy {
             return Ok(e.clone());
         }
         let family = self.family_to_spend().await;
+        let mut free = false;
         let opened = {
             let mut wallet = self.wallet.lock().await;
             self.client
@@ -435,14 +448,25 @@ impl Proxy {
                 // is waiting: top up now rather than fail (the background refill should
                 // prevent this).
                 self.refill(true).await;
-                let mut wallet = self.wallet.lock().await;
-                self.client
-                    .open(&mut wallet, family, self.settings.funding_cents)
-                    .await?
+                let opened = {
+                    let mut wallet = self.wallet.lock().await;
+                    self.client
+                        .open(&mut wallet, family, self.settings.funding_cents)
+                        .await
+                };
+                match opened {
+                    Ok(s) => s,
+                    // No money anywhere: what costs none still works.
+                    Err(e) => {
+                        free = true;
+                        self.open_free().await.ok_or(e)?
+                    }
+                }
             }
         };
         let entry = Arc::new(Entry {
             session,
+            free,
             last_used: AtomicU64::new(now()),
             busy: AtomicUsize::new(0),
             opened_at: now(),
@@ -554,11 +578,13 @@ impl Proxy {
     /// Close every session that has been quiet for `idle_close`.
     pub async fn close_idle(&self) {
         let cutoff = now().saturating_sub(self.settings.idle_close.as_secs());
+        let free_cutoff = now().saturating_sub(self.settings.idle_close.as_secs().max(FREE_IDLE_SECS));
         let idle: Vec<(String, Arc<Entry>)> = {
             let mut sessions = self.sessions.lock().unwrap();
             let keys: Vec<String> = sessions
                 .iter()
                 .filter(|(_, e)| {
+                    let cutoff = if e.free { free_cutoff } else { cutoff };
                     e.busy.load(Ordering::SeqCst) == 0 && e.last_used.load(Ordering::SeqCst) <= cutoff
                 })
                 .map(|(k, _)| k.clone())
@@ -625,6 +651,7 @@ impl Proxy {
 
         let mut reopened = false;
         let mut topups = 0;
+        let mut rest = false;
         let mut presented = 0;
         let mut none: Vec<String> = Vec::new();
         loop {
@@ -633,7 +660,11 @@ impl Proxy {
                 Err(e) => return text(StatusCode::PAYMENT_REQUIRED, &format!("{e:#}")),
             };
             entry.busy.fetch_add(1, Ordering::SeqCst);
-            let result = self.send(&entry, method, path, &passed, &body).await;
+            let mut sent = passed.clone();
+            if rest {
+                sent.push((unlinkable_inference::protocol::REST_HEADER.to_string(), "1".to_string()));
+            }
+            let result = self.send(&entry, method, path, &sent, &body).await;
             entry.last_used.store(now(), Ordering::SeqCst);
             entry.requests.fetch_add(1, Ordering::SeqCst);
             let response = match result {
@@ -661,11 +692,15 @@ impl Proxy {
                         result = self.client.topup(&mut wallet, &entry.session, cents).await;
                     }
                     entry.busy.fetch_sub(1, Ordering::SeqCst);
+                    // Nothing more to add: the reply gets what the session's money still buys.
                     if let Err(e) = result {
-                        return text(
-                            StatusCode::PAYMENT_REQUIRED,
-                            &format!("The session ran out and the wallet could not top it up: {e:#}"),
-                        );
+                        if rest {
+                            return text(
+                                StatusCode::PAYMENT_REQUIRED,
+                                &format!("The session ran out and the wallet could not top it up: {e:#}"),
+                            );
+                        }
+                        rest = true;
                     }
                     continue;
                 }

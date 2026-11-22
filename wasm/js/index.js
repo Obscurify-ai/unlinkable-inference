@@ -57,8 +57,10 @@ export async function kind(input) {
  *   server       the API's origin (default: this page's)
  *   storage      where the wallet is kept (default localStorage), under `name`
  *   replyHeader  a response header naming a reply the server holds for later
+ *   hasFunds     async function, asked when a request ran out of money and the account has
+ *                refused to give more lately: true when it has some now
  */
-export async function connect({ seed, apiKey, server = location.origin, storage = localStorage, name = 'unlinkable-inference', replyHeader, tickMs = 30000 }) {
+export async function connect({ seed, apiKey, server = location.origin, storage = localStorage, name = 'unlinkable-inference', replyHeader, hasFunds, tickMs = 30000 }) {
     await load();
     const key = typeof apiKey === 'function' ? await apiKey() : apiKey;
     const m = await Manager.connect(server, seed, storage.getItem(name), key ?? null);
@@ -78,15 +80,29 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
          *  presents a pass when the server asks for one. */
         async fetch(url, init = {}, { chat = 'default', reply } = {}) {
             const held = reply ? await m.reply(reply) : null;
-            let secret = held || (await run(m.session(chat)));
+            // The account refused a top-up lately (it is asked again only after ten minutes), but
+            // has money now: ask it again.
+            const funded = async () => {
+                if (!hasFunds || !(await hasFunds().catch(() => false))) return false;
+                await m.askAgain();
+                return true;
+            };
+            const open = () => run(m.session(chat)).catch(async (e) => {
+                if (await funded()) return run(m.session(chat));
+                throw e;
+            });
+            let secret = held || (await open());
             let passes = 0;
+            let rest = false; // nothing more to add: spend what the session has
             const none = new Set();
             for (let attempt = 0; ; attempt++) {
                 const headers = new Headers(init.headers || {});
                 headers.set('Authorization', 'Bearer ' + secret);
+                if (rest) headers.set('X-Session-Rest', '1');
                 const res = await fetch(url, { ...init, headers, credentials: 'omit' });
-                if (attempt < 4 && !held && res.status === 402) {
-                    await run(m.ranOut(secret, attempt)).catch(() => {});
+                if (attempt < 4 && !held && !rest && res.status === 402) {
+                    const add = () => run(m.ranOut(secret, attempt)).then(() => true, () => false);
+                    rest = !(await add()) && !((await funded()) && (await add()));
                     continue;
                 }
                 // The server wants a pass for this request (it names the label): present one
@@ -105,7 +121,7 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
                 }
                 if (attempt < 4 && !held && res.status === 401) {
                     await m.expired(secret);
-                    secret = await run(m.session(chat));
+                    secret = await open();
                     continue;
                 }
                 const id = replyHeader && res.headers.get(replyHeader);

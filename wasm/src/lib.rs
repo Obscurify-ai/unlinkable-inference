@@ -125,11 +125,20 @@ impl Manager {
         })
     }
 
-    /// A 402: add more to the session, doubling with each attempt.
+    /// A 402: add more to the session, doubling with each attempt. Rejects when there is nothing more to add.
     #[wasm_bindgen(js_name = ranOut)]
     pub fn ran_out(&self, secret: String, attempt: u32) -> js_sys::Promise {
         promise!(self, |m| {
             m.ran_out(&secret, attempt).await.map_err(err)?;
+            Ok(JsValue::TRUE)
+        })
+    }
+
+    /// Money was just added to the account: the next top-up asks it again.
+    #[wasm_bindgen(js_name = askAgain)]
+    pub fn ask_again(&self) -> js_sys::Promise {
+        promise!(self, |m| {
+            m.ask_again();
             Ok(JsValue::TRUE)
         })
     }

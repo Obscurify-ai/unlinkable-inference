@@ -25,10 +25,11 @@ use unlinkable_inference::protocol::{
     ChangeResponse, Issued, LabelAllowance, PassAllowance, PassResponse, SessionStatus, UnclaimedSession, PASS_REQUIRED,
     PASS_REQUIRED_HEADER,
 };
+use unlinkable_inference::keyset::{PassKeyInfo, VoucherKeyInfo};
 use unlinkable_inference::{sha256_hex, Family};
 use unlinkable_inference::server::{
     signer::KeyStore,
-    Backend, Gateway, GatewayError, IssuedRecord, PassUse, SignChange, Spend,
+    Backend, Gateway, GatewayError, IssuedRecord, PassUse, Sign, SignChange, Signer, Spend,
 };
 
 /// Passes each account gets per month.
@@ -37,8 +38,10 @@ pub const PASSES_PER_MONTH: i64 = 10;
 /// `echo-plus` needs a session that presented a pass with this label.
 pub const PLUS: &str = "plus";
 /// `echo-metered` needs one pass with this label for every [`METERED_REQUESTS`] requests.
-/// (`echo-saver` asks a session for a `plus` pass once and serves it either way.)
+/// So does `echo-free`, which costs nothing: a session opened with a `metered` pass and no money
+/// can use it. (`echo-saver` asks a session for a `plus` pass once and serves it either way.)
 pub const METERED: &str = "metered";
+pub const FREE_MODEL: &str = "echo-free";
 pub const METERED_REQUESTS: i64 = 2;
 
 /// Balances are kept in nanodollars (1e-9 USD).
@@ -136,6 +139,34 @@ pub struct MemoryBackend {
     /// An open session is listed as unclaimed after this long unused
     /// (`protocol::UNCLAIMED_AFTER_SECS`; tests shorten it).
     unclaimed_after: Mutex<Duration>,
+    signatures: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The keys, counting what they sign.
+struct Counting(KeyStore, Arc<std::sync::atomic::AtomicUsize>);
+
+impl Signer for Counting {
+    fn public_keys(&self, family: Family) -> Vec<VoucherKeyInfo> {
+        self.0.public_keys(family)
+    }
+    fn sign_blinded(&self, family: Family, cents: i64, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.sign_blinded(family, cents, blinded)
+    }
+    fn dust_keys(&self, family: Family) -> Vec<VoucherKeyInfo> {
+        self.0.dust_keys(family)
+    }
+    fn sign_dust(&self, family: Family, millicents: i64, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.sign_dust(family, millicents, blinded)
+    }
+    fn pass_key(&self) -> Option<PassKeyInfo> {
+        self.0.pass_key()
+    }
+    fn sign_pass(&self, label: &str, period: &str, blinded: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.sign_pass(label, period, blinded)
+    }
 }
 
 impl MemoryBackend {
@@ -144,6 +175,18 @@ impl MemoryBackend {
             db: Mutex::new(Db::default()),
             idle_timeout,
             unclaimed_after: Mutex::new(Duration::from_secs(unlinkable_inference::protocol::UNCLAIMED_AFTER_SECS)),
+            signatures: Arc::default(),
+        }
+    }
+
+    /// Signatures made so far, of any kind.
+    pub fn signatures(&self) -> usize {
+        self.signatures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn add_balance(&self, token: &str, cents: i64) {
+        if let Some(a) = self.db.lock().unwrap().accounts.get_mut(&sha256_hex(token)) {
+            a.balance_cents += cents;
         }
     }
 
@@ -164,15 +207,20 @@ impl MemoryBackend {
         }
     }
 
-    fn spend(db: &mut Db, spends: &[Spend]) -> Result<i64, GatewayError> {
+    fn check_unspent(db: &Db, spends: &[Spend]) -> Result<(), GatewayError> {
         let spent: Vec<String> = spends
             .iter()
             .filter(|s| db.spent.contains_key(&s.hash))
             .map(|s| s.hash.clone())
             .collect();
-        if !spent.is_empty() {
-            return Err(GatewayError::Spent(spent));
+        match spent.is_empty() {
+            true => Ok(()),
+            false => Err(GatewayError::Spent(spent)),
         }
+    }
+
+    fn spend(db: &mut Db, spends: &[Spend]) -> Result<i64, GatewayError> {
+        Self::check_unspent(db, spends)?;
         let now = unix();
         for s in spends {
             db.spent.insert(s.hash.clone(), now);
@@ -191,7 +239,7 @@ impl MemoryBackend {
         if row.closed_at.is_some() || row.last_used.elapsed() > self.idle_timeout {
             return Err(GatewayError::unauthorized());
         }
-        if row.balance_nano <= 0 {
+        if row.balance_nano <= 0 && model != FREE_MODEL {
             return Err(GatewayError::payment_required(
                 "This session has run out. Top it up or open a new one.",
             ));
@@ -200,7 +248,7 @@ impl MemoryBackend {
         if model == "echo-plus" && !row.labels.iter().any(|l| l == PLUS) {
             return Ok(Err(PLUS));
         }
-        if model == "echo-metered" {
+        if model == "echo-metered" || model == FREE_MODEL {
             if row.metered_left <= 0 {
                 return Ok(Err(METERED));
             }
@@ -305,6 +353,10 @@ fn blinded_hashes(answer: &ChangeResponse) -> Vec<String> {
 
 #[async_trait]
 impl Backend for MemoryBackend {
+    async fn free_open_label(&self) -> Option<String> {
+        Some(METERED.into())
+    }
+
     async fn open_session(
         &self,
         secret_hash: &str,
@@ -313,7 +365,7 @@ impl Backend for MemoryBackend {
         pass: Option<&PassUse>,
     ) -> Result<SessionStatus, GatewayError> {
         let mut db = self.db.lock().unwrap();
-        let digest = unlinkable_inference::server::open_digest(spends);
+        let digest = unlinkable_inference::server::open_digest(spends, pass);
         if let Some(row) = db.sessions.get(secret_hash) {
             // A retried open presents exactly the vouchers the first one spent. Anything else,
             // even vouchers spent elsewhere (another device's copy of a shared wallet), is a
@@ -427,17 +479,19 @@ impl Backend for MemoryBackend {
         &self,
         request_digest: &str,
         spends: &[Spend],
-        answer: &ChangeResponse,
+        sign: Sign<ChangeResponse>,
     ) -> Result<ChangeResponse, GatewayError> {
         let mut db = self.db.lock().unwrap();
         if let Some(previous) = db.answers.get(request_digest) {
             return Ok(previous.clone());
         }
+        Self::check_unspent(&db, spends)?;
+        let answer = sign()?;
         Self::spend(&mut db, spends)?;
-        db.signed_change.push((unix(), blinded_hashes(answer)));
+        db.signed_change.push((unix(), blinded_hashes(&answer)));
         db.answers
             .insert(request_digest.to_string(), answer.clone());
-        Ok(answer.clone())
+        Ok(answer)
     }
 
     async fn pass_allowance(
@@ -467,9 +521,11 @@ impl Backend for MemoryBackend {
     async fn record_passes(
         &self,
         account_token: &str,
+        label: &str,
+        period: &str,
         count: i64,
         request_digest: &str,
-        answer: &PassResponse,
+        sign: Sign<PassResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<PassResponse, GatewayError> {
         let mut db = self.db.lock().unwrap();
@@ -480,10 +536,10 @@ impl Backend for MemoryBackend {
             .accounts
             .get_mut(&sha256_hex(account_token))
             .ok_or_else(GatewayError::unauthorized)?;
-        if !account.labels.contains(&answer.label) {
+        if !account.labels.iter().any(|l| l == label) {
             return Err(GatewayError::Status(StatusCode::FORBIDDEN, "permission_error", "This account does not get those passes.".into()));
         }
-        let used = account.passes.entry(format!("{} {}", answer.period, answer.label)).or_insert(0);
+        let used = account.passes.entry(format!("{period} {label}")).or_insert(0);
         if *used + count > PASSES_PER_MONTH {
             return Err(GatewayError::Status(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -491,8 +547,8 @@ impl Backend for MemoryBackend {
                 format!("{} passes left this month.", PASSES_PER_MONTH - *used),
             ));
         }
+        let mut answer = sign()?;
         *used += count;
-        let mut answer = answer.clone();
         answer.remaining = PASSES_PER_MONTH - *used;
         db.pass_answers
             .insert(request_digest.to_string(), answer.clone());
@@ -507,7 +563,7 @@ impl Backend for MemoryBackend {
         account_token: &str,
         cents: i64,
         request_digest: &str,
-        answer: &ChangeResponse,
+        sign: Sign<ChangeResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<ChangeResponse, GatewayError> {
         let mut db = self.db.lock().unwrap();
@@ -528,19 +584,20 @@ impl Backend for MemoryBackend {
                 account.balance_cents,
             ));
         }
+        let answer = sign()?;
         account.balance_cents -= cents;
         db.withdrawals.push(WithdrawalRow {
             account: key.clone(),
             amount_cents: cents,
             at: unix(),
-            blinded_hashes: blinded_hashes(answer),
+            blinded_hashes: blinded_hashes(&answer),
         });
         db.answers
             .insert(request_digest.to_string(), answer.clone());
         if let Some(i) = issued {
-            db.issued.push((key, issued_row(i, answer)));
+            db.issued.push((key, issued_row(i, &answer)));
         }
-        Ok(answer.clone())
+        Ok(answer)
     }
 
     async fn unclaimed(&self) -> Result<Vec<UnclaimedSession>, GatewayError> {
@@ -710,7 +767,9 @@ async fn chat(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value
         Err(e) => return e.into_response(),
     }
     let words = reply_words(&body);
-    app.backend.charge(&session, price(&body, &words));
+    if body["model"] != FREE_MODEL {
+        app.backend.charge(&session, price(&body, &words));
+    }
     let model = body["model"].as_str().unwrap_or("echo").to_string();
     if body["stream"] == true {
         let mut events: Vec<(Option<&'static str>, Value)> = words
@@ -741,7 +800,9 @@ async fn messages(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
         Err(e) => return e.into_response(),
     }
     let words = reply_words(&body);
-    app.backend.charge(&session, price(&body, &words));
+    if body["model"] != FREE_MODEL {
+        app.backend.charge(&session, price(&body, &words));
+    }
     let model = body["model"].as_str().unwrap_or("echo").to_string();
     if body["stream"] == true {
         let mut events: Vec<(Option<&'static str>, Value)> = vec![
@@ -782,6 +843,7 @@ async fn models() -> Json<Value> {
         {"id": "echo-plus", "object": "model"},
         {"id": "echo-metered", "object": "model"},
         {"id": "echo-saver", "object": "model"},
+        {"id": FREE_MODEL, "object": "model"},
     ]}))
 }
 
@@ -870,7 +932,7 @@ pub fn build(
     idle_timeout: Duration,
 ) -> Server {
     let backend = Arc::new(MemoryBackend::new(idle_timeout));
-    let gateway = Gateway::new(backend.clone(), Arc::new(keys));
+    let gateway = Gateway::new(backend.clone(), Arc::new(Counting(keys, backend.signatures.clone())));
     let app = App {
         backend: backend.clone(),
     };

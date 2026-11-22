@@ -62,6 +62,9 @@ use Tor or a VPN, or at least withdraw from a different network.
 - **Timing**. A withdrawal immediately followed by a session of the same size,
   on a quiet server, is suggestive. Withdraw ahead of time; the wallet splits
   vouchers into session-sized pieces through anonymous exchanges.
+  The last cents of a balance move in one piece, often while a request waits: a withdrawal of
+  7¢ and a session opened with 7¢ seconds later are as suggestive as it gets. Sessions opened with
+  a pass and no money have no amount to compare.
 - **Denominations**. Change comes back in the standard split, so its values
   say how much was left; spending those exact values later is weakly
   suggestive. `unlinkable-inference exchange` trades them for a standard set. Dust is

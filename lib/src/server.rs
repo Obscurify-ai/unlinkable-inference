@@ -51,6 +51,8 @@ pub enum GatewayError {
     Status(StatusCode, &'static str, String),
     /// A withdrawal the account can't cover: 402, with the whole cents it can.
     Unaffordable(String, i64),
+    /// 403: needs a pass with this label.
+    PassRequired(String),
 }
 
 impl GatewayError {
@@ -95,6 +97,7 @@ struct Answer(GatewayError, Vec<String>);
 impl IntoResponse for Answer {
     fn into_response(self) -> Response {
         let mut available_cents = None;
+        let mut pass = None;
         let (status, kind, message, spent) = match self.0 {
             GatewayError::Spent(hashes) => {
                 let spent: Vec<usize> = self
@@ -117,16 +120,27 @@ impl IntoResponse for Answer {
                 available_cents = Some(cents);
                 (StatusCode::PAYMENT_REQUIRED, "insufficient_balance", message, Vec::new())
             }
+            GatewayError::PassRequired(label) => {
+                let message = format!("A session without money needs a {label} pass to open.");
+                pass = Some(label);
+                (StatusCode::FORBIDDEN, PASS_REQUIRED, message, Vec::new())
+            }
         };
+        let header = pass.clone();
         let body = ErrorBody {
             error: ErrorDetail {
                 message,
                 kind: kind.to_string(),
                 spent,
                 available_cents,
+                pass,
             },
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(label) = header.and_then(|l| http::HeaderValue::from_str(&l).ok()) {
+            response.headers_mut().insert(PASS_REQUIRED_HEADER, label);
+        }
+        response
     }
 }
 
@@ -152,6 +166,10 @@ pub struct IssuedRecord {
 pub type SignChange =
     Box<dyn FnOnce(Family, i64) -> Result<ChangeResponse, GatewayError> + Send>;
 
+/// Signs a request's blanks. Signing is the expensive part of a request, so the backend calls it
+/// only once everything else is in order: a refused request costs the server nothing.
+pub type Sign<T> = Box<dyn FnOnce() -> Result<T, GatewayError> + Send>;
+
 /// Storage and money. Every method that spends vouchers or moves balance
 /// must do it atomically, and must answer a repeat of a request (same
 /// `secret_hash` or `request_digest`) the way it answered the first time,
@@ -162,12 +180,18 @@ pub trait Backend: Send + Sync + 'static {
     async fn enabled(&self) -> bool {
         true
     }
-    /// The smallest total a session can be opened with, in cents.
+    /// The smallest total a session can be opened with, in cents (0: any voucher at all).
     async fn min_session_cents(&self) -> i64 {
-        10
+        0
+    }
+    /// The label whose passes open a session that holds no money, for what costs none (free
+    /// models). `None`: every session needs vouchers.
+    async fn free_open_label(&self) -> Option<String> {
+        None
     }
     /// Spend `spends` and open a session holding their total; with `pass`, as
-    /// [`Backend::present_pass`] in the same step. If a session with `secret_hash` exists: when it was opened with exactly
+    /// [`Backend::present_pass`] in the same step. No `spends`: a session without money, opened
+    /// by a [`Backend::free_open_label`] pass. If a session with `secret_hash` exists: when it was opened with exactly
     /// these vouchers ([`open_digest`] matches: a retry), return its status and spend
     /// nothing, with `repeat: true`; otherwise answer 409 `secret_taken` (another device's secret). Vouchers
     /// merely being spent is not enough: devices sharing an account's wallet hold copies
@@ -197,18 +221,21 @@ pub trait Backend: Send + Sync + 'static {
         let _ = (account_token, period);
         Err(GatewayError::unavailable())
     }
-    /// Count `count` passes with `answer.label` against the account's monthly
-    /// allowance and record `answer` under `request_digest`, atomically; a
-    /// repeat with the same digest gets the stored answer.
+    /// Count `count` passes with `label` against the account's monthly allowance for `period`,
+    /// `sign` them and record the answer under `request_digest`, atomically; a
+    /// repeat with the same digest gets the stored answer, without signing.
+    #[allow(clippy::too_many_arguments)]
     async fn record_passes(
         &self,
         account_token: &str,
+        label: &str,
+        period: &str,
         count: i64,
         request_digest: &str,
-        answer: &PassResponse,
+        sign: Sign<PassResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<PassResponse, GatewayError> {
-        let _ = (account_token, count, request_digest, answer, issued);
+        let _ = (account_token, label, period, count, request_digest, sign, issued);
         Err(GatewayError::unavailable())
     }
     /// Sessions closed and not marked done, or open and unused for
@@ -240,21 +267,23 @@ pub trait Backend: Send + Sync + 'static {
         request_digest: &str,
         sign: SignChange,
     ) -> Result<ChangeResponse, GatewayError>;
-    /// Spend `spends` and record `answer` under `request_digest`, atomically.
+    /// Spend `spends`, `sign`, and record the answer under `request_digest`, atomically; a
+    /// repeat with the same digest gets the stored answer, without signing.
     async fn exchange(
         &self,
         request_digest: &str,
         spends: &[Spend],
-        answer: &ChangeResponse,
+        sign: Sign<ChangeResponse>,
     ) -> Result<ChangeResponse, GatewayError>;
     /// Debit `cents` of withdrawable balance from the account `account_token`
-    /// authenticates and record `answer` under `request_digest`, atomically.
+    /// authenticates, `sign`, and record the answer under `request_digest`, atomically; a
+    /// repeat with the same digest gets the stored answer, without signing.
     async fn withdraw(
         &self,
         account_token: &str,
         cents: i64,
         request_digest: &str,
-        answer: &ChangeResponse,
+        sign: Sign<ChangeResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<ChangeResponse, GatewayError>;
 }
@@ -514,31 +543,33 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
                 format!("This account does not get {label} passes."),
             ));
         }
-        // Signing first is safe: nothing counts until record_passes checks the
-        // allowance and stores the answer in one step.
-        let mut signatures = Vec::with_capacity(req.blinded.len());
-        for b in &req.blinded {
-            let blinded = crate::unb64(b)
-                .ok_or_else(|| GatewayError::bad_request("Invalid blinded pass."))?;
-            let sig = gw
-                .signer
-                .sign_pass(&label, &req.period, &blinded)
-                .map_err(|e| GatewayError::bad_request(format!("Cannot sign that pass: {e}")))?;
-            signatures.push(crate::b64(sig));
-        }
-        let answer = PassResponse {
-            label: label.clone(),
-            // A 0.1 client asked (it says `tier`): answer in its words, and record it under
-            // the kind it rebuilds from. It skips kinds it does not know.
-            tier: req.tier.clone(),
-            period: req.period.clone(),
-            blind_signatures: signatures,
-            remaining: 0,
-        };
+        // A 0.1 client asked (it says `tier`): answer in its words, and record it under
+        // the kind it rebuilds from. It skips kinds it does not know.
         let kind = if req.tier.is_some() { "passes" } else { "pass" };
         let issued = issued_record(kind, req.nonce.as_deref(), &req)?;
+        let count = req.blinded.len() as i64;
+        let (signer, period) = (gw.clone(), req.period.clone());
+        let sign: Sign<PassResponse> = Box::new(move || {
+            let mut signatures = Vec::with_capacity(req.blinded.len());
+            for b in &req.blinded {
+                let blinded = crate::unb64(b)
+                    .ok_or_else(|| GatewayError::bad_request("Invalid blinded pass."))?;
+                let sig = signer
+                    .signer
+                    .sign_pass(req.label(), &req.period, &blinded)
+                    .map_err(|e| GatewayError::bad_request(format!("Cannot sign that pass: {e}")))?;
+                signatures.push(crate::b64(sig));
+            }
+            Ok(PassResponse {
+                label: req.label().to_string(),
+                tier: req.tier.clone(),
+                period: req.period.clone(),
+                blind_signatures: signatures,
+                remaining: 0,
+            })
+        });
         gw.backend
-            .record_passes(&token, req.blinded.len() as i64, &digest, &answer, issued.as_ref())
+            .record_passes(&token, &label, &period, count, &digest, sign, issued.as_ref())
             .await
     };
     respond(run.await, &[])
@@ -616,6 +647,21 @@ async fn open(State(gw): Gw, Json(req): Json<OpenSessionRequest>) -> Response {
         if req.secret_hash.len() != 64 || !req.secret_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(GatewayError::bad_request("secret_hash must be SHA-256 hex."));
         }
+        if req.vouchers.is_empty() {
+            if let Some(label) = gw.backend.free_open_label().await {
+                let Some(code) = &req.pass else {
+                    return Err(GatewayError::PassRequired(label));
+                };
+                let pass = gw.check_pass(code)?;
+                if pass.label != label {
+                    return Err(GatewayError::PassRequired(label));
+                }
+                return gw
+                    .backend
+                    .open_session(&req.secret_hash.to_ascii_lowercase(), Family::Paid, &[], Some(&pass))
+                    .await;
+            }
+        }
         let (family, spends) = gw.spends(&req.vouchers)?;
         let total: i64 = spends.iter().map(|s| s.millicents).sum();
         let min = gw.backend.min_session_cents().await;
@@ -685,19 +731,24 @@ async fn exchange(State(gw): Gw, Json(req): Json<ExchangeRequest>) -> Response {
         check_blank_count(&req.blanks)?;
         let (family, spends) = gw.spends(&req.vouchers)?;
         let total: i64 = spends.iter().map(|s| s.millicents).sum();
-        // Signing first is safe: signatures count for nothing until the
-        // backend spends the vouchers and records them in one step.
-        let answer = gw.sign_all(&req.blanks, family, total)?;
+        let (signer, blanks) = (gw.clone(), req.blanks.clone());
         gw.backend
-            .exchange(&blanks_digest("exchange", &req.blanks), &spends, &answer)
+            .exchange(
+                &blanks_digest("exchange", &req.blanks),
+                &spends,
+                Box::new(move || signer.sign_all(&blanks, family, total)),
+            )
             .await
     };
     respond(run.await, &req.vouchers)
 }
 
-/// Which vouchers opened a session: SHA-256 over their spent hashes, sorted. A repeat open
-/// with the same secret is a retry only when this matches.
-pub fn open_digest(spends: &[Spend]) -> String {
+/// What opened a session: SHA-256 over its vouchers' spent hashes, sorted (its pass's, for one
+/// opened without vouchers). A repeat open with the same secret is a retry only when this matches.
+pub fn open_digest(spends: &[Spend], pass: Option<&PassUse>) -> String {
+    if let (true, Some(pass)) = (spends.is_empty(), pass) {
+        return crate::sha256_hex(format!("pass|{}", pass.hash));
+    }
     let mut hashes: Vec<&str> = spends.iter().map(|s| s.hash.as_str()).collect();
     hashes.sort_unstable();
     crate::sha256_hex(hashes.join(","))
@@ -725,14 +776,15 @@ async fn withdraw(State(gw): Gw, headers: HeaderMap, Json(req): Json<WithdrawReq
             ));
         }
         check_blank_count(&req.blanks)?;
-        let answer = gw.sign_all(&req.blanks, Family::Paid, req.amount_cents * MILLICENTS_PER_CENT)?;
         let issued = issued_record("withdraw", req.nonce.as_deref(), &req)?;
+        let (signer, blanks) = (gw.clone(), req.blanks.clone());
+        let millicents = req.amount_cents * MILLICENTS_PER_CENT;
         gw.backend
             .withdraw(
                 &token,
                 req.amount_cents,
                 &blanks_digest("withdraw", &req.blanks),
-                &answer,
+                Box::new(move || signer.sign_all(&blanks, Family::Paid, millicents)),
                 issued.as_ref(),
             )
             .await

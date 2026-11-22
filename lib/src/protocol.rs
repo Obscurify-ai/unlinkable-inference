@@ -43,6 +43,10 @@ pub const PASS_REQUIRED_HEADER: &str = "x-pass-required";
 /// The error `type` of that refusal.
 pub const PASS_REQUIRED: &str = "pass_required";
 
+/// A request header: `1` when the client has nothing left to add to the session, so the server
+/// may shorten the reply to what the session can pay for instead of refusing it (402).
+pub const REST_HEADER: &str = "x-session-rest";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStatus {
     /// Remaining balance in USD, as a decimal string (exact)
@@ -194,6 +198,9 @@ pub struct ErrorDetail {
     /// A withdrawal larger than the account can cover: what it can (whole cents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_cents: Option<i64>,
+    /// With type [`PASS_REQUIRED`]: the label of the pass that is needed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<String>,
 }
 
 /// `GET /u/sessions/unclaimed` lists a session only once it is closed or has gone this long

@@ -7,7 +7,8 @@
 //! The app keeps the account number's seed and `Manager::state()` (save it
 //! after every call; a crash between saves loses nothing, `start` restores
 //! it from the seed) and sends `session(chat)` as `Authorization: Bearer`.
-//! On a 402 it calls `ran_out` and retries; on a 401, `expired` and asks for a
+//! On a 402 it calls `ran_out` and retries (with [`REST_HEADER`](crate::protocol::REST_HEADER) when
+//! that failed: the server then serves what the session's money still buys); on a 401, `expired` and asks for a
 //! new session; on a 403 that names a pass (the `x-pass-required` header),
 //! `needs_pass` with that label, then sends the request again: when that said
 //! no (none to show), once only, in case the server serves it another way.
@@ -27,10 +28,10 @@ pub struct Policy {
     /// Top the wallet up when it holds less than this...
     pub keep_cents: i64,
     /// ...by this much: one of `WITHDRAW_SIZES` (fixed, so withdrawals look alike). An account
-    /// holding less gives what it has, down to `min_session_cents`.
+    /// holding less gives what it has, down to `min_cents`.
     pub refill_cents: i64,
-    /// The least a session can open with (the server's minimum): less stays in the account.
-    pub min_session_cents: i64,
+    /// The least to take from the account: less stays there.
+    pub min_cents: i64,
     /// After the account refused a top-up, wait this long before asking again.
     pub refused_backoff_secs: u64,
     /// The wallet is shared by every device with the account's code: when low, look for what the
@@ -47,6 +48,9 @@ pub struct Policy {
     pub label_retry_secs: u64,
     /// Close a conversation's session after this long without a request.
     pub idle_secs: u64,
+    /// The same for a session without money (opened with a pass): it has no change to bring back,
+    /// and closing it would waste what its pass still gives. The server's own limit, or less.
+    pub idle_free_secs: u64,
     /// When nothing else can fund a conversation, close this device's sessions quiet this long.
     pub quiet_secs: u64,
 }
@@ -57,7 +61,7 @@ impl Default for Policy {
             funding_cents: 10,
             keep_cents: 50,
             refill_cents: 100,
-            min_session_cents: 10,
+            min_cents: 1,
             refused_backoff_secs: 600,
             share_every_secs: 10,
             keep_passes: 10,
@@ -65,6 +69,7 @@ impl Default for Policy {
             labels_every_secs: 600,
             label_retry_secs: 60,
             idle_secs: 300,
+            idle_free_secs: 6 * 3600,
             quiet_secs: 30,
         }
     }
@@ -119,6 +124,8 @@ pub struct Manager {
     offered: Option<(crate::protocol::PassAllowance, u64)>,
     /// label → when a session last needed one the account could not give
     refused_labels: BTreeMap<String, u64>,
+    /// The label whose passes open a session without money, once asked (`None` inside: none does)
+    free_label: Option<Option<String>>,
     server: String,
     seed_hex: String,
     previous_seeds: Vec<String>,
@@ -165,6 +172,7 @@ impl Manager {
             share_empty: false,
             offered: None,
             refused_labels: BTreeMap::new(),
+            free_label: None,
             server: server.to_string(),
             seed_hex,
             previous_seeds,
@@ -224,7 +232,7 @@ impl Manager {
         let quiet: Vec<String> = self
             .chats
             .iter()
-            .filter(|(_, (secret, used))| Some(secret.as_str()) != keep && now.saturating_sub(*used) >= self.policy.quiet_secs)
+            .filter(|(_, (secret, used))| Some(secret.as_str()) != keep && now.saturating_sub(*used) >= self.policy.quiet_secs && self.has_money(secret))
             .map(|(k, _)| k.clone())
             .collect();
         for chat in quiet {
@@ -254,7 +262,11 @@ impl Manager {
                     Ok(s) => s,
                     Err(_) => {
                         self.free_quiet(None).await;
-                        self.client.open(&mut self.wallet, Family::Paid, cents).await?
+                        match self.client.open(&mut self.wallet, Family::Paid, cents).await {
+                            Ok(s) => s,
+                            // No money anywhere: what costs none still works.
+                            Err(e) => self.open_free().await.ok_or(e)?,
+                        }
                     }
                 }
             }
@@ -262,6 +274,32 @@ impl Manager {
         self.chats.insert(chat.to_string(), (opened.secret.clone(), unix_now()));
         self.wallet.used_session(&opened.secret, unix_now());
         Ok(opened.secret)
+    }
+
+    /// Was money put into this session?
+    fn has_money(&self, secret: &str) -> bool {
+        self.wallet.sessions().iter().all(|s| s.secret != secret || s.funded_millicents > 0)
+    }
+
+    /// A session without money, opened with one of the passes the server takes for that.
+    async fn open_free(&mut self) -> Option<Session> {
+        if self.free_label.is_none() {
+            self.free_label = Some(self.client.free_open_label().await.ok()?);
+        }
+        let label = self.free_label.clone()??;
+        if let Ok(Some(s)) = self.client.open_with_pass(&mut self.wallet, &label).await {
+            return Some(s);
+        }
+        if !self.fetch_passes(&label).await {
+            return None;
+        }
+        self.client.open_with_pass(&mut self.wallet, &label).await.ok().flatten()
+    }
+
+    /// Money was just added to the account: the next top-up asks it again, however lately it
+    /// refused one.
+    pub fn ask_again(&mut self) {
+        self.refused_at = 0;
     }
 
     /// The secret of the session that asked for held reply `id`.
@@ -274,7 +312,8 @@ impl Manager {
         self.replies.insert(id.to_string(), secret.to_string());
     }
 
-    /// The session ran out of money (402): add more, doubling with each `attempt`.
+    /// The session ran out of money (402): add more, doubling with each `attempt`. An error:
+    /// there is nothing more to add.
     pub async fn ran_out(&mut self, secret: &str, attempt: u32) -> Result<()> {
         let session = Session { secret: secret.to_string(), family: Family::Paid };
         let cents = self.policy.funding_cents << attempt.min(8);
@@ -303,7 +342,16 @@ impl Manager {
         if self.client.present_pass(&mut self.wallet, &session, label).await? {
             return Ok(true);
         }
-        let Some(key) = self.api_key.clone() else { return Ok(false) };
+        if !self.fetch_passes(label).await {
+            return Ok(false);
+        }
+        self.client.present_pass(&mut self.wallet, &session, label).await
+    }
+
+    /// The wallet has no `label` pass: fetch some if what the account was last told allows it
+    /// (see [`Manager::needs_pass`]). False: there are none to have.
+    async fn fetch_passes(&mut self, label: &str) -> bool {
+        let Some(key) = self.api_key.clone() else { return false };
         let now = unix_now();
         let known = self
             .offered
@@ -313,21 +361,21 @@ impl Manager {
             .map(|l| l.remaining);
         match known {
             // Used up: nothing to ask.
-            Some(left) if left <= 0 => return Ok(false),
+            Some(left) if left <= 0 => return false,
             // Offered, and the stock ran out between two looks: fetch more.
             Some(_) => {}
             // Not offered when last asked (or never asked): it may be new.
             None => {
                 let asked = self.refused_labels.get(label).copied().unwrap_or(0);
                 if now.saturating_sub(asked) < self.policy.label_retry_secs {
-                    return Ok(false);
+                    return false;
                 }
                 self.refused_labels.insert(label.to_string(), now);
                 self.offered = None;
             }
         }
         self.stock(&key, Some(label)).await;
-        self.client.present_pass(&mut self.wallet, &session, label).await
+        true
     }
 
     /// Keep `keep_passes` of each label the account gets (just `only`, when given).
@@ -361,7 +409,10 @@ impl Manager {
         let idle: Vec<String> = self
             .chats
             .iter()
-            .filter(|(_, (_, used))| now.saturating_sub(*used) >= self.policy.idle_secs)
+            .filter(|(_, (secret, used))| {
+                let idle = if self.has_money(secret) { self.policy.idle_secs } else { self.policy.idle_free_secs };
+                now.saturating_sub(*used) >= idle
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for chat in idle {
@@ -399,7 +450,7 @@ impl Manager {
             self.share_empty = self.wallet.balance_millicents(Family::Paid) <= before;
         }
         if low(self) && now.saturating_sub(self.refused_at) >= self.policy.refused_backoff_secs {
-            let min = self.policy.min_session_cents.min(self.policy.refill_cents);
+            let min = self.policy.min_cents.min(self.policy.refill_cents);
             match self.client.withdraw_up_to(&mut self.wallet, &key, self.policy.refill_cents, min).await {
                 Ok(_) => self.refused_at = 0,
                 // Refused (402: not enough in the account): wait. A network failure retries next tick.

@@ -227,6 +227,7 @@ impl Transport {
                         kind: "unknown".into(),
                         spent: Vec::new(),
                         available_cents: None,
+                        pass: None,
                     },
                 }),
             })
@@ -531,6 +532,81 @@ impl Client {
             }
         }
         bail!("could not open a session: vouchers kept turning out spent")
+    }
+
+    /// The label of the passes that open a session without money here (`open_with_pass`), or
+    /// `None` when the server wants vouchers for every session. Nothing is opened or spent.
+    pub async fn free_open_label(&self) -> Result<Option<String>> {
+        let req = OpenSessionRequest {
+            vouchers: Vec::new(),
+            secret_hash: crate::sha256_hex(crate::new_session_secret()),
+            pass: None,
+        };
+        match self.transport.json::<SessionStatus>(Request::post_json("/u/sessions", &req)).await {
+            Err(ApiError::Server { status: 403, body }) if body.error.kind == PASS_REQUIRED => Ok(body.error.pass),
+            Err(ApiError::Server { status: 400, .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+            Ok(_) => bail!("the server opened a session for nothing"),
+        }
+    }
+
+    /// Open a session holding no money, for what costs none, with a pass from the wallet whose
+    /// label is the server's [`Client::free_open_label`]. `Ok(None)`: the wallet has none that
+    /// still works.
+    pub async fn open_with_pass(&self, wallet: &mut Wallet, label: &str) -> Result<Option<Session>> {
+        let period = crate::pass::current_period();
+        let mut taken = 0;
+        while let Some(pass) = wallet.take_pass(&period, label) {
+            let secret = self.new_secret(wallet);
+            wallet.remember_session(OpenSession {
+                secret: secret.clone(),
+                family: Family::Paid,
+                opened_at: now(),
+                funded_millicents: 0,
+                used_at: 0,
+            });
+            wallet.save()?;
+            let req = Request::post_json(
+                "/u/sessions",
+                &OpenSessionRequest {
+                    vouchers: Vec::new(),
+                    secret_hash: crate::sha256_hex(&secret),
+                    pass: Some(pass.encode()),
+                },
+            );
+            let mut answer = self.transport.json::<SessionStatus>(req.clone()).await;
+            let mut ours = false;
+            if matches!(answer, Err(ApiError::Network(_))) {
+                // Unknown outcome: the same secret and pass are safe to repeat.
+                answer = self.transport.json::<SessionStatus>(req).await;
+                ours = true;
+            }
+            match answer {
+                // A repeat is another device on the account that made the same choices: its
+                // pass is used, pick again.
+                Ok(status) if ours || !status.repeat => {
+                    wallet.save()?;
+                    return Ok(Some(Session { secret, family: Family::Paid }));
+                }
+                Ok(_) => wallet.forget_session(&secret),
+                Err(ApiError::Server { status: 409, body }) if body.error.kind == "pass_spent" => {
+                    wallet.forget_session(&secret);
+                }
+                Err(ApiError::Server { status: 409, body }) if body.error.kind == "secret_taken" && taken < 8 => {
+                    taken += 1;
+                    wallet.add_passes([pass]);
+                    wallet.forget_session(&secret);
+                }
+                Err(e) => {
+                    wallet.add_passes([pass]);
+                    wallet.forget_session(&secret);
+                    wallet.save()?;
+                    return Err(e.into());
+                }
+            }
+            wallet.save()?;
+        }
+        Ok(None)
     }
 
     pub async fn status(&self, session: &Session) -> Result<SessionStatus> {

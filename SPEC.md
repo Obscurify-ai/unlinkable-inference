@@ -82,7 +82,7 @@ None of them reads a cookie or stores an IP. Errors are
 
 Rules:
 
-- **Open** needs at least the server's minimum (10¢ by default) and spends
+- **Open** needs at least one voucher (or the server's minimum, if it sets one) and spends
   every voucher or none. Vouchers must share a family and not
   repeat; up to 64. If any were spent before: 409 with `spent` = their indexes,
   and nothing is spent. A repeat open with the same `secret_hash` and exactly the
@@ -93,6 +93,15 @@ Rules:
   gets `repeat` on a first try (not a retry after a lost response) treats it as
   another device's session: those vouchers are spent, pick another secret. With `"pass"`, that pass
   is presented as the session opens (see Passes).
+- **Open without money**: a server may let a pass with one label open a session that holds none,
+  for what costs nothing (free models). An open with no vouchers and no such pass is then 403
+  with `x-pass-required: <label>`, like any request that needs a pass; with it, the session opens
+  and the pass counts as presented. Servers without this answer 400. Such a session can be topped
+  up like any other. Clients keep it open as long as the server does: it has no change to bring
+  back, and closing it would waste what its pass still gives.
+- **The last of the money**: a client that got 402 for a request and has nothing more to add
+  sends it once more with `x-session-rest: 1`. The server may then shorten the reply to what the
+  session can pay for (in the usual way, with finish reason `length`) instead of refusing it.
 - **Close** rounds the balance **up** to the next millicent (a session never
   costs more than its tokens) and signs the standard split (largest first,
   1-2-5 steps) of it: whole cents from the normal blanks, the rest from dust
@@ -104,8 +113,9 @@ Rules:
 - **Exchange** and **withdraw** sign every blank (dust or not); the blanks must
   add up to exactly the vouchers' total, or the amount, in millicents. Withdrawals are $1, $5, $20, $50
   or $100, or any amount under $1 (the last of a balance), from the account's balance. One the
-  account can't cover is 402 with `available_cents`, what it can; clients take that when it is
-  at least a session's minimum, and leave less in the account. A repeat with the same blanks
+  account can't cover is 402 with `available_cents`, what it can; clients take that, down to 1¢.
+  (Fractions of a cent stay in the account: an odd amount would say which withdrawal a session's
+  money came from.) A repeat with the same blanks
   gets the same answer.
 - Sessions refuse model requests after `idle_timeout_seconds` without one but
   can always be closed for change: an open session's balance is never taken.
@@ -121,7 +131,7 @@ or unused for 15 minutes (`UNCLAIMED_AFTER_SECS`), so a device never closes a se
 device is using. A voucher two devices hold is spent by whichever uses it first; the other gets
 409 `spent` (or `repeat`) and drops it.
 
-Clients open a conversation's session with the server's minimum (10¢) and top it up as it is
+Clients open a conversation's session with 10¢ (or what there is) and top it up as it is
 used, so a small balance spreads over many open conversations; seeded withdrawals arrive in 10¢
 pieces for that. A device whose own quiet sessions hold the last of the money closes them for
 their change when nothing else can fund the conversation in use. After the account's code
@@ -179,6 +189,9 @@ in `GET /u/passes` for them; their records in `GET /u/issued` keep the kind
 
 ## Abuse limits
 
-Servers should rate-limit `/u/*` per client address (Obscurify: in memory,
-per hour) and may set a higher session minimum. Neither involves storing the
-address.
+Addresses are shared (VPNs, Tor, mobile networks), so a limit per address stops people who did
+nothing. What these endpoints hand out is limited by itself: withdrawals by the account's
+balance, passes by its monthly allowance, sessions by the vouchers or pass they spend. The server
+module signs only after everything else about a request is in order, so refused requests cost
+little. Against floods, Obscurify counts requests per address only while one endpoint gets far
+more than its normal traffic from everyone together (in memory, nothing stored).
