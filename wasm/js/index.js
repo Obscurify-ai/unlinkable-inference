@@ -179,6 +179,9 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
         moneyAdded: () => run(m.moneyAdded()),
         /** null, or the Unix time a waiting conversation may go on about. */
         refilling,
+        /** What the account said when it last refused to fill the wallet (a plan's limit used
+         *  up, and when it starts over), or null: for wording a refusal without asking it. */
+        accountNote: () => m.accountNote() ?? null,
         /** `{ paid_cents, passes }`, or null while busy. */
         summary: () => m.summary(),
         /** A reply in conversation `chat` said it cost `usd`: the balance shown while its

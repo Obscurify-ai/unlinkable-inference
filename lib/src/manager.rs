@@ -158,6 +158,9 @@ struct State {
     waiting: bool,
     #[serde(default)]
     release_at: u64,
+    /// What the account said when it last refused a top-up (see `Manager::account_note`)
+    #[serde(default)]
+    account_note: Option<String>,
     /// The seed this state was made with (hex), to notice when the account's code changes
     #[serde(default)]
     seed: Option<String>,
@@ -188,6 +191,8 @@ pub struct Manager {
     release_at: u64,
     /// Labels a session asked for that the wallet had none of: asked for at the next contact
     wanted: std::collections::BTreeSet<String>,
+    /// See `State::account_note`
+    account_note: Option<String>,
     /// The labels the account gets and how many of each are left, as last asked, and when
     /// (Unix seconds)
     offered: Option<(crate::protocol::PassAllowance, u64)>,
@@ -240,6 +245,7 @@ impl Manager {
             waiting: st.waiting,
             release_at: st.release_at,
             wanted: Default::default(),
+            account_note: st.account_note.clone(),
             offered: None,
             free_label: None,
             server: server.to_string(),
@@ -260,6 +266,7 @@ impl Manager {
             next_contact: self.next_contact,
             waiting: self.waiting,
             release_at: self.release_at,
+            account_note: self.account_note.clone(),
             seed: Some(self.seed_hex.clone()),
             previous_seeds: self.previous_seeds.clone(),
         })
@@ -386,6 +393,13 @@ impl Manager {
         (!self.waiting && unix_now() < self.release_at).then_some(self.release_at)
     }
 
+    /// What the account said when it last refused to fill the wallet (a plan's limit used up and
+    /// when it starts over, say), for an app to word a refusal with: asking the account again
+    /// right after a conversation was refused would tie the two together. `None` after a top-up.
+    pub fn account_note(&self) -> Option<&str> {
+        self.account_note.as_deref()
+    }
+
     /// `Some(when)` (Unix seconds) while a conversation waits for the account (see
     /// [`Refilling`]); `None` once the contact has been made: send the held request again.
     pub fn refilling(&self) -> Option<u64> {
@@ -421,6 +435,7 @@ impl Manager {
     /// payment went through in the app): ask it at the next `tick`, labels included.
     pub fn ask_again(&mut self) {
         self.account_empty = false;
+        self.account_note = None;
         self.refused_at = 0;
         self.offered = None;
         self.next_contact = unix_now();
@@ -583,6 +598,7 @@ impl Manager {
             match self.client.withdraw_up_to_left(&mut self.wallet, &key, self.policy.refill_cents, min).await {
                 Ok((_, left)) => {
                     self.refused_at = 0;
+                    self.account_note = None;
                     // It gave its last cents: a conversation that runs short doesn't wait for it.
                     self.account_empty = left == Some(0);
                 }
@@ -590,6 +606,9 @@ impl Manager {
                 Err(e) if matches!(e.downcast_ref::<crate::net::ApiError>(), Some(crate::net::ApiError::Server { status: 402, .. })) => {
                     self.refused_at = now;
                     self.account_empty = true;
+                    if let Some(crate::net::ApiError::Server { body, .. }) = e.downcast_ref::<crate::net::ApiError>() {
+                        self.account_note = Some(body.error.message.clone());
+                    }
                 }
                 Err(_) => {}
             }

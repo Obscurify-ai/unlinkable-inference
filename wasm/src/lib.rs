@@ -154,6 +154,17 @@ impl Manager {
         }
     }
 
+    /// What the account said when it last refused to fill the wallet, or `null`. `undefined`
+    /// while a call runs.
+    #[wasm_bindgen(js_name = accountNote)]
+    pub fn account_note(&self) -> JsValue {
+        let Some(m) = self.inner.try_lock() else { return JsValue::UNDEFINED };
+        match m.account_note() {
+            Some(n) => n.into(),
+            None => JsValue::NULL,
+        }
+    }
+
     /// Money was just added to the account, or its plan changed (in this app): ask it now.
     #[wasm_bindgen(js_name = moneyAdded)]
     pub fn money_added(&self) -> js_sys::Promise {

@@ -1446,6 +1446,7 @@ async fn an_account_with_no_money_chats_on_free_models_by_pass() {
     m.api_key = Some(none);
     m.start().await.unwrap();
     assert!(m.session("chat").await.is_err());
+    assert!(m.account_note().is_some_and(|n| !n.is_empty()), "what the account said, for the app to show");
 
     // The proxy does the same.
     let key = new_account_with(&stack.server, 0, &["metered"]).await;
