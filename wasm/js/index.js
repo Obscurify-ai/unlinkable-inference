@@ -98,15 +98,22 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
             // The wallet is refilling for this conversation: hold the request (onWait(at) says so,
             // onWait(null) when it goes on) and keep the clock running until it may go. False:
             // nothing to wait for (the account has nothing to give).
+            // A request cancelled meanwhile (init.signal) is never sent.
             const hold = async () => {
                 let at = await refilling();
                 if (at === null) return false;
-                if (onWait) onWait(at);
-                while ((at = await refilling()) !== null) {
-                    await new Promise((r) => setTimeout(r, 5000));
-                    await run(m.tick()).catch(() => {});
+                let told = null;
+                try {
+                    while (at !== null) {
+                        if (init.signal?.aborted) throw new DOMException('The request was cancelled while it waited', 'AbortError');
+                        if (onWait && at !== told) onWait((told = at));
+                        await new Promise((r) => setTimeout(r, 2000));
+                        await run(m.tick()).catch(() => {});
+                        at = await refilling();
+                    }
+                } finally {
+                    if (onWait && told !== null) onWait(null);
                 }
-                if (onWait) onWait(null);
                 return true;
             };
             const open = async () => {
