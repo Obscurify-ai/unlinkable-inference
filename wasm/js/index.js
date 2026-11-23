@@ -131,6 +131,9 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
         },
         /** `{ paid_cents, passes }`, or null while busy. */
         summary: () => m.summary(),
+        /** A reply in conversation `chat` said it cost `usd`: the balance shown while its
+         *  session is open takes it off. Closing the session says exactly. */
+        noteCost: (usd, { chat = 'default' } = {}) => run(m.noteCost(chat, usd)),
         /** What private use cost: see `spending()` below. */
         spending: () => m.spending(),
         stop: () => clearInterval(timer),
@@ -151,9 +154,10 @@ async function passRequired(res) {
  * What private use cost on this device, for an account page's history:
  * `{ spent: [{ at, millicents }], prepaid_millicents }`, `spent` oldest first
  * (`at` Unix seconds, 100000 millicents = $1; sessions still open count what
- * they have used so far) and `prepaid_millicents` the money still here (the
- * wallet plus what open sessions hold). Read-only: opens, closes and saves
- * nothing, so it is safe next to a running `connect` in another tab.
+ * their replies said, `noteCost`) and `prepaid_millicents` the money still here
+ * (the wallet plus what open sessions hold). From what this device keeps: no
+ * request names a session. Opens, closes and saves nothing, so it is safe next
+ * to a running `connect` in another tab.
  */
 export async function spending({ seed, server = location.origin, storage = localStorage, name = 'unlinkable-inference' }) {
     await load();

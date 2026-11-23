@@ -52,6 +52,18 @@ pub struct OpenSession {
     /// Last request, Unix seconds (0: never noted)
     #[serde(default)]
     pub used_at: u64,
+    /// What its replies said they cost so far, millicents. Only for showing a balance while it
+    /// is open: closing it says exactly.
+    #[serde(default)]
+    pub noted_millicents: i64,
+}
+
+impl OpenSession {
+    /// What it still holds, as far as this device knows (asking the server would tie the
+    /// sessions asked about to each other).
+    pub fn left_millicents(&self) -> i64 {
+        (self.funded_millicents - self.noted_millicents).max(0)
+    }
 }
 
 /// What one closed session cost: what was put in minus the change. Kept
@@ -346,6 +358,13 @@ impl Wallet {
     pub fn used_session(&mut self, secret: &str, at: u64) {
         if let Some(s) = self.file.sessions.iter_mut().find(|s| s.secret == secret) {
             s.used_at = s.used_at.max(at);
+        }
+    }
+
+    /// A reply on this session said it cost this much.
+    pub fn note_cost(&mut self, secret: &str, millicents: i64) {
+        if let Some(s) = self.file.sessions.iter_mut().find(|s| s.secret == secret) {
+            s.noted_millicents += millicents.max(0);
         }
     }
 

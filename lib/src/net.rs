@@ -458,6 +458,7 @@ impl Client {
             let codes: Vec<String> = vouchers.iter().map(Voucher::encode).collect();
             let secret = self.new_secret(wallet);
             wallet.remember_session(OpenSession {
+                noted_millicents: 0,
                 secret: secret.clone(),
                 family,
                 opened_at: now(),

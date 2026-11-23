@@ -101,6 +101,15 @@ impl Manager {
         })
     }
 
+    /// A reply in conversation `chat` said it cost `usd`.
+    #[wasm_bindgen(js_name = noteCost)]
+    pub fn note_cost(&self, chat: String, usd: f64) -> js_sys::Promise {
+        promise!(self, |m| {
+            m.note_cost(&chat, (usd * 100_000.0).round() as i64);
+            Ok(JsValue::TRUE)
+        })
+    }
+
     /// Close sessions no conversation uses, bring back what a lost browser
     /// left behind, top up. Resolves to the cents recovered.
     pub fn start(&self) -> js_sys::Promise {

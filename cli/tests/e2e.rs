@@ -562,6 +562,41 @@ async fn a_session_that_runs_out_on_an_empty_wallet_is_topped_up_from_the_accoun
     proxy.close_all().await;
 }
 
+/// An app shows its balance from what the device keeps: wallet plus open sessions, less what
+/// replies said they cost. No request names a session. Closing the
+/// session says exactly, whatever was noted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_balance_shown_comes_from_the_device_and_ends_exact() {
+    use unlinkable_inference::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 500).await;
+    let seed = unlinkable_inference::seed::account_keys("2222 3333 4444 5555").unwrap().seed;
+    let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
+    m.api_key = Some(key);
+    m.start().await.unwrap();
+    let all = m.spending().await.prepaid_millicents;
+    assert!(all > 0);
+    let secret = m.session("chat").await.unwrap();
+    assert_eq!(m.spending().await.prepaid_millicents, all, "opening a session costs nothing");
+    assert_eq!(echo(&stack.server, &secret).await, 200);
+    m.note_cost("chat", 700);
+    m.note_cost("another chat", 5_000);
+    let s = m.spending().await;
+    assert_eq!(s.prepaid_millicents, all - 700, "the reply's cost is off at once");
+    assert_eq!(s.spent.iter().map(|e| e.millicents).sum::<i64>(), 700);
+    // It survives a restart of the app.
+    let saved = m.state();
+    let m2 = Manager::connect(&stack.server, seed, Some(&saved)).await.unwrap();
+    assert_eq!(m2.spending().await.prepaid_millicents, all - 700);
+    // Closed: what the server really charged, not what was noted.
+    m.policy.idle_secs = 0;
+    m.tick().await;
+    let charged: i64 = stack.backend.dump()["sessions"].as_array().unwrap().iter().map(|s| s["spent_nano"].as_i64().unwrap() / 10_000).sum();
+    let s = m.spending().await;
+    assert_eq!(s.spent.iter().map(|e| e.millicents).sum::<i64>(), charged);
+    assert_eq!(s.spent.len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_a_pass_models_that_need_one_are_refused_and_tiny_sessions_work() {
     let stack = start_stack().await;
@@ -898,9 +933,11 @@ async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_lo
     let charged = || -> i64 {
         stack.backend.dump()["sessions"].as_array().unwrap().iter().map(|s| s["spent_nano"].as_i64().unwrap() / 10_000).sum()
     };
+    m.note_cost("chat-a", 300);
+    m.note_cost("chat-b", 400);
     let live = m.spending().await.spent;
     assert_eq!(live.len(), 2, "both conversations' sessions: {live:?}");
-    assert!(live.iter().map(|e| e.millicents).sum::<i64>() >= charged());
+    assert_eq!(live.iter().map(|e| e.millicents).sum::<i64>(), 700, "what their replies said");
 
     // Quiet conversations are closed for their change.
     m.policy.idle_secs = 0;
