@@ -565,6 +565,7 @@ impl Client {
                 opened_at: now(),
                 funded_millicents: 0,
                 used_at: 0,
+                noted_millicents: 0,
             });
             wallet.save()?;
             let req = Request::post_json(
