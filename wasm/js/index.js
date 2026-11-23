@@ -12,6 +12,11 @@
 //   const res = await u.fetch('/v1/chat/completions', { method: 'POST', body }, { chat: conversationId });
 import init, { accountKeys, newAccountNumber, newAccountCode, credentialKind, Manager } from './unlinkable_inference_wasm.js';
 
+// How many times a request's session is topped up (each time by more: 10¢, 20¢ ... $3.20) and the
+// request sent again. With the 10¢ it opens with, up to $6.40: a pricey model's reply ($1 held) to
+// a prompt that fills its context. The money comes from the wallet: keep it full enough.
+const TOP_UPS = 6;
+
 let loaded;
 
 /** Load the WebAssembly module (once). Pass `wasmUrl` if it is not next to this file. */
@@ -100,7 +105,7 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
                 headers.set('Authorization', 'Bearer ' + secret);
                 if (rest) headers.set('X-Session-Rest', '1');
                 const res = await fetch(url, { ...init, headers, credentials: 'omit' });
-                if (attempt < 4 && !held && !rest && res.status === 402) {
+                if (attempt < TOP_UPS && !held && !rest && res.status === 402) {
                     const add = () => run(m.ranOut(secret, attempt)).then(() => true, () => false);
                     rest = !(await add()) && !((await funded()) && (await add()));
                     continue;
