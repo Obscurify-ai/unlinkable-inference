@@ -169,6 +169,9 @@ pub struct Proxy {
     account_key: Mutex<Option<String>>,
     /// When the account is asked next, and what for (see [`Proxy::refill`])
     contact: Mutex<Contact>,
+    /// The contact made as the proxy starts is done (requests wait for it: it is the account's
+    /// own moment, not theirs)
+    started: std::sync::atomic::AtomicBool,
     /// The labels the account gets passes for, as last asked (at most every 10 minutes), and when
     offered: tokio::sync::Mutex<Option<(unlinkable_inference::protocol::PassAllowance, std::time::Instant)>>,
     /// The helper session's last seen balance (see [`Proxy::helper_secret`])
@@ -319,6 +322,8 @@ impl Proxy {
             account_key: Mutex::new(settings.account_key.clone()),
             contact: Mutex::new(Contact { next: now(), waiting: false, account_empty: false, release_at: 0, wanted: Default::default(), held: Default::default() }),
             offered: tokio::sync::Mutex::new(None),
+            // Without a key at start there is no start-up contact to wait for.
+            started: std::sync::atomic::AtomicBool::new(settings.account_key.is_none()),
             helper_balance: Mutex::new(String::new()),
             settings,
             opts,
@@ -384,7 +389,12 @@ impl Proxy {
         if !c.held.contains(key) {
             return None;
         }
-        let until = if c.waiting { Some(c.next.max(c.release_at)) } else { (now() < c.release_at).then_some(c.release_at) };
+        // Waiting: until the contact, or (one is under way, the next already set far off) a moment.
+        let until = if c.waiting {
+            Some(if c.next > now() + self.settings.wait_secs.1 { now() + 2 } else { c.next.max(c.release_at) })
+        } else {
+            (now() < c.release_at).then_some(c.release_at)
+        };
         if until.is_none() {
             c.held.remove(key);
         }
@@ -410,6 +420,7 @@ impl Proxy {
         }
         let Some(key) = self.account_key.lock().unwrap().clone() else {
             self.contact.lock().unwrap().waiting = false;
+            self.started.store(true, Ordering::SeqCst);
             return;
         };
         let wanted: Vec<String> = self.contact.lock().unwrap().wanted.iter().cloned().collect();
@@ -468,6 +479,8 @@ impl Proxy {
             c.release_at = now() + random_secs(self.settings.wait_secs);
         }
         c.waiting = false;
+        drop(c);
+        self.started.store(true, Ordering::SeqCst);
     }
 
     /// Keep `keep_passes` of each label the account gets (only `only`, when given). The
@@ -533,6 +546,10 @@ impl Proxy {
             let mut known = self.account_key.lock().unwrap();
             if known.is_none() {
                 *known = Some(key);
+                // Learned from a request: the account is first asked a random while later, not
+                // right after it.
+                let mut c = self.contact.lock().unwrap();
+                c.next = c.next.max(now() + random_secs(self.settings.wait_secs));
             }
         }
     }
@@ -551,6 +568,13 @@ impl Proxy {
         let _guard = self.opening.lock().await;
         if let Some(e) = self.sessions.lock().unwrap().get(key) {
             return Ok(e.clone());
+        }
+        // The proxy is starting: the contact it makes then comes first (up to 30 s).
+        for _ in 0..60 {
+            if self.started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         if let Some(at) = self.held_back() {
             return Err(Refilling(at).into());
