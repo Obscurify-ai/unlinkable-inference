@@ -426,12 +426,13 @@ impl Proxy {
             // The account's last cents (under $1) too.
             match self
                 .client
-                .withdraw_up_to(&mut wallet, &key, self.settings.refill_cents, 1)
+                .withdraw_up_to_left(&mut wallet, &key, self.settings.refill_cents, 1)
                 .await
             {
-                Ok(c) => {
+                Ok((c, left)) => {
                     tracing::info!("topped up the wallet with {} from the account", dollars(c));
-                    self.contact.lock().unwrap().account_empty = false;
+                    // Its last cents: a request that runs short doesn't wait for it.
+                    self.contact.lock().unwrap().account_empty = left == Some(0);
                 }
                 Err(e) => {
                     failed = true;

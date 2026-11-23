@@ -562,10 +562,11 @@ impl Manager {
         }
         if low(self) {
             let min = self.policy.min_cents.min(self.policy.refill_cents);
-            match self.client.withdraw_up_to(&mut self.wallet, &key, self.policy.refill_cents, min).await {
-                Ok(_) => {
+            match self.client.withdraw_up_to_left(&mut self.wallet, &key, self.policy.refill_cents, min).await {
+                Ok((_, left)) => {
                     self.refused_at = 0;
-                    self.account_empty = false;
+                    // It gave its last cents: a conversation that runs short doesn't wait for it.
+                    self.account_empty = left == Some(0);
                 }
                 // Refused (402: not enough in the account). A network failure tries again next time.
                 Err(e) if matches!(e.downcast_ref::<crate::net::ApiError>(), Some(crate::net::ApiError::Server { status: 402, .. })) => {

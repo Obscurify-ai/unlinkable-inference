@@ -794,8 +794,14 @@ impl Client {
     /// that is at least `min_cents` (under $1: 50¢, 20¢, 10¢, 5¢, 2¢ or 1¢). Returns the cents
     /// moved; an account below `min_cents` is an error, and its balance stays in the account.
     pub async fn withdraw_up_to(&self, wallet: &mut Wallet, api_key: &str, cents: i64, min_cents: i64) -> Result<i64> {
+        Ok(self.withdraw_up_to_left(wallet, api_key, cents, min_cents).await?.0)
+    }
+
+    /// [`Client::withdraw_up_to`], also saying what the account holds afterwards when that is
+    /// known (it held less than `cents`): `Some(0)`, it has nothing more to give.
+    pub async fn withdraw_up_to_left(&self, wallet: &mut Wallet, api_key: &str, cents: i64, min_cents: i64) -> Result<(i64, Option<i64>)> {
         let err = match self.withdraw(wallet, api_key, cents).await {
-            Ok(got) => return Ok(got),
+            Ok(got) => return Ok((got, None)),
             Err(e) => e,
         };
         let available = match err.downcast_ref::<ApiError>() {
@@ -812,7 +818,8 @@ impl Client {
         } else {
             WITHDRAW_SIZES.iter().copied().filter(|s| *s <= available).max().unwrap_or(100)
         };
-        self.withdraw(wallet, api_key, take).await
+        let got = self.withdraw(wallet, api_key, take).await?;
+        Ok((got, Some(available - got)))
     }
 
     async fn withdraw_with(
