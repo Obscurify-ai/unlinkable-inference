@@ -530,7 +530,7 @@ async fn accounts_with_and_without_passes_look_the_same_until_a_pass_is_needed()
 /// Settings for a test proxy: the account is asked at its start and, after that, only when a
 /// request waits (in a second or two), so a test sees every contact the requests brought on.
 fn waiting_settings(key: &str) -> Settings {
-    Settings { account_key: Some(key.to_string()), contact_secs: (3600, 3600), wait_secs: (2, 3), ..Settings::default() }
+    Settings { account_key: Some(key.to_string()), contact_secs: (3600, 3600), wait_secs: (2, 3), fund_now: false, ..Settings::default() }
 }
 
 /// Send until the proxy stops answering 503 (the wallet refilling), sleeping as it says (it
@@ -723,12 +723,11 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
     };
     // Empty wallet, no setup: the client sends its usual key, as it would to
     // the API directly.
-    // The key is learned from that request, so the wallet is filled a random moment later (not
-    // at once: that would tie the request to the account); the request waits until then.
+    // The key is learned from that request, and the wallet is filled from the account at once:
+    // the request is served without waiting (Settings::fund_now, the default).
     let settings = Settings {
         account_key_prefix: "sk-test_".into(),
         contact_secs: (3600, 3600),
-        wait_secs: (2, 3),
         ..Settings::default()
     };
     let (_proxy, url) = start_proxy(&opts, settings).await;
@@ -740,7 +739,7 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
     })
     .await;
     assert_eq!(resp.status(), 200, "the model that needs a pass works, with nothing set up");
-    assert!(waits >= 1, "the first request waited for the wallet");
+    assert_eq!(waits, 0, "the first request didn't wait");
     let st = status(&url).await;
     assert!(st["wallet"]["paid_cents"].as_i64().unwrap() > 0, "{st}");
     assert!(st["wallet"]["passes"].as_i64().unwrap() > 0);
@@ -759,7 +758,6 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
             assert_eq!(r["credential"], "session", "{r}");
         }
     }
-    assert_account_never_follows_a_chat(&db, 900);
 }
 
 /// Claude Code without a base URL change: `unlinkable-inference mcp` runs as one of the
@@ -1430,12 +1428,9 @@ async fn an_account_with_no_money_chats_on_free_models_by_pass() {
     // Nothing of the account is on the sessions.
     let dump = stack.backend.dump();
     assert!(!dump["sessions"].to_string().contains(&unlinkable_inference::sha256_hex(&key)));
-    // Money arrives: the account is asked again when the app says so (a payment is a moment of
-    // the account's own), and the conversation goes on.
+    // Money arrives some other way: the next request that needs it finds it at once
+    // (Policy::fund_now), and the conversation goes on.
     stack.backend.add_balance(&key, 5);
-    assert!(m.ran_out(&s, 0).await.is_err(), "not asked again yet");
-    assert!(m.refilling().is_none(), "an empty account isn't waited for");
-    m.money_added().await;
     m.ran_out(&s, 0).await.unwrap();
     assert_eq!(ask(s.clone(), "echo").await, 200);
 
@@ -1620,6 +1615,7 @@ async fn an_app_never_asks_the_account_because_a_conversation_needs_money() {
     m.policy.contact_max_secs = 3600;
     m.policy.wait_min_secs = 2;
     m.policy.wait_max_secs = 3;
+    m.policy.fund_now = false;
     let policy = m.policy.clone();
     m.start().await.unwrap();
     assert_eq!(balance_cents(&stack.server, &key).await, 900, "$1 when the app started");
@@ -1673,6 +1669,7 @@ async fn a_conversation_that_waits_keeps_its_session() {
     m.policy.contact_max_secs = 3600;
     m.policy.wait_min_secs = 2;
     m.policy.wait_max_secs = 3;
+    m.policy.fund_now = false;
     m.policy.idle_secs = 1;
     m.start().await.unwrap();
     let s = m.session("one").await.unwrap();

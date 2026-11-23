@@ -60,17 +60,17 @@ use Tor or a VPN, or at least withdraw from a different network.
   across sessions links them by content.
 - **The address**. Hide it with Tor or a VPN.
 - **Timing**. Whatever the amounts, a withdrawal followed a second later by a session opening
-  or topping up points at the account, on a quiet server most of all. So clients never ask the
-  account because a conversation needs something: they ask it at moments of its own (the app
-  starting, a sign-in, a payment) and at random times 5 to 30 minutes apart, and a conversation
-  the wallet can't pay waits ("the private wallet is refilling"): the next contact is brought
-  forward to a random moment 30 s to 5 min away, and the conversation goes on a random 30 s to
-  5 min after it, never at once. Under $1 the account's balance moves in fixed sizes (50¢, 20¢,
-  10¢, 5¢, 2¢, 1¢), one per contact, so no withdrawal's amount matches what one session spends.
-  What is left: a few minutes is little cover while few people use the server (some 5 sessions
-  an hour at Obscurify in November 2026), and an app's own signed-in requests when it opens
-  (balance, plan) are as telling as a withdrawal for a chat started a few seconds later.
-  Sessions opened with a pass and no money have no amount to compare.
+  or topping up points at the account, on a quiet server most of all. Clients keep the wallet
+  stocked ahead of time (at least $2, $5 at a time) and ask the account at moments of its own
+  (the app starting, a sign-in, a payment) and at random times 5 to 30 minutes apart, so most
+  conversations never need it. When one does (the wallet is empty, or short of a pass), the
+  account is asked at once by default, so nobody is kept waiting: those two requests are then
+  seconds apart. `Policy::fund_now = false` (the proxy's `Settings::fund_now`) makes the
+  conversation wait instead, until a random while after a contact 30 s to 5 min away.
+  Under $1 the account's balance moves in fixed sizes (50¢, 20¢, 10¢, 5¢, 2¢, 1¢).
+  An app's own signed-in requests when it opens (balance, plan) are as telling as a withdrawal
+  for a chat started a few seconds later. Sessions opened with a pass and no money have no
+  amount to compare.
 - **Denominations**. Change comes back in the standard split, so its values
   say how much was left; spending those exact values later is weakly
   suggestive. `unlinkable-inference exchange` trades them for a standard set. Dust is

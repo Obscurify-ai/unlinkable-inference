@@ -80,6 +80,11 @@ pub struct Policy {
     /// goes on a random while this long after it (a top-up right after the withdrawal would too).
     pub wait_min_secs: u64,
     pub wait_max_secs: u64,
+    /// A conversation that needs money or a pass the wallet doesn't hold gets it from the
+    /// account at once (default). The account's request and the conversation's are then seconds
+    /// apart, a hint that they go together; false makes the conversation wait instead (see
+    /// [`Refilling`]), for apps that put that first.
+    pub fund_now: bool,
     /// Keep this many of this month's passes of each label the account gets, asking for
     /// `pass_batch` at a time.
     pub keep_passes: usize,
@@ -113,6 +118,7 @@ impl Default for Policy {
             // Before the contact and again after it: a few minutes in all, on average.
             wait_min_secs: 30,
             wait_max_secs: 300,
+            fund_now: true,
             keep_passes: 10,
             pass_batch: 30,
             labels_every_secs: 600,
@@ -356,7 +362,13 @@ impl Manager {
                 match self.client.open(&mut self.wallet, Family::Paid, cents).await {
                     Ok(s) => s,
                     Err(e) => {
-                        if let Some(waiting) = self.wait() {
+                        if self.fund_now().await {
+                            if let Ok(s) = self.client.open(&mut self.wallet, Family::Paid, cents).await {
+                                self.chats.insert(chat.to_string(), (s.secret.clone(), unix_now()));
+                                self.wallet.used_session(&s.secret, unix_now());
+                                return Ok(s.secret);
+                            }
+                        } else if let Some(waiting) = self.wait() {
                             return Err(waiting.into());
                         }
                         // No money anywhere: what costs none still works.
@@ -368,6 +380,19 @@ impl Manager {
         self.chats.insert(chat.to_string(), (opened.secret.clone(), unix_now()));
         self.wallet.used_session(&opened.secret, unix_now());
         Ok(opened.secret)
+    }
+
+    /// With `fund_now`: ask the account at once for what a conversation needs (money, passes),
+    /// even if it had nothing at the last contact (money may have been added since). False:
+    /// not asked (no key, or the app waits instead).
+    async fn fund_now(&mut self) -> bool {
+        if !self.policy.fund_now || self.api_key.is_none() {
+            return false;
+        }
+        self.account_empty = false;
+        self.offered = None;
+        self.contact().await;
+        true
     }
 
     /// A conversation needs what only the account can give. `None` when it has nothing to give
@@ -473,6 +498,7 @@ impl Manager {
         self.free_quiet(Some(secret)).await;
         match self.client.topup(&mut self.wallet, &session, cents).await {
             Ok(_) => Ok(()),
+            Err(e) if self.fund_now().await => self.client.topup(&mut self.wallet, &session, cents).await.map(|_| ()).map_err(|_| e),
             Err(e) => match self.wait() {
                 Some(waiting) => Err(waiting.into()),
                 None => Err(e),
@@ -510,6 +536,9 @@ impl Manager {
             return Ok(false);
         }
         self.wanted.insert(label.to_string());
+        if self.fund_now().await {
+            return self.client.present_pass(&mut self.wallet, &session, label).await;
+        }
         match self.wait() {
             Some(waiting) => Err(waiting.into()),
             None => Ok(false),

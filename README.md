@@ -37,7 +37,7 @@ let secret = m.session(&conversation_id).await?; // send as Authorization: Beare
 save(m.state());                               // after every call
 // 402: m.ran_out(&secret, attempt), retry. 401: m.expired(&secret), new session.
 // Every 30 s: m.tick().await (closes quiet sessions for their change, asks the account at random times).
-// Err(Refilling): the wallet is refilling. Hold the request until m.refilling() is None, then retry.
+// With policy.fund_now = false, Err(Refilling): hold the request until m.refilling() is None, then retry.
 // A payment or plan change in the app: m.money_added().await.
 ```
 
@@ -126,12 +126,11 @@ ANTHROPIC_MODEL=deepseek/deepseek-v4.1-flash claude
 
 OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, your usual key.
 The proxy uses that key for one thing: keeping the wallet (and this month's
-passes, where the server gives the account any) topped up in the background, at random times and
-never because a request needs it (that would tie the request to the account by timing). A
-request the wallet can't pay gets 503 with `Retry-After` (up to about 10 minutes); retry after
-it (most SDKs give up sooner on their own). Keep enough in the wallet (`--keep`, default $2) for
-the replies you expect, and start the proxy with the key (`OBSCURIFY_API_KEY`) so it fills the
-wallet when it starts.
+passes, where the server gives the account any) topped up in the background, at random times,
+so a request rarely needs the account. When one does, it is topped up at once (the two requests
+are then seconds apart: see THREAT_MODEL.md, Timing). Keep enough in the wallet (`--keep`,
+default $2) for the replies you expect, and start the proxy with the key (`OBSCURIFY_API_KEY`) so
+it fills the wallet when it starts.
 Chats go out with a session secret instead and are charged exactly their tokens, down to 0.001¢.
 
 `http://127.0.0.1:8899/_unlinkable` shows what the server received for each

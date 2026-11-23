@@ -69,6 +69,10 @@ pub struct Settings {
     pub contact_secs: (u64, u64),
     /// ...and, when a request waits for it, at a random moment this far away (never sooner).
     pub wait_secs: (u64, u64),
+    /// A request that needs money or a pass the wallet doesn't hold gets it from the account at
+    /// once (default; the two requests are then seconds apart, a hint that they go together).
+    /// False: the request waits (503, Retry-After) for a random contact instead.
+    pub fund_now: bool,
     /// Client keys starting with this are taken to be the account's key
     pub account_key_prefix: String,
 }
@@ -87,6 +91,7 @@ impl Default for Settings {
             keep_passes: 10,
             contact_secs: CONTACT_SECS,
             wait_secs: WAIT_SECS,
+            fund_now: true,
             account_key_prefix: "sk-obs1_".into(),
         }
     }
@@ -534,6 +539,11 @@ impl Proxy {
             }
             c.wanted.insert(label.to_string());
         }
+        if self.settings.fund_now && self.account_key.lock().unwrap().is_some() {
+            self.refill(true).await;
+            let mut wallet = self.wallet.lock().await;
+            return Ok(self.client.present_pass(&mut wallet, &entry.session, label).await.unwrap_or(false));
+        }
         match self.wait() {
             Some(at) => Err(at),
             None => Ok(false),
@@ -591,8 +601,15 @@ impl Proxy {
             Ok(s) => s,
             Err(e) => {
                 // The wallet is empty, or holds less than a session's minimum, and a request
-                // is waiting. Never top up now: the request waits for the next contact.
-                if let Some(at) = self.wait() {
+                // is waiting: top up now (or, without fund_now, wait for the next contact).
+                if self.settings.fund_now && self.account_key.lock().unwrap().is_some() {
+                    self.refill(true).await;
+                    let mut wallet = self.wallet.lock().await;
+                    if let Ok(s) = self.client.open(&mut wallet, family, self.settings.funding_cents).await {
+                        drop(wallet);
+                        return Ok(self.keep_entry(key, s, false));
+                    }
+                } else if let Some(at) = self.wait() {
                     return Err(Refilling(at).into());
                 }
                 // No money anywhere: what costs none still works.
@@ -600,6 +617,11 @@ impl Proxy {
                 self.open_free().await.ok_or(e)?
             }
         };
+        Ok(self.keep_entry(key, session, free))
+    }
+
+    /// A conversation's newly opened session, kept for its requests.
+    fn keep_entry(&self, key: &str, session: Session, free: bool) -> Arc<Entry> {
         let entry = Arc::new(Entry {
             session,
             free,
@@ -608,11 +630,8 @@ impl Proxy {
             opened_at: now(),
             requests: AtomicU64::new(0),
         });
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), entry.clone());
-        Ok(entry)
+        self.sessions.lock().unwrap().insert(key.to_string(), entry.clone());
+        entry
     }
 
     /// The secret of the helper session, opening one if there is none or the
@@ -672,10 +691,15 @@ impl Proxy {
         if unlinkable_inference::net::usd_to_cents_floor(&st.balance_usd) < self.settings.funding_cents {
             let mut wallet = self.wallet.lock().await;
             if wallet.balance_cents(entry.session.family) < self.settings.funding_cents {
-                // Never from the account now (this session just spent): at the next contact.
                 drop(wallet);
-                let _ = self.wait();
-                return;
+                if self.settings.fund_now {
+                    self.refill(true).await;
+                    wallet = self.wallet.lock().await;
+                } else {
+                    // Never from the account now (this session just spent): at the next contact.
+                    let _ = self.wait();
+                    return;
+                }
             }
             if let Err(e) = self
                 .client
@@ -835,13 +859,20 @@ impl Proxy {
                         self.client.topup(&mut wallet, &entry.session, cents).await
                     };
                     entry.busy.fetch_sub(1, Ordering::SeqCst);
-                    if result.is_err() {
-                        // The wallet is empty (or what it held was spent elsewhere): never top
-                        // it up now, as in `entry`. The request waits for the next contact.
-                        if let Some(at) = self.wait() {
-                            return self.hold(&key, at);
+                    let result = match result {
+                        // The wallet is empty (or what it held was spent elsewhere): top it up
+                        // now and try again, as in `entry` (or, without fund_now, wait).
+                        Err(_) if self.settings.fund_now && self.account_key.lock().unwrap().is_some() => {
+                            self.refill(true).await;
+                            let mut wallet = self.wallet.lock().await;
+                            self.client.topup(&mut wallet, &entry.session, cents).await
                         }
-                    }
+                        Err(e) => match self.wait() {
+                            Some(at) => return self.hold(&key, at),
+                            None => Err(e),
+                        },
+                        ok => ok,
+                    };
                     // Nothing more to add: the reply gets what the session's money still buys.
                     if let Err(e) = result {
                         if rest {
