@@ -28,7 +28,7 @@ pub mod manager;
 pub mod server;
 
 pub use blank::Blank;
-pub use denominations::{split, DENOMINATIONS, WITHDRAW_SIZES};
+pub use denominations::{split, DENOMINATIONS, SMALL_WITHDRAW_SIZES, WITHDRAW_SIZES};
 pub use keyset::{Keyset, Pins};
 pub use voucher::{Family, Voucher};
 pub use wallet::{Spend, Wallet};

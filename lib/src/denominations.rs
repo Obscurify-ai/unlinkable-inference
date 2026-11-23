@@ -10,6 +10,10 @@ pub const DENOMINATIONS: [i64; 18] = [
 /// mean a withdrawal's amount says nothing about what it will be spent on.
 pub const WITHDRAW_SIZES: [i64; 5] = [100, 500, 2000, 5000, 10000];
 
+/// What clients take from an account holding less than $1, one at a time: the largest that fits,
+/// the rest later. (Servers take any amount under $1, for older clients.)
+pub const SMALL_WITHDRAW_SIZES: [i64; 6] = [1, 2, 5, 10, 20, 50];
+
 /// Split an amount into voucher values, largest first. With 1-2-5 steps the
 /// greedy split is exact and short.
 pub fn split(mut cents: i64) -> Vec<i64> {

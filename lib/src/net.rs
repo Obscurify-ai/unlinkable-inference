@@ -6,7 +6,7 @@
 
 use crate::blank::Blank;
 use crate::denominations::{
-    blanks_for_any_amount_up_to, dust_blanks_for_any, split, MILLICENTS_PER_CENT, WITHDRAW_SIZES,
+    blanks_for_any_amount_up_to, dust_blanks_for_any, split, MILLICENTS_PER_CENT, SMALL_WITHDRAW_SIZES, WITHDRAW_SIZES,
 };
 use crate::keyset::Keyset;
 use crate::pass::{Pass, PassBlank};
@@ -790,8 +790,8 @@ impl Client {
         Ok(change.change_cents)
     }
 
-    /// Withdraw `cents`, or, when the account holds less, everything it has if that is at least
-    /// `min_cents` (all of it under $1, else the largest fixed size it covers). Returns the cents
+    /// Withdraw `cents`, or, when the account holds less, the largest fixed size it covers if
+    /// that is at least `min_cents` (under $1: 50¢, 20¢, 10¢, 5¢, 2¢ or 1¢). Returns the cents
     /// moved; an account below `min_cents` is an error, and its balance stays in the account.
     pub async fn withdraw_up_to(&self, wallet: &mut Wallet, api_key: &str, cents: i64, min_cents: i64) -> Result<i64> {
         let err = match self.withdraw(wallet, api_key, cents).await {
@@ -805,8 +805,10 @@ impl Client {
         let Some(available) = available.filter(|a| *a >= min_cents.max(1) && *a < cents) else {
             return Err(err);
         };
+        // Under $1, one of a few fixed sizes at a time (the rest at later top-ups): the exact last
+        // cents of a balance, 7¢ say, would match a session that spends exactly 7¢.
         let take = if available < 100 {
-            available
+            SMALL_WITHDRAW_SIZES.iter().copied().filter(|s| *s <= available).max().unwrap_or(available)
         } else {
             WITHDRAW_SIZES.iter().copied().filter(|s| *s <= available).max().unwrap_or(100)
         };

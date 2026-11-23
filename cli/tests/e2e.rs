@@ -527,38 +527,98 @@ async fn accounts_with_and_without_passes_look_the_same_until_a_pass_is_needed()
     assert!(stack.backend.dump()["spent_passes"].as_array().unwrap().is_empty(), "no pass was shown");
 }
 
-/// A conversation that runs out while the wallet is empty is topped up from the account on
-/// the spot; it doesn't fail until the background refill comes round (up to a minute later).
+/// Settings for a test proxy: the account is asked at its start and, after that, only when a
+/// request waits (in a second or two), so a test sees every contact the requests brought on.
+fn waiting_settings(key: &str) -> Settings {
+    Settings { account_key: Some(key.to_string()), contact_secs: (3600, 3600), wait_secs: (2, 3), ..Settings::default() }
+}
+
+/// Send until the proxy stops answering 503 (the wallet refilling), sleeping as it says (it
+/// tops up on its 5 s tick). Returns the answer and how many times it said to wait.
+async fn until_filled(send: impl Fn() -> reqwest::RequestBuilder) -> (reqwest::Response, usize) {
+    let mut waits = 0;
+    loop {
+        let r = send().send().await.unwrap();
+        if r.status() != 503 || waits >= 12 {
+            return (r, waits);
+        }
+        let after: u64 = r.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).expect("a 503 says when to try again");
+        assert!(after <= 600, "{after}");
+        waits += 1;
+        tokio::time::sleep(Duration::from_secs(after.min(3) + 3)).await;
+    }
+}
+
+/// The rule behind the whole design: nothing a conversation does makes a request with the
+/// account's key, and a conversation never goes on right after one. A request with the
+/// account's key never comes within `gap_ms` of a conversation's own (a chat, an open, a top-up,
+/// a pass), before or after, except the first ones (the proxy or app starting) before any.
+fn assert_account_never_follows_a_chat(db: &Value, gap_ms: u64) {
+    let rows = db["requests"].as_array().unwrap();
+    let chatty = |r: &Value| {
+        let p = r["path"].as_str().unwrap();
+        p.starts_with("/v1/") || p == "/u/sessions" || p == "/u/sessions/topup" || p == "/u/sessions/pass"
+    };
+    let at = |r: &Value| r["at_ms"].as_u64().unwrap();
+    let Some(first) = rows.iter().position(chatty) else { return };
+    // (`/test/` is the test itself reading balances.)
+    let account: Vec<u64> = rows[first..]
+        .iter()
+        .filter(|r| r["credential"] == "account" && !r["path"].as_str().unwrap().starts_with("/test/"))
+        .map(at)
+        .collect();
+    for r in rows[first..].iter().filter(|r| chatty(r)) {
+        for &a in &account {
+            assert!(at(r).abs_diff(a) >= gap_ms, "an account request {} ms from a conversation's: {r}", at(r).abs_diff(a));
+        }
+    }
+}
+
+/// A conversation that runs out while the wallet is empty waits (503 with Retry-After): the
+/// account is never asked at that moment, which would tie the two together by timing. The
+/// wallet is filled a random second or two later, and the request goes on. When the account
+/// has nothing left, the reply gets what the session still holds, or fails and says why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_session_that_runs_out_on_an_empty_wallet_is_topped_up_from_the_account() {
+async fn a_conversation_that_runs_dry_waits_for_the_wallet_and_never_asks_the_account_then() {
     let stack = start_stack().await;
-    let key = new_account(&stack.server, 150).await;
+    let key = new_account(&stack.server, 250).await;
     let opts = Options {
         server: stack.server.clone(),
         wallet: Some(temp_wallet()),
         pins: vec![],
     };
     // Each session takes the whole $1 refill, so the wallet is empty while it runs.
-    let settings = Settings { account_key: Some(key.clone()), funding_cents: 100, ..Settings::default() };
+    let settings = Settings { funding_cents: 100, keep_cents: 50, refill_cents: 100, ..waiting_settings(&key) };
     let (proxy, url) = start_proxy(&opts, settings).await;
-    proxy.refill(true).await;
+    for _ in 0..40 {
+        if status(&url).await["wallet"]["paid_cents"] == 100 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(stack.backend.account_balance(&key), Some(150), "the proxy took $1 as it started");
     // Costs more than $1 ($2 per million characters): the session's next request gets a 402.
     let long = "x".repeat(600_000);
     let body = |more: &str| json!({"model": "echo", "messages": [
         {"role": "user", "content": long.clone()}, {"role": "user", "content": more}]});
     let http = reqwest::Client::new();
-    let post = |b: Value| http.post(format!("{url}/v1/chat/completions")).json(&b).send();
-    assert_eq!(post(body("one")).await.unwrap().status(), 200);
+    let post = |b: Value| http.post(format!("{url}/v1/chat/completions")).json(&b);
+    assert_eq!(post(body("one")).send().await.unwrap().status(), 200);
     assert_eq!(status(&url).await["wallet"]["paid_cents"], 0);
-    let again = post(body("one")).await.unwrap();
-    let code = again.status();
-    assert_eq!(code, 200, "topped up from the account: {}", again.text().await.unwrap());
+    let wait = post(body("one")).send().await.unwrap();
+    assert_eq!(wait.status(), 503, "{}", wait.text().await.unwrap());
+    assert_eq!(stack.backend.account_balance(&key), Some(150), "nothing taken from the account while the request waited");
+    let (again, waits) = until_filled(|| post(body("one"))).await;
+    assert_eq!(again.status(), 200, "{}", again.text().await.unwrap());
+    assert!(waits >= 1);
+    assert_eq!(stack.backend.account_balance(&key), Some(50), "$1 at the next contact");
     assert_eq!(status(&url).await["sessions"].as_array().unwrap().len(), 1, "still the same session");
-    // Nothing left anywhere: it fails, and says why.
-    assert_eq!(balance_cents(&stack.server, &key).await, 0);
-    let broke = post(body("one")).await.unwrap();
-    assert_eq!(broke.status(), 402);
-    assert!(broke.text().await.unwrap().contains("the wallet is empty"));
+    // The last 50¢, then nothing left anywhere: the reply gets what the session holds, or the
+    // proxy says why it can't.
+    let (last, _) = until_filled(|| post(body("one"))).await;
+    assert_eq!(stack.backend.account_balance(&key), Some(0));
+    assert_ne!(last.status(), 503, "an empty account isn't waited for");
+    assert_account_never_follows_a_chat(&stack.backend.dump(), 900);
     proxy.close_all().await;
 }
 
@@ -663,23 +723,28 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
     };
     // Empty wallet, no setup: the client sends its usual key, as it would to
     // the API directly.
+    // The key is learned from that request, so the wallet is filled a random moment later (not
+    // at once: that would tie the request to the account); the request waits until then.
     let settings = Settings {
         account_key_prefix: "sk-test_".into(),
+        contact_secs: (3600, 3600),
+        wait_secs: (2, 3),
         ..Settings::default()
     };
     let (_proxy, url) = start_proxy(&opts, settings).await;
-    let resp = reqwest::Client::new()
-        .post(format!("{url}/v1/chat/completions"))
-        .header("authorization", format!("Bearer {key}"))
-        .json(&json!({"model": "echo-plus", "messages": [{"role": "user", "content": "hello"}]}))
-        .send()
-        .await
-        .unwrap();
+    let http = reqwest::Client::new();
+    let (resp, waits) = until_filled(|| {
+        http.post(format!("{url}/v1/chat/completions"))
+            .header("authorization", format!("Bearer {key}"))
+            .json(&json!({"model": "echo-plus", "messages": [{"role": "user", "content": "hello"}]}))
+    })
+    .await;
     assert_eq!(resp.status(), 200, "the model that needs a pass works, with nothing set up");
+    assert!(waits >= 1, "the first request waited for the wallet");
     let st = status(&url).await;
     assert!(st["wallet"]["paid_cents"].as_i64().unwrap() > 0, "{st}");
     assert!(st["wallet"]["passes"].as_i64().unwrap() > 0);
-    assert_eq!(stack.backend.account_balance(&key), Some(1_900), "one $1 top-up");
+    assert_eq!(stack.backend.account_balance(&key), Some(1_500), "one $5 top-up");
 
     let db = stack.backend.dump();
     for r in db["requests"].as_array().unwrap() {
@@ -694,6 +759,7 @@ async fn the_customer_just_uses_their_key_and_the_server_never_sees_it_with_a_ch
             assert_eq!(r["credential"], "session", "{r}");
         }
     }
+    assert_account_never_follows_a_chat(&db, 900);
 }
 
 /// Claude Code without a base URL change: `unlinkable-inference mcp` runs as one of the
@@ -999,13 +1065,13 @@ async fn when_what_the_account_gets_changes_every_device_follows() {
     let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
     small(&mut m);
     m.start().await.unwrap();
-    assert!(m.wallet().vouchers().len() > 0 && m.summary().1 == 0);
+    assert!(!m.wallet().vouchers().is_empty() && m.summary().1 == 0);
     let s = m.session("chat-a").await.unwrap();
     assert_eq!(plus_chat(s.clone()).await, (403, need.clone()));
     assert!(!m.needs_pass(&s, "plus").await.unwrap(), "the account has none to give: show the error");
     let asked = account_requests(&stack);
     assert!(!m.needs_pass(&s, "plus").await.unwrap());
-    assert_eq!(account_requests(&stack), asked, "the account is asked about a label at most once a minute");
+    assert_eq!(account_requests(&stack), asked, "the account isn't asked about a label a conversation needs");
 
     // Billing gives the account the label (an upgrade).
     stack.backend.set_labels(&key, &["plus"]);
@@ -1022,11 +1088,15 @@ async fn when_what_the_account_gets_changes_every_device_follows() {
     assert_eq!(plus_chat(p.clone()).await.0, 200);
     assert_eq!(phone.wallet().passes_of(&period, "plus"), 3);
 
-    // The first device still believes the account gets nothing (it asks every 10 minutes).
-    // A minute after its last refusal, the conversation's 403 makes it ask now: the same
-    // session gets a pass and the retry works. Nothing was closed or reopened.
-    m.policy.label_retry_secs = 0;
+    // The first device still believes the account gets nothing (it was told so at its last
+    // contact): its conversation is told no at once, never by asking the account right then.
+    // The upgrade is a moment of the account's own: the app says so, the account is asked, and
+    // the same session gets a pass. Nothing was closed or reopened.
     assert_eq!(plus_chat(s.clone()).await, (403, need.clone()));
+    let asked = account_requests(&stack);
+    assert!(!m.needs_pass(&s, "plus").await.unwrap(), "not offered at the last contact: no");
+    assert_eq!(account_requests(&stack), asked, "the account wasn't asked");
+    m.money_added().await;
     assert!(m.needs_pass(&s, "plus").await.unwrap(), "the account gets the label now: retry");
     assert_eq!(m.session("chat-a").await.unwrap(), s, "the conversation keeps its session");
     assert_eq!(plus_chat(s.clone()).await.0, 200);
@@ -1159,9 +1229,11 @@ async fn two_devices_never_share_a_session(server: &str, key: &str) {
         m.api_key = Some(key.to_string());
         m.policy.funding_cents = 10;
         m.policy.refill_cents = 500; // a fixed withdrawal size
-        // Both spend one shared wallet, faster than any person: look in it every time it runs low.
+        // Both spend one shared wallet, filled when they start (a moment of the account's own).
         m.policy.share_every_secs = 0;
     }
+    phone.start().await.unwrap();
+    laptop.start().await.unwrap();
     for i in 0..20 {
         for m in [&mut phone, &mut laptop] {
             let s = m.session(&format!("chat-{i}")).await.unwrap();
@@ -1224,6 +1296,8 @@ async fn devices_on_one_account_share_one_wallet() {
     let device = || async {
         let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
         m.api_key = Some(key.clone());
+        m.policy.keep_cents = 50;
+        m.policy.refill_cents = 100;
         m
     };
 
@@ -1275,8 +1349,9 @@ async fn devices_on_one_account_share_one_wallet() {
     assert_eq!(missing, 0, "the browser's change is the phone's to spend too ({missing} of {} missing)", change.len());
 }
 
-/// No balance is stranded: 73¢ is spent privately, and 7¢ (below the 10¢ a session needs) stays
-/// in the account for the app to spend there, without asking again on every tick.
+/// No balance is stranded: 73¢ and 7¢ are spent privately, taken in fixed sizes (50¢, 20¢, 10¢,
+/// 5¢, 2¢, 1¢) at separate contacts, so no withdrawal's amount matches what one session spends.
+/// An empty account isn't asked again on every tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_cent_of_a_small_balance_is_spent_privately() {
     use unlinkable_inference::manager::Manager;
@@ -1286,7 +1361,11 @@ async fn every_cent_of_a_small_balance_is_spent_privately() {
     let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
     m.api_key = Some(key.clone());
     m.start().await.unwrap();
-    assert_eq!(m.wallet().balance_cents(Family::Paid), 73, "all 73¢ moved");
+    assert_eq!(m.wallet().balance_cents(Family::Paid), 50, "50¢ first");
+    for _ in 0..3 {
+        m.refill().await;
+    }
+    assert_eq!(m.wallet().balance_cents(Family::Paid), 73, "then 20¢, 2¢ and 1¢: all 73¢ moved");
     assert_eq!(balance_cents(&stack.server, &key).await, 0);
     let s = m.session("chat").await.unwrap();
     assert_eq!(echo(&stack.server, &s).await, 200);
@@ -1296,7 +1375,8 @@ async fn every_cent_of_a_small_balance_is_spent_privately() {
     let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
     m.api_key = Some(key.clone());
     m.start().await.unwrap();
-    assert_eq!(m.wallet().balance_cents(Family::Paid), 7, "7¢ move too");
+    m.refill().await;
+    assert_eq!(m.wallet().balance_cents(Family::Paid), 7, "7¢ move too, as 5¢ and 2¢");
     assert_eq!(balance_cents(&stack.server, &key).await, 0);
     let s = m.session("chat").await.unwrap();
     assert_eq!(echo(&stack.server, &s).await, 200);
@@ -1350,10 +1430,12 @@ async fn an_account_with_no_money_chats_on_free_models_by_pass() {
     // Nothing of the account is on the sessions.
     let dump = stack.backend.dump();
     assert!(!dump["sessions"].to_string().contains(&unlinkable_inference::sha256_hex(&key)));
-    // Money arrives: the account is asked again when the app says so, and the conversation goes on.
+    // Money arrives: the account is asked again when the app says so (a payment is a moment of
+    // the account's own), and the conversation goes on.
     stack.backend.add_balance(&key, 5);
     assert!(m.ran_out(&s, 0).await.is_err(), "not asked again yet");
-    m.ask_again();
+    assert!(m.refilling().is_none(), "an empty account isn't waited for");
+    m.money_added().await;
     m.ran_out(&s, 0).await.unwrap();
     assert_eq!(ask(s.clone(), "echo").await, 200);
 
@@ -1517,4 +1599,48 @@ async fn quiet_conversations_give_their_money_to_the_one_in_use() {
     m.policy.quiet_secs = 0;
     let s = m.session("c").await.expect("the quiet conversations' change funds it");
     assert_eq!(short(s).await, 200);
+}
+
+/// What web and Android do (the Manager): a conversation that finds the wallet empty is told to
+/// wait (`Refilling`), and the account is asked only at the contact a random moment later; the
+/// conversation goes on a random while after that, never right after the account's withdrawal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_never_asks_the_account_because_a_conversation_needs_money() {
+    use unlinkable_inference::manager::{Manager, Refilling};
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 1_000).await;
+    let seed = unlinkable_inference::seed::account_keys("4410 2876 3391 0057").unwrap().seed;
+    let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.policy.keep_cents = 50;
+    m.policy.refill_cents = 100;
+    m.policy.funding_cents = 100;
+    m.policy.contact_min_secs = 3600;
+    m.policy.contact_max_secs = 3600;
+    m.policy.wait_min_secs = 2;
+    m.policy.wait_max_secs = 3;
+    m.start().await.unwrap();
+    assert_eq!(balance_cents(&stack.server, &key).await, 900, "$1 when the app started");
+    let first = m.session("one").await.unwrap();
+    assert_eq!(echo(&stack.server, &first).await, 200);
+    // The dollar is in that session: another conversation finds the wallet empty.
+    let err = m.session("two").await.unwrap_err();
+    assert!(err.downcast_ref::<Refilling>().is_some(), "{err:#}");
+    assert!(m.refilling().is_some());
+    m.tick().await;
+    assert_eq!(balance_cents(&stack.server, &key).await, 900, "not asked at once");
+    // The app keeps ticking (every 30 s; faster here) and holds the request until refilling()
+    // says it may go.
+    for _ in 0..40 {
+        if m.refilling().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        m.tick().await;
+    }
+    assert!(m.refilling().is_none(), "filled, and the hold-back over");
+    assert_eq!(balance_cents(&stack.server, &key).await, 800, "$1 at the contact");
+    let second = m.session("two").await.unwrap();
+    assert_eq!(echo(&stack.server, &second).await, 200);
+    assert_account_never_follows_a_chat(&stack.backend.dump(), 900);
 }

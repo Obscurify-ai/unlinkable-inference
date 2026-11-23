@@ -54,7 +54,11 @@ export async function kind(input) {
 /**
  * Start private sessions. Closes sessions left from last time, brings back
  * whatever a lost browser left behind, tops the wallet up, and from then on
- * closes quiet conversations' sessions and tops up every `tickMs`.
+ * closes quiet conversations' sessions every `tickMs`, and asks the account for what the wallet
+ * lacks at random times. Never because a conversation needs it: a withdrawal a second before a
+ * session opens or tops up ties the two together by timing. A request the wallet can't pay
+ * waits ("the private wallet is refilling", `onWait`) until a random while after the next
+ * contact, then goes.
  *
  *   seed         hex, from keys()
  *   apiKey       the account's API key (or an async function for it), used only
@@ -62,8 +66,8 @@ export async function kind(input) {
  *   server       the API's origin (default: this page's)
  *   storage      where the wallet is kept (default localStorage), under `name`
  *   replyHeader  a response header naming a reply the server holds for later
- *   hasFunds     async function, asked when a request ran out of money and the account has
- *                refused to give more lately: true when it has some now
+ *   hasFunds     unused since 0.3 (asking the account after a request ran out would tie the
+ *                two together); call `moneyAdded()` when money is added in the app instead
  */
 export async function connect({ seed, apiKey, server = location.origin, storage = localStorage, name = 'unlinkable-inference', replyHeader, hasFunds, tickMs = 30000 }) {
     await load();
@@ -76,6 +80,12 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
     const run = async (p) => {
         try { return await p; } finally { save(); }
     };
+    // m.refilling(), waiting out a call that holds the wallet (it says undefined then).
+    const refilling = async () => {
+        let at;
+        while ((at = m.refilling()) === undefined) await new Promise((r) => setTimeout(r, 50));
+        return at;
+    };
     await run(m.start());
     const timer = setInterval(() => run(m.tick()).catch(() => {}), tickMs);
 
@@ -83,19 +93,31 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
         /** fetch() for conversation `chat` (or held reply `reply`), with its
          *  session secret and no cookie. Tops the session up when it runs out, and
          *  presents a pass when the server asks for one. */
-        async fetch(url, init = {}, { chat = 'default', reply } = {}) {
+        async fetch(url, init = {}, { chat = 'default', reply, onWait } = {}) {
             const held = reply ? await m.reply(reply) : null;
-            // The account refused a top-up lately (it is asked again only after ten minutes), but
-            // has money now: ask it again.
-            const funded = async () => {
-                if (!hasFunds || !(await hasFunds().catch(() => false))) return false;
-                await m.askAgain();
+            // The wallet is refilling for this conversation: hold the request (onWait(at) says so,
+            // onWait(null) when it goes on) and keep the clock running until it may go. False:
+            // nothing to wait for (the account has nothing to give).
+            const hold = async () => {
+                let at = await refilling();
+                if (at === null) return false;
+                if (onWait) onWait(at);
+                while ((at = await refilling()) !== null) {
+                    await new Promise((r) => setTimeout(r, 5000));
+                    await run(m.tick()).catch(() => {});
+                }
+                if (onWait) onWait(null);
                 return true;
             };
-            const open = () => run(m.session(chat)).catch(async (e) => {
-                if (await funded()) return run(m.session(chat));
-                throw e;
-            });
+            const open = async () => {
+                for (;;) {
+                    try {
+                        return await run(m.session(chat));
+                    } catch (e) {
+                        if (!(await hold())) throw e;
+                    }
+                }
+            };
             let secret = held || (await open());
             let passes = 0;
             let rest = false; // nothing more to add: spend what the session has
@@ -107,14 +129,25 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
                 const res = await fetch(url, { ...init, headers, credentials: 'omit' });
                 if (attempt < TOP_UPS && !held && !rest && res.status === 402) {
                     const add = () => run(m.ranOut(secret, attempt)).then(() => true, () => false);
-                    rest = !(await add()) && !((await funded()) && (await add()));
+                    let added = await add();
+                    while (!added && (await hold())) added = await add();
+                    rest = !added;
                     continue;
                 }
                 // The server wants a pass for this request (it names the label): present one
                 // from the wallet and send the request again. With none to present, send it
                 // once more as it was (a server may serve it another way, at another price).
                 const label = res.status === 403 && !held && passes < 8 && (await passRequired(res));
-                if (label && (await run(m.needsPass(secret, label)).catch(() => false))) {
+                const shown = async () => {
+                    for (;;) {
+                        try {
+                            return await run(m.needsPass(secret, label));
+                        } catch (e) {
+                            if (!(await hold())) return false;
+                        }
+                    }
+                };
+                if (label && (await shown())) {
                     passes++;
                     attempt--;
                     continue;
@@ -134,6 +167,11 @@ export async function connect({ seed, apiKey, server = location.origin, storage 
                 return res;
             }
         },
+        /** Money was added to the account, or its plan changed, in this app (a moment of the
+         *  account's own): ask it now. */
+        moneyAdded: () => run(m.moneyAdded()),
+        /** null, or the Unix time a waiting conversation may go on about. */
+        refilling,
         /** `{ paid_cents, passes }`, or null while busy. */
         summary: () => m.summary(),
         /** A reply in conversation `chat` said it cost `usd`: the balance shown while its

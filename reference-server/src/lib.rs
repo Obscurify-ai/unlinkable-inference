@@ -115,6 +115,8 @@ pub struct RequestRow {
     pub credential: String,
     pub had_cookie: bool,
     pub at: u64,
+    /// The same in milliseconds
+    pub at_ms: u64,
 }
 
 #[derive(Default)]
@@ -914,6 +916,7 @@ async fn record(State(app): State<App>, req: Request, next: Next) -> Response {
             credential: credential.into(),
             had_cookie: req.headers().contains_key("cookie"),
             at: unix(),
+            at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
         });
     }
     next.run(req).await

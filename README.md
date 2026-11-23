@@ -36,7 +36,9 @@ m.start().await?;                              // brings back what a lost device
 let secret = m.session(&conversation_id).await?; // send as Authorization: Bearer
 save(m.state());                               // after every call
 // 402: m.ran_out(&secret, attempt), retry. 401: m.expired(&secret), new session.
-// Every 30 s: m.tick().await (closes quiet sessions for their change, tops up).
+// Every 30 s: m.tick().await (closes quiet sessions for their change, asks the account at random times).
+// Err(Refilling): the wallet is refilling. Hold the request until m.refilling() is None, then retry.
+// A payment or plan change in the app: m.money_added().await.
 ```
 
 **Browser** (`npm install unlinkable-inference`):
@@ -46,7 +48,8 @@ import * as sessions from 'unlinkable-inference';
 
 const { loginKey, seed } = await sessions.keys(number); // sign in with loginKey
 const u = await sessions.connect({ seed, apiKey });     // wallet kept in localStorage
-const res = await u.fetch('/v1/chat/completions', { method: 'POST', headers, body }, { chat: conversationId });
+const res = await u.fetch('/v1/chat/completions', { method: 'POST', headers, body },
+  { chat: conversationId, onWait: (at) => showRefilling(at) }); // onWait(null): it goes on
 ```
 
 `u.fetch` sends the conversation's session secret with `credentials: 'omit'`,
@@ -123,8 +126,11 @@ ANTHROPIC_MODEL=deepseek/deepseek-v4.1-flash claude
 
 OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, your usual key.
 The proxy uses that key for one thing: keeping the wallet (and this month's
-passes, where the server gives the account any) topped up in the background. Chats go out with a session
-secret instead and are charged exactly their tokens, down to 0.001¢.
+passes, where the server gives the account any) topped up in the background, at random times and
+never because a request needs it (that would tie the request to the account by timing). A
+request the wallet can't pay gets 503 with `Retry-After` (a few minutes); SDKs that retry on
+503 wait it out. Keep enough in the wallet (`--keep`, default $2) for the replies you expect.
+Chats go out with a session secret instead and are charged exactly their tokens, down to 0.001¢.
 
 `http://127.0.0.1:8899/_unlinkable` shows what the server received for each
 request. To hide your IP address too, run the proxy behind Tor or a VPN

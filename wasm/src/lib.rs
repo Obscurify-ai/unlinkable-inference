@@ -143,6 +143,26 @@ impl Manager {
         })
     }
 
+    /// `null` when nothing waits; else the Unix time (seconds) a conversation may go on about
+    /// (it waits for the wallet: hold its request, keep calling `tick`, ask again).
+    /// `undefined` while a call runs.
+    pub fn refilling(&self) -> JsValue {
+        let Some(m) = self.inner.try_lock() else { return JsValue::UNDEFINED };
+        match m.refilling() {
+            Some(at) => (at as f64).into(),
+            None => JsValue::NULL,
+        }
+    }
+
+    /// Money was just added to the account, or its plan changed (in this app): ask it now.
+    #[wasm_bindgen(js_name = moneyAdded)]
+    pub fn money_added(&self) -> js_sys::Promise {
+        promise!(self, |m| {
+            m.money_added().await;
+            Ok(JsValue::TRUE)
+        })
+    }
+
     /// Money was just added to the account: the next top-up asks it again.
     #[wasm_bindgen(js_name = askAgain)]
     pub fn ask_again(&self) -> js_sys::Promise {

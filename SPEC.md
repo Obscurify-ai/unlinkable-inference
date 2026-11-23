@@ -131,6 +131,13 @@ or unused for 15 minutes (`UNCLAIMED_AFTER_SECS`), so a device never closes a se
 device is using. A voucher two devices hold is spent by whichever uses it first; the other gets
 409 `spent` (or `repeat`) and drops it.
 
+**When clients ask the account.** Never because a conversation needs something: a withdrawal
+(or `GET /u/issued`, `/u/passes`) a second before a session opens or tops up ties the two together
+by timing. Clients ask at moments of the account's own (starting, signing in, a payment) and at
+random times; a conversation the wallet can't pay waits until a random while after the next
+contact (library: `Manager::refilling`, `Refilling`; proxy: 503 with `Retry-After`). Under $1
+they withdraw 50¢, 20¢, 10¢, 5¢, 2¢ or 1¢ at a time (`SMALL_WITHDRAW_SIZES`).
+
 Clients open a conversation's session with 10¢ (or what there is) and top it up as it is
 used, so a small balance spreads over many open conversations; seeded withdrawals arrive in 10¢
 pieces for that. A device whose own quiet sessions hold the last of the money closes them for

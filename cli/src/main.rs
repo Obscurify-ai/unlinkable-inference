@@ -63,11 +63,14 @@ struct ServeArgs {
     /// the proxy uses the first sk-obs1_ key a client sends.
     #[arg(long, env = "OBSCURIFY_API_KEY")]
     api_key: Option<String>,
-    /// Top up when the wallet falls below this many dollars
-    #[arg(long, default_value = "0.50")]
+    /// Top up when the wallet falls below this many dollars. The account is asked at random
+    /// times, never when a request needs it (that would tie the request to the account), so keep
+    /// enough for the largest reply you expect; a request the wallet can't pay waits (503 with
+    /// Retry-After) until the next top-up.
+    #[arg(long, default_value = "2")]
     keep: String,
     /// Top up by this many dollars (1, 5, 20, 50 or 100)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 5)]
     refill: u32,
 }
 
@@ -366,6 +369,7 @@ async fn start(
         refill_cents: refill as i64 * 100,
         keep_passes: 10,
         account_key_prefix: "sk-obs1_".into(),
+        ..Settings::default()
     };
     eprintln!(
         "unlinkable-inference: wallet {} ({}); proxy on http://{listen} (page: http://{listen}/_unlinkable)",

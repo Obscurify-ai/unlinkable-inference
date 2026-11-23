@@ -65,6 +65,10 @@ pub struct Settings {
     pub refill_cents: i64,
     /// Fetch passes when fewer than this many are left this month
     pub keep_passes: usize,
+    /// The account is asked at random times this many seconds apart (min, max)...
+    pub contact_secs: (u64, u64),
+    /// ...and, when a request waits for it, at a random moment this far away (never sooner).
+    pub wait_secs: (u64, u64),
     /// Client keys starting with this are taken to be the account's key
     pub account_key_prefix: String,
 }
@@ -77,9 +81,12 @@ impl Default for Settings {
             idle_close: Duration::from_secs(300),
             show_traffic: false,
             account_key: None,
-            keep_cents: 50,
-            refill_cents: 100,
+            // A pricey model's reply ($1 held, plus its prompt) fits in what the wallet keeps.
+            keep_cents: 200,
+            refill_cents: 500,
             keep_passes: 10,
+            contact_secs: CONTACT_SECS,
+            wait_secs: WAIT_SECS,
             account_key_prefix: "sk-obs1_".into(),
         }
     }
@@ -98,6 +105,57 @@ struct Entry {
     requests: AtomicU64,
 }
 
+/// The account is asked for money and passes only at moments of its own (the proxy starting) and
+/// at random times: never because a request needs it. A withdrawal a second before a session
+/// opens or tops up ties the two together by timing alone.
+struct Contact {
+    /// When (Unix seconds)
+    next: u64,
+    /// A request is waiting for what only the account can give
+    waiting: bool,
+    /// The account had nothing to give at the last contact
+    account_empty: bool,
+    /// After the contact a waiting request needed, sessions are opened and topped up only from
+    /// this time (Unix seconds), so the withdrawal and the session's top-up aren't seconds apart
+    release_at: u64,
+    /// Labels a session asked for that the wallet had none of
+    wanted: std::collections::BTreeSet<String>,
+    /// Conversations told to wait: their retries are answered here, never sent on to the server
+    /// (a retry timed by Retry-After would land right next to the contact)
+    held: std::collections::HashSet<String>,
+}
+
+/// The account is asked this many seconds apart (at random in between)...
+pub const CONTACT_SECS: (u64, u64) = (5 * 60, 30 * 60);
+/// ...and, when a request waits for it, at a random moment this far away (never sooner).
+pub const WAIT_SECS: (u64, u64) = (60, 600);
+
+fn random_secs((min, max): (u64, u64)) -> u64 {
+    unlinkable_inference::manager::random_secs(min, max)
+}
+
+/// The request waits for the wallet (see [`Contact`]): 503 with Retry-After.
+fn refilling(at: u64) -> Response {
+    let wait = at.saturating_sub(now()).max(1);
+    let mut r = text(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("The private wallet is refilling from the account; try again in {wait} s. (It is never refilled at the moment a request needs it: that would tie the request to the account.)"),
+    );
+    r.headers_mut().insert("retry-after", wait.to_string().parse().unwrap());
+    r
+}
+
+#[derive(Debug)]
+struct Refilling(u64);
+
+impl std::fmt::Display for Refilling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the private wallet is refilling")
+    }
+}
+
+impl std::error::Error for Refilling {}
+
 pub struct Proxy {
     client: Client,
     wallet: tokio::sync::Mutex<Wallet>,
@@ -109,12 +167,10 @@ pub struct Proxy {
     settings: Settings,
     opts: Options,
     account_key: Mutex<Option<String>>,
-    /// After a failed top-up, wait before trying again
-    refill_backoff: Mutex<Option<std::time::Instant>>,
+    /// When the account is asked next, and what for (see [`Proxy::refill`])
+    contact: Mutex<Contact>,
     /// The labels the account gets passes for, as last asked (at most every 10 minutes), and when
     offered: tokio::sync::Mutex<Option<(unlinkable_inference::protocol::PassAllowance, std::time::Instant)>>,
-    /// label → when a session last needed one and there was none to present
-    refused_labels: Mutex<HashMap<String, std::time::Instant>>,
     /// The helper session's last seen balance (see [`Proxy::helper_secret`])
     helper_balance: Mutex<String>,
 }
@@ -261,9 +317,8 @@ impl Proxy {
             traffic,
             opening: tokio::sync::Mutex::new(()),
             account_key: Mutex::new(settings.account_key.clone()),
-            refill_backoff: Mutex::new(None),
+            contact: Mutex::new(Contact { next: now(), waiting: false, account_empty: false, release_at: 0, wanted: Default::default(), held: Default::default() }),
             offered: tokio::sync::Mutex::new(None),
-            refused_labels: Mutex::new(HashMap::new()),
             helper_balance: Mutex::new(String::new()),
             settings,
             opts,
@@ -296,22 +351,68 @@ impl Proxy {
         }
     }
 
-    /// Keep the wallet and passes topped up from the account, in the
-    /// background, so customers never move money by hand. Withdrawals happen
-    /// when the wallet runs low, not when a session opens, so their timing
-    /// says little about any one conversation. `urgent` skips the backoff
-    /// (the wallet is empty and a request is waiting).
-    pub async fn refill(&self, urgent: bool) {
+    /// A request needs what only the account can give: `Some(when)` the next contact is (brought
+    /// forward to a random moment `WAIT_SECS` away, unless one is due sooner); `None` when the
+    /// account has nothing to give, or there is no account key.
+    fn wait(&self) -> Option<u64> {
+        if self.account_key.lock().unwrap().is_none() {
+            return None;
+        }
+        let mut c = self.contact.lock().unwrap();
+        if c.account_empty {
+            return None;
+        }
+        if !c.waiting && now() < c.release_at {
+            return Some(c.release_at);
+        }
+        c.next = c.next.min(now() + random_secs(self.settings.wait_secs));
+        c.waiting = true;
+        Some(c.next)
+    }
+
+    /// Just filled for a request that waited: `Some(until)` while new sessions and top-ups hold
+    /// back (see `Contact::release_at`).
+    fn held_back(&self) -> Option<u64> {
+        let c = self.contact.lock().unwrap();
+        (now() < c.release_at).then_some(c.release_at)
+    }
+
+    /// Conversation `key` was told to wait: until the wallet is filled and the hold-back is
+    /// over, its requests are answered here. `Some(until)` while it waits.
+    fn still_held(&self, key: &str) -> Option<u64> {
+        let mut c = self.contact.lock().unwrap();
+        if !c.held.contains(key) {
+            return None;
+        }
+        let until = if c.waiting { Some(c.next.max(c.release_at)) } else { (now() < c.release_at).then_some(c.release_at) };
+        if until.is_none() {
+            c.held.remove(key);
+        }
+        until
+    }
+
+    fn hold(&self, key: &str, at: u64) -> Response {
+        self.contact.lock().unwrap().held.insert(key.to_string());
+        refilling(at)
+    }
+
+    /// Keep the wallet and passes topped up from the account, in the background, so customers
+    /// never move money by hand. `now`: ask the account at once (the proxy starting, or a
+    /// person's command); else only when the next contact is due, set at random each time
+    /// (`CONTACT_SECS`), so when the account is asked says nothing about any request.
+    pub async fn refill(&self, now_: bool) {
+        {
+            let mut c = self.contact.lock().unwrap();
+            if !now_ && now() < c.next {
+                return;
+            }
+            c.next = now() + random_secs(self.settings.contact_secs);
+        }
         let Some(key) = self.account_key.lock().unwrap().clone() else {
+            self.contact.lock().unwrap().waiting = false;
             return;
         };
-        if !urgent {
-            if let Some(at) = *self.refill_backoff.lock().unwrap() {
-                if at.elapsed() < Duration::from_secs(600) {
-                    return;
-                }
-            }
-        }
+        let wanted: Vec<String> = self.contact.lock().unwrap().wanted.iter().cloned().collect();
         let mut wallet = self.wallet.lock().await;
         let mut failed = false;
         // One wallet per account: what other devices withdrew, or got back as change from
@@ -328,14 +429,20 @@ impl Proxy {
                 .withdraw_up_to(&mut wallet, &key, self.settings.refill_cents, 1)
                 .await
             {
-                Ok(c) => tracing::info!("topped up the wallet with {} from the account", dollars(c)),
+                Ok(c) => {
+                    tracing::info!("topped up the wallet with {} from the account", dollars(c));
+                    self.contact.lock().unwrap().account_empty = false;
+                }
                 Err(e) => {
                     failed = true;
+                    if matches!(e.downcast_ref::<unlinkable_inference::net::ApiError>(), Some(unlinkable_inference::net::ApiError::Server { status: 402, .. })) {
+                        self.contact.lock().unwrap().account_empty = true;
+                    }
                     tracing::warn!("could not top up the wallet: {e:#}");
                 }
             }
         }
-        match self.stock(&mut wallet, &key, None, false).await {
+        match self.stock(&mut wallet, &key, None, !wanted.is_empty()).await {
             Ok(0) => {}
             Ok(n) => tracing::info!("got {n} passes for this month"),
             Err(e) => {
@@ -351,7 +458,15 @@ impl Proxy {
             }
         }
         let _ = wallet.save();
-        *self.refill_backoff.lock().unwrap() = failed.then(std::time::Instant::now);
+        let _ = failed;
+        let period = unlinkable_inference::pass::current_period();
+        let mut c = self.contact.lock().unwrap();
+        c.wanted.retain(|label| wallet.passes_of(&period, label) == 0 && wanted.contains(label));
+        if c.waiting {
+            // The request that waited goes on a random while later, not at once.
+            c.release_at = now() + random_secs(self.settings.wait_secs);
+        }
+        c.waiting = false;
     }
 
     /// Keep `keep_passes` of each label the account gets (only `only`, when given). The
@@ -369,43 +484,46 @@ impl Proxy {
     }
 
     /// The server asked this session for a pass with `label`: present one. With none held,
-    /// what the account was last told decides: a label it has used up for the month means no,
-    /// with no word to the account (its request right before this session's next one would
-    /// tie the two by their timing); one it wasn't offered may be new, so the account is
-    /// asked (at most once a minute per label) and some are fetched. False: none to present.
-    async fn present_pass(&self, entry: &Entry, label: &str) -> bool {
+    /// what the account was last told decides: a label it has used up for the month means no;
+    /// otherwise (one it gets, or one it may get now, its plan having changed) the account is
+    /// asked at the next contact, never now, which would tie this session to it by timing:
+    /// `Err(when)`, the request waits. `Ok(false)`: none to present.
+    async fn present_pass(&self, entry: &Entry, label: &str) -> std::result::Result<bool, u64> {
         let mut wallet = self.wallet.lock().await;
         match self.client.present_pass(&mut wallet, &entry.session, label).await {
-            Ok(true) => return true,
+            Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!("could not present a {label} pass: {e:#}");
-                return false;
+                return Ok(false);
             }
         }
-        let Some(key) = self.account_key.lock().unwrap().clone() else { return false };
+        drop(wallet);
+        // What the account was told at the last contact. A label it wasn't offered: no.
         let known = self
             .offered
             .lock()
             .await
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(600))
-            .and_then(|(a, _)| a.labels.iter().find(|l| l.label == label))
-            .map(|l| l.remaining);
-        let fresh = match known {
-            Some(left) if left <= 0 => return false,
-            Some(_) => false,
-            None => {
-                let mut refused = self.refused_labels.lock().unwrap();
-                if refused.get(label).is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
-                    return false;
-                }
-                refused.insert(label.to_string(), std::time::Instant::now());
-                true
+            .map(|(a, _)| a.labels.iter().find(|l| l.label == label).map(|l| l.remaining));
+        match known {
+            Some(None) => return Ok(false),
+            Some(Some(left)) if left <= 0 => return Ok(false),
+            _ => {}
+        }
+        {
+            let mut c = self.contact.lock().unwrap();
+            if c.wanted.contains(label) && !c.waiting {
+                // Asked for at the last contact and still none: the account doesn't give it.
+                c.wanted.remove(label);
+                return Ok(false);
             }
-        };
-        let _ = self.stock(&mut wallet, &key, Some(label), fresh).await;
-        self.client.present_pass(&mut wallet, &entry.session, label).await.unwrap_or(false)
+            c.wanted.insert(label.to_string());
+        }
+        match self.wait() {
+            Some(at) => Err(at),
+            None => Ok(false),
+        }
     }
 
     fn learn_account_key(&self, headers: &HeaderMap) {
@@ -433,6 +551,9 @@ impl Proxy {
         if let Some(e) = self.sessions.lock().unwrap().get(key) {
             return Ok(e.clone());
         }
+        if let Some(at) = self.held_back() {
+            return Err(Refilling(at).into());
+        }
         let family = self.family_to_spend().await;
         let mut free = false;
         let opened = {
@@ -443,25 +564,15 @@ impl Proxy {
         };
         let session = match opened {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
                 // The wallet is empty, or holds less than a session's minimum, and a request
-                // is waiting: top up now rather than fail (the background refill should
-                // prevent this).
-                self.refill(true).await;
-                let opened = {
-                    let mut wallet = self.wallet.lock().await;
-                    self.client
-                        .open(&mut wallet, family, self.settings.funding_cents)
-                        .await
-                };
-                match opened {
-                    Ok(s) => s,
-                    // No money anywhere: what costs none still works.
-                    Err(e) => {
-                        free = true;
-                        self.open_free().await.ok_or(e)?
-                    }
+                // is waiting. Never top up now: the request waits for the next contact.
+                if let Some(at) = self.wait() {
+                    return Err(Refilling(at).into());
                 }
+                // No money anywhere: what costs none still works.
+                free = true;
+                self.open_free().await.ok_or(e)?
             }
         };
         let entry = Arc::new(Entry {
@@ -496,11 +607,9 @@ impl Proxy {
         let entry = self.entry(HELPER).await?;
         // Its requests go straight to the server, so nothing here sees the server ask for a
         // pass: present one of each label the account gets now.
-        let key = self.account_key.lock().unwrap().clone();
+        // What the wallet holds (stocked at contacts: asking the account now would tie it to this
+        // session by timing).
         let mut wallet = self.wallet.lock().await;
-        if let Some(key) = key {
-            let _ = self.stock(&mut wallet, &key, None, false).await;
-        }
         let period = unlinkable_inference::pass::current_period();
         let mut labels: Vec<String> = wallet.passes(&period).into_iter().map(|p| p.label).collect();
         labels.sort();
@@ -538,9 +647,10 @@ impl Proxy {
         if unlinkable_inference::net::usd_to_cents_floor(&st.balance_usd) < self.settings.funding_cents {
             let mut wallet = self.wallet.lock().await;
             if wallet.balance_cents(entry.session.family) < self.settings.funding_cents {
+                // Never from the account now (this session just spent): at the next contact.
                 drop(wallet);
-                self.refill(true).await;
-                wallet = self.wallet.lock().await;
+                let _ = self.wait();
+                return;
             }
             if let Err(e) = self
                 .client
@@ -654,10 +764,18 @@ impl Proxy {
         let mut rest = false;
         let mut presented = 0;
         let mut none: Vec<String> = Vec::new();
+        if let Some(at) = self.still_held(&key) {
+            return refilling(at);
+        }
         loop {
             let entry = match self.entry(&key).await {
                 Ok(e) => e,
-                Err(e) => return text(StatusCode::PAYMENT_REQUIRED, &format!("{e:#}")),
+                Err(e) => {
+                    if let Some(Refilling(at)) = e.downcast_ref::<Refilling>() {
+                        return self.hold(&key, *at);
+                    }
+                    return text(StatusCode::PAYMENT_REQUIRED, &format!("{e:#}"));
+                }
             };
             entry.busy.fetch_add(1, Ordering::SeqCst);
             let mut sent = passed.clone();
@@ -676,22 +794,26 @@ impl Proxy {
             };
             match response.status {
                 402 if topups < 5 => {
+                    if let Some(at) = self.held_back() {
+                        entry.busy.fetch_sub(1, Ordering::SeqCst);
+                        return self.hold(&key, at);
+                    }
                     // Out of money for this request: add more from the wallet
                     // (the top-up links only to this session) and try again.
                     topups += 1;
                     let cents = self.settings.funding_cents << topups;
-                    let mut result = {
+                    let result = {
                         let mut wallet = self.wallet.lock().await;
                         self.client.topup(&mut wallet, &entry.session, cents).await
                     };
-                    if result.is_err() {
-                        // The wallet is empty (or what it held was spent elsewhere) and a
-                        // request is waiting: top it up now rather than fail, as in `entry`.
-                        self.refill(true).await;
-                        let mut wallet = self.wallet.lock().await;
-                        result = self.client.topup(&mut wallet, &entry.session, cents).await;
-                    }
                     entry.busy.fetch_sub(1, Ordering::SeqCst);
+                    if result.is_err() {
+                        // The wallet is empty (or what it held was spent elsewhere): never top
+                        // it up now, as in `entry`. The request waits for the next contact.
+                        if let Some(at) = self.wait() {
+                            return self.hold(&key, at);
+                        }
+                    }
                     // Nothing more to add: the reply gets what the session's money still buys.
                     if let Err(e) = result {
                         if rest {
@@ -709,10 +831,17 @@ impl Proxy {
                     // to this session) and try again. With none to present, send it once more
                     // as it was: a server may serve it another way (at another price).
                     let label = response.header(unlinkable_inference::protocol::PASS_REQUIRED_HEADER).unwrap_or_default().to_string();
-                    if self.present_pass(&entry, &label).await {
-                        presented += 1;
-                        entry.busy.fetch_sub(1, Ordering::SeqCst);
-                        continue;
+                    match self.present_pass(&entry, &label).await {
+                        Ok(true) => {
+                            presented += 1;
+                            entry.busy.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(at) => {
+                            entry.busy.fetch_sub(1, Ordering::SeqCst);
+                            return self.hold(&key, at);
+                        }
                     }
                     if !none.contains(&label) {
                         none.push(label);
@@ -1024,15 +1153,12 @@ pub async fn run(
     let closer = proxy.clone();
     let ticker = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
-        let mut n: u64 = 0;
         loop {
             tick.tick().await;
             closer.watch_helper().await;
             closer.close_idle().await;
-            if n.is_multiple_of(12) {
-                closer.refill(false).await;
-            }
-            n += 1;
+            // Asks the account only when the next contact (random) is due.
+            closer.refill(false).await;
         }
     });
     axum::serve(listener, router(proxy.clone()))

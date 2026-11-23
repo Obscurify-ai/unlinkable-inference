@@ -59,28 +59,29 @@ use Tor or a VPN, or at least withdraw from a different network.
 - **Content**. A prompt that names you names you. A unique system prompt reused
   across sessions links them by content.
 - **The address**. Hide it with Tor or a VPN.
-- **Timing**. A withdrawal immediately followed by a session of the same size,
-  on a quiet server, is suggestive. Withdraw ahead of time; the wallet splits
-  vouchers into session-sized pieces through anonymous exchanges.
-  The last cents of a balance move in one piece, often while a request waits: a withdrawal of
-  7¢ and a session opened with 7¢ seconds later are as suggestive as it gets. Sessions opened with
-  a pass and no money have no amount to compare.
+- **Timing**. Whatever the amounts, a withdrawal followed a second later by a session opening
+  or topping up points at the account, on a quiet server most of all. So clients never ask the
+  account because a conversation needs something: they ask it at moments of its own (the app
+  starting, a sign-in, a payment) and at random times 5 to 30 minutes apart, and a conversation
+  the wallet can't pay waits ("the private wallet is refilling"): the next contact is brought
+  forward to a random moment 30 s to 5 min away, and the conversation goes on a random 30 s to
+  5 min after it, never at once. Under $1 the account's balance moves in fixed sizes (50¢, 20¢,
+  10¢, 5¢, 2¢, 1¢), one per contact, so no withdrawal's amount matches what one session spends.
+  What is left: a few minutes is little cover while few people use the server (some 5 sessions
+  an hour at Obscurify in November 2026), and an app's own signed-in requests when it opens
+  (balance, plan) are as telling as a withdrawal for a chat started a few seconds later.
+  Sessions opened with a pass and no money have no amount to compare.
 - **Denominations**. Change comes back in the standard split, so its values
   say how much was left; spending those exact values later is weakly
   suggestive. `unlinkable-inference exchange` trades them for a standard set. Dust is
   always spent with the next session, so dust in an opening says only "this
   client had a session before".
-- **Automatic top-ups**. With the account key, the proxy withdraws when the
-  wallet runs low and fetches passes when they run low, in the background,
-  never at the moment a session opens or is topped up (unless the wallet is
-  empty: then that withdrawal and the session are seconds apart). The one
-  exception for passes: when a session is asked for a label the account was
-  not offered when last asked (its plan may have just changed), the client
-  asks the account right then (at most once a minute per label), and that
-  request and the session's next one are seconds apart. A label the account
-  gets but has used up for the month never causes this: the client already
-  knows there is none and says nothing to the account. Without
-  Tor or a VPN the same address makes both, which links them.
+- **Automatic top-ups**. With the account key, the proxy and apps keep the wallet and passes
+  stocked in the background (at least $2, $5 at a time), at the moments described under Timing.
+  A pass the wallet lacks for a label the account gets waits the same way; a label the account
+  wasn't offered at the last contact is refused at once (a plan bought in the app is a moment of
+  its own: the app says so and the account is asked then). Without Tor or a VPN the same address
+  makes both the account's requests and the sessions', which links them whatever the timing.
 - **The web app**. Its scripts come from the server. The strong claim is the
   proxy and the Android app; the web gets published script hashes.
 - **One wallet per account**. Devices signed in with the same code share the wallet: a device
@@ -93,7 +94,7 @@ use Tor or a VPN, or at least withdraw from a different network.
   the number, and the next sign-in rebuilds the wallet and closes stranded
   sessions for their change. A wallet without the number (vouchers bought or
   imported) is lost with its file; `unlinkable-inference export` makes a backup.
-  Either way the wallet stays small (it tops up $1 when below 50¢) and the
+  Either way the wallet stays small (it tops up $5 when below $2) and the
   account balance is untouched.
 - **Abuse controls**. The server cannot ban a person in this mode, only refuse
   a session.
