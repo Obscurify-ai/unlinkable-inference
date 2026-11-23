@@ -49,8 +49,9 @@ pub enum GatewayError {
     /// These spent-voucher hashes were already spent; nothing was spent.
     Spent(Vec<String>),
     Status(StatusCode, &'static str, String),
-    /// A withdrawal the account can't cover: 402, with the whole cents it can.
-    Unaffordable(String, i64),
+    /// A withdrawal the account can't cover: 402, with the whole cents it can, and whether it
+    /// holds more that it can't give yet (a plan's usage window).
+    Unaffordable(String, i64, bool),
     /// 403: needs a pass with this label.
     PassRequired(String),
 }
@@ -71,7 +72,13 @@ impl GatewayError {
     }
     /// A withdrawal larger than the account holds; `available_cents` is what it can take.
     pub fn unaffordable(message: impl Into<String>, available_cents: i64) -> Self {
-        Self::Unaffordable(message.into(), available_cents.max(0))
+        Self::Unaffordable(message.into(), available_cents.max(0), false)
+    }
+    /// [`GatewayError::unaffordable`] for an account that holds more than `available_cents`
+    /// but can't give it yet (a plan's usage window): clients don't take the account for empty
+    /// when they have taken that much.
+    pub fn unaffordable_for_now(message: impl Into<String>, available_cents: i64) -> Self {
+        Self::Unaffordable(message.into(), available_cents.max(0), true)
     }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Status(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message.into())
@@ -97,6 +104,7 @@ struct Answer(GatewayError, Vec<String>);
 impl IntoResponse for Answer {
     fn into_response(self) -> Response {
         let mut available_cents = None;
+        let mut more_later = false;
         let mut pass = None;
         let (status, kind, message, spent) = match self.0 {
             GatewayError::Spent(hashes) => {
@@ -116,8 +124,9 @@ impl IntoResponse for Answer {
                 )
             }
             GatewayError::Status(status, kind, message) => (status, kind, message, Vec::new()),
-            GatewayError::Unaffordable(message, cents) => {
+            GatewayError::Unaffordable(message, cents, more) => {
                 available_cents = Some(cents);
+                more_later = more;
                 (StatusCode::PAYMENT_REQUIRED, "insufficient_balance", message, Vec::new())
             }
             GatewayError::PassRequired(label) => {
@@ -133,6 +142,7 @@ impl IntoResponse for Answer {
                 kind: kind.to_string(),
                 spent,
                 available_cents,
+                more_later,
                 pass,
             },
         };

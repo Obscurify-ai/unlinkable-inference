@@ -128,8 +128,10 @@ OpenAI SDKs and curl: base URL `http://127.0.0.1:8899/v1`, your usual key.
 The proxy uses that key for one thing: keeping the wallet (and this month's
 passes, where the server gives the account any) topped up in the background, at random times and
 never because a request needs it (that would tie the request to the account by timing). A
-request the wallet can't pay gets 503 with `Retry-After` (a few minutes); SDKs that retry on
-503 wait it out. Keep enough in the wallet (`--keep`, default $2) for the replies you expect.
+request the wallet can't pay gets 503 with `Retry-After` (up to about 10 minutes); retry after
+it (most SDKs give up sooner on their own). Keep enough in the wallet (`--keep`, default $2) for
+the replies you expect, and start the proxy with the key (`OBSCURIFY_API_KEY`) so it fills the
+wallet when it starts.
 Chats go out with a session secret instead and are charged exactly their tokens, down to 0.001¢.
 
 `http://127.0.0.1:8899/_unlinkable` shows what the server received for each

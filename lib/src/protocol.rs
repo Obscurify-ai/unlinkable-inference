@@ -198,6 +198,10 @@ pub struct ErrorDetail {
     /// A withdrawal larger than the account can cover: what it can (whole cents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_cents: Option<i64>,
+    /// With `available_cents`: the account holds more than that, which it can't give yet (a
+    /// plan's usage window). Taking all of `available_cents` doesn't leave it empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more_later: bool,
     /// With type [`PASS_REQUIRED`]: the label of the pass that is needed
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass: Option<String>,

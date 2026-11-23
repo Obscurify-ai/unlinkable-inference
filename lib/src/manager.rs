@@ -152,6 +152,12 @@ struct State {
     /// When the account is asked next (Unix seconds; 0: at the first `tick`)
     #[serde(default)]
     next_contact: u64,
+    /// A conversation was waiting for the account, and when the hold-back after the contact
+    /// ends: kept, so reopening the app doesn't ask the account at once (see `start`)
+    #[serde(default)]
+    waiting: bool,
+    #[serde(default)]
+    release_at: u64,
     /// The seed this state was made with (hex), to notice when the account's code changes
     #[serde(default)]
     seed: Option<String>,
@@ -231,8 +237,8 @@ impl Manager {
             refused_at: st.refused_at,
             account_empty: st.account_empty,
             next_contact: st.next_contact,
-            waiting: false,
-            release_at: 0,
+            waiting: st.waiting,
+            release_at: st.release_at,
             wanted: Default::default(),
             offered: None,
             free_label: None,
@@ -252,6 +258,8 @@ impl Manager {
             refused_at: self.refused_at,
             account_empty: self.account_empty,
             next_contact: self.next_contact,
+            waiting: self.waiting,
+            release_at: self.release_at,
             seed: Some(self.seed_hex.clone()),
             previous_seeds: self.previous_seeds.clone(),
         })
@@ -263,7 +271,14 @@ impl Manager {
     /// another device left behind (an open session, change not collected, the whole wallet after
     /// a wipe) comes back; then the account is asked for what the wallet lacks.
     /// Resolves to the cents recovered.
+    ///
+    /// Not while a conversation waits for the wallet (or holds back after it was filled): an app
+    /// reopened then, often to get a chat going, would otherwise ask the account seconds before
+    /// that chat goes on. The scheduled contact (and hold-back) stand; `tick` makes it.
     pub async fn start(&mut self) -> Result<i64> {
+        if self.refilling().is_some() {
+            return Ok(0);
+        }
         let in_use: Vec<String> = self.chats.values().map(|(s, _)| s.clone()).chain(self.replies.values().cloned()).collect();
         for open in self.wallet.sessions().to_vec() {
             if !in_use.contains(&open.secret) {

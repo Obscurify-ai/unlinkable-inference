@@ -227,6 +227,7 @@ impl Transport {
                         kind: "unknown".into(),
                         spent: Vec::new(),
                         available_cents: None,
+                        more_later: false,
                         pass: None,
                     },
                 }),
@@ -804,9 +805,9 @@ impl Client {
             Ok(got) => return Ok((got, None)),
             Err(e) => e,
         };
-        let available = match err.downcast_ref::<ApiError>() {
-            Some(ApiError::Server { status: 402, body }) => body.error.available_cents,
-            _ => None,
+        let (available, more_later) = match err.downcast_ref::<ApiError>() {
+            Some(ApiError::Server { status: 402, body }) => (body.error.available_cents, body.error.more_later),
+            _ => (None, false),
         };
         let Some(available) = available.filter(|a| *a >= min_cents.max(1) && *a < cents) else {
             return Err(err);
@@ -819,7 +820,7 @@ impl Client {
             WITHDRAW_SIZES.iter().copied().filter(|s| *s <= available).max().unwrap_or(100)
         };
         let got = self.withdraw(wallet, api_key, take).await?;
-        Ok((got, Some(available - got)))
+        Ok((got, (!more_later).then_some(available - got)))
     }
 
     async fn withdraw_with(

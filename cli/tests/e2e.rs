@@ -1610,7 +1610,7 @@ async fn an_app_never_asks_the_account_because_a_conversation_needs_money() {
     let stack = start_stack().await;
     let key = new_account(&stack.server, 1_000).await;
     let seed = unlinkable_inference::seed::account_keys("4410 2876 3391 0057").unwrap().seed;
-    let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+    let mut m = Manager::connect(&stack.server, seed.clone(), None).await.unwrap();
     m.api_key = Some(key.clone());
     m.policy.keep_cents = 50;
     m.policy.refill_cents = 100;
@@ -1619,6 +1619,7 @@ async fn an_app_never_asks_the_account_because_a_conversation_needs_money() {
     m.policy.contact_max_secs = 3600;
     m.policy.wait_min_secs = 2;
     m.policy.wait_max_secs = 3;
+    let policy = m.policy.clone();
     m.start().await.unwrap();
     assert_eq!(balance_cents(&stack.server, &key).await, 900, "$1 when the app started");
     let first = m.session("one").await.unwrap();
@@ -1629,6 +1630,15 @@ async fn an_app_never_asks_the_account_because_a_conversation_needs_money() {
     assert!(m.refilling().is_some());
     m.tick().await;
     assert_eq!(balance_cents(&stack.server, &key).await, 900, "not asked at once");
+    // The app is reopened while the chat waits (people do, when told to wait): starting doesn't
+    // ask the account either. The wait, and the hold-back after it, carry on.
+    let saved = m.state();
+    let mut m = Manager::connect(&stack.server, seed.clone(), Some(&saved)).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.policy = policy.clone();
+    m.start().await.unwrap();
+    assert_eq!(balance_cents(&stack.server, &key).await, 900, "reopening doesn't ask the account");
+    assert!(m.refilling().is_some(), "the wait goes on");
     // The app keeps ticking (every 30 s; faster here) and holds the request until refilling()
     // says it may go.
     for _ in 0..40 {
