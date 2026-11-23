@@ -690,10 +690,13 @@ impl Proxy {
     pub async fn close_idle(&self) {
         let cutoff = now().saturating_sub(self.settings.idle_close.as_secs());
         let free_cutoff = now().saturating_sub(self.settings.idle_close.as_secs().max(FREE_IDLE_SECS));
+        // A conversation told to wait for the wallet makes no requests: its session isn't idle.
+        let held: std::collections::HashSet<String> = self.contact.lock().unwrap().held.clone();
         let idle: Vec<(String, Arc<Entry>)> = {
             let mut sessions = self.sessions.lock().unwrap();
             let keys: Vec<String> = sessions
                 .iter()
+                .filter(|(k, _)| !held.contains(*k))
                 .filter(|(_, e)| {
                     let cutoff = if e.free { free_cutoff } else { cutoff };
                     e.busy.load(Ordering::SeqCst) == 0 && e.last_used.load(Ordering::SeqCst) <= cutoff

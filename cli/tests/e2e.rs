@@ -1644,3 +1644,47 @@ async fn an_app_never_asks_the_account_because_a_conversation_needs_money() {
     assert_eq!(echo(&stack.server, &second).await, 200);
     assert_account_never_follows_a_chat(&stack.backend.dump(), 900);
 }
+
+/// A conversation waiting for the wallet makes no requests, longer than a session may sit idle:
+/// its session is kept, and the conversation goes on with it once the wallet is filled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conversation_that_waits_keeps_its_session() {
+    use unlinkable_inference::manager::{Manager, Refilling};
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 250).await;
+    let seed = unlinkable_inference::seed::account_keys("5521 0983 4417 6620").unwrap().seed;
+    let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+    m.api_key = Some(key.clone());
+    m.policy.keep_cents = 50;
+    m.policy.refill_cents = 100;
+    m.policy.funding_cents = 100;
+    m.policy.contact_min_secs = 3600;
+    m.policy.contact_max_secs = 3600;
+    m.policy.wait_min_secs = 2;
+    m.policy.wait_max_secs = 3;
+    m.policy.idle_secs = 1;
+    m.start().await.unwrap();
+    let s = m.session("one").await.unwrap();
+    let long = |secret: &str| {
+        let body = json!({"model": "echo", "messages": [{"role": "user", "content": "x".repeat(600_000)}]});
+        reqwest::Client::new().post(format!("{}/v1/chat/completions", stack.server)).bearer_auth(secret.to_string()).json(&body).send()
+    };
+    // The first spends the session's $1 (and some); the next gets a 402.
+    assert_eq!(long(&s).await.unwrap().status(), 200);
+    assert_eq!(long(&s).await.unwrap().status(), 402);
+    let err = m.ran_out(&s, 0).await.unwrap_err();
+    assert!(err.downcast_ref::<Refilling>().is_some(), "{err:#}");
+    for _ in 0..40 {
+        if m.refilling().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        m.tick().await;
+    }
+    assert!(m.refilling().is_none());
+    m.ran_out(&s, 0).await.unwrap();
+    assert_eq!(m.session("one").await.unwrap(), s, "the same session");
+    let hash = unlinkable_inference::sha256_hex(&s);
+    let row = stack.backend.dump()["sessions"].as_array().unwrap().iter().find(|r| r["secret_hash"] == hash.as_str()).cloned().unwrap();
+    assert!(row["closed_at"].is_null(), "still open on the server, topped up: {row}");
+}

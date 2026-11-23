@@ -515,9 +515,12 @@ impl Manager {
     /// when the next contact is due (random times, see [`Policy::contact_min_secs`]).
     pub async fn tick(&mut self) {
         let now = unix_now();
+        // A conversation waiting for the wallet makes no requests: its session isn't idle.
+        let waiting = self.refilling().is_some();
         let idle: Vec<String> = self
             .chats
             .iter()
+            .filter(|_| !waiting)
             .filter(|(_, (secret, used))| {
                 let idle = if self.has_money(secret) { self.policy.idle_secs } else { self.policy.idle_free_secs };
                 now.saturating_sub(*used) >= idle
@@ -593,6 +596,11 @@ impl Manager {
             // The conversation that waited goes on a random while later, not at once: a session
             // topped up a second after the account's withdrawal points at it just the same.
             self.release_at = unix_now() + random_secs(self.policy.wait_min_secs, self.policy.wait_max_secs);
+            // The conversations made no requests while they waited: none is idle before it may go on.
+            let until = self.release_at;
+            for (_, used) in self.chats.values_mut() {
+                *used = (*used).max(until);
+            }
         }
         self.waiting = false;
     }
