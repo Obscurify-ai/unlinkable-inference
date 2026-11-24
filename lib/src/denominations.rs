@@ -10,6 +10,12 @@ pub const DENOMINATIONS: [i64; 18] = [
 /// mean a withdrawal's amount says nothing about what it will be spent on.
 pub const WITHDRAW_SIZES: [i64; 5] = [100, 500, 2000, 5000, 10000];
 
+/// What a withdrawal may be: a fixed size, so most look alike, or what is left under $1, so no
+/// balance is stranded.
+pub fn withdrawable_amount(cents: i64) -> bool {
+    WITHDRAW_SIZES.contains(&cents) || (1..100).contains(&cents)
+}
+
 /// What clients take from an account holding less than $1, one at a time: the largest that fits,
 /// the rest later. (Servers take any amount under $1, for older clients.)
 pub const SMALL_WITHDRAW_SIZES: [i64; 6] = [1, 2, 5, 10, 20, 50];
@@ -102,3 +108,38 @@ pub fn pick_dust_blanks(blanks: &[i64], millicents: i64) -> Option<Vec<usize>> {
 }
 
 pub const MILLICENTS_PER_CENT: i64 = 1000;
+
+/// Nanodollars (1e-9 USD) in a millicent.
+pub const NANO_PER_MILLICENT: i64 = 10_000;
+
+/// What a closing session gives back, in millicents, for a balance in nanodollars: rounded up to
+/// the next millicent, so a session never costs more than its tokens, and nothing for a balance
+/// of zero or less.
+pub fn change_millicents(balance_nano: i64) -> i64 {
+    if balance_nano <= 0 {
+        return 0;
+    }
+    balance_nano / NANO_PER_MILLICENT + i64::from(balance_nano % NANO_PER_MILLICENT != 0)
+}
+
+/// Which of a request's blanks to sign for change of exactly `millicents`: whole cents the
+/// standard way from the normal blanks, the rest from the dust blanks. `blanks` are (value, dust)
+/// pairs, value in cents or, for dust, millicents. `None` if they cannot hold it.
+pub fn pick_change(blanks: &[(i64, bool)], millicents: i64) -> Option<Vec<usize>> {
+    if millicents < 0 {
+        return None;
+    }
+    let whole: Vec<usize> = (0..blanks.len()).filter(|&i| !blanks[i].1).collect();
+    let small: Vec<usize> = (0..blanks.len()).filter(|&i| blanks[i].1).collect();
+    let values = |idx: &[usize]| idx.iter().map(|&i| blanks[i].0).collect::<Vec<_>>();
+    let mut picked: Vec<usize> = pick_blanks(&values(&whole), millicents / MILLICENTS_PER_CENT)?
+        .into_iter()
+        .map(|k| whole[k])
+        .collect();
+    picked.extend(
+        pick_dust_blanks(&values(&small), millicents % MILLICENTS_PER_CENT)?
+            .into_iter()
+            .map(|k| small[k]),
+    );
+    Some(picked)
+}

@@ -1,0 +1,26 @@
+(* P1. The server cannot tell which account paid for a chat.
+
+   Two accounts (any number of pairs of them) each withdraw money into their wallets (the server sees which
+   account asked, and the blinded message). Later two chats happen. On the
+   left, A's money pays chat1 and B's pays chat2; on the right it is the other
+   way round. ProVerif proves no server can tell the two worlds apart.
+
+   `phase 1` is the line between stocking the wallet and chatting: the
+   withdrawals are all over before the chats begin (see THREAT_MODEL.md,
+   Timing: a withdrawal a second before a chat is not covered). *)
+
+(* `!`: any number of such pairs of accounts at once, their steps interleaved in
+   any order the server likes; each pair's devices talk to it over their own
+   private wallet channels. *)
+process
+  ! ( new wa: channel; new wb: channel;
+    new master_a: bitstring; new master_b: bitstring;
+    (* each pair's accounts have their own names, which the server knows *)
+    new acct_a: bitstring; new acct_b: bitstring; out(c, (acct_a, acct_b));
+    ( Withdraw(acct_a, master_a, wa)
+    | Withdraw(acct_b, master_b, wb)
+    | in(wa, (sa: bitstring, ma: bitstring, va: bitstring));
+      in(wb, (sb: bitstring, mb: bitstring, vb: bitstring));
+      phase 1;
+      ( Chat(choice[sa, sb], choice[ma, mb], choice[va, vb], minute1, chat1)
+      | Chat(choice[sb, sa], choice[mb, ma], choice[vb, va], minute1, chat2) ) ) )

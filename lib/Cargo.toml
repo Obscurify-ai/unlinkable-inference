@@ -56,3 +56,6 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Headers", "Request", "RequestInit", "RequestCredentials", "Response", "Window", "WorkerGlobalScope"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

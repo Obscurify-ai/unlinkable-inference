@@ -21,7 +21,7 @@ use axum::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use crate::{
-    denominations::{pick_blanks, pick_dust_blanks, MILLICENTS_PER_CENT, WITHDRAW_SIZES},
+    denominations::{pick_change, MILLICENTS_PER_CENT},
     keyset::{Keyset, PassKeyInfo, VoucherKeyInfo, SCHEME},
     pass::{current_period, valid_label, Pass},
     protocol::*,
@@ -388,25 +388,13 @@ impl Gateway {
     ) -> Result<ChangeResponse, GatewayError> {
         let cents = millicents / MILLICENTS_PER_CENT;
         let dust = millicents % MILLICENTS_PER_CENT;
-        let whole: Vec<usize> = (0..blanks.len()).filter(|&i| !blanks[i].dust).collect();
-        let small: Vec<usize> = (0..blanks.len()).filter(|&i| blanks[i].dust).collect();
-        let values = |idx: &[usize]| idx.iter().map(|&i| blanks[i].denomination_cents).collect::<Vec<_>>();
-        let cannot = || {
+        // The pure part, proved in lib/src/proofs.rs: what is picked adds up to exactly `millicents`.
+        let pairs: Vec<(i64, bool)> = blanks.iter().map(|b| (b.denomination_cents, b.dust)).collect();
+        let picked = pick_change(&pairs, millicents).ok_or_else(|| {
             GatewayError::bad_request(format!(
                 "These blanks cannot hold {cents}¢ and {dust} millicents of change. Send blanks for any amount up to the balance, and dust blanks for any amount below a cent."
             ))
-        };
-        let mut picked: Vec<usize> = pick_blanks(&values(&whole), cents)
-            .ok_or_else(cannot)?
-            .into_iter()
-            .map(|k| whole[k])
-            .collect();
-        picked.extend(
-            pick_dust_blanks(&values(&small), dust)
-                .ok_or_else(cannot)?
-                .into_iter()
-                .map(|k| small[k]),
-        );
+        })?;
         self.sign_picked(blanks, picked, family)
     }
 
@@ -764,11 +752,7 @@ pub fn open_digest(spends: &[Spend], pass: Option<&PassUse>) -> String {
     crate::sha256_hex(hashes.join(","))
 }
 
-/// What a withdrawal may be: a fixed size, so most look alike, or what is left under $1, so no
-/// balance is stranded.
-pub fn withdrawable_amount(cents: i64) -> bool {
-    WITHDRAW_SIZES.contains(&cents) || (1..100).contains(&cents)
-}
+pub use crate::denominations::withdrawable_amount;
 
 async fn withdraw(State(gw): Gw, headers: HeaderMap, Json(req): Json<WithdrawRequest>) -> Response {
     let run = async {

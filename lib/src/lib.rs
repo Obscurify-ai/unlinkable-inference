@@ -20,6 +20,9 @@ pub mod seed;
 pub mod voucher;
 pub mod wallet;
 
+#[cfg(kani)]
+mod proofs;
+
 #[cfg(feature = "net")]
 pub mod net;
 #[cfg(feature = "net")]

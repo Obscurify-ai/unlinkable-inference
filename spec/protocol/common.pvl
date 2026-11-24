@@ -1,0 +1,115 @@
+(* Unlinkable inference: the cryptography, symbolically.
+
+   The server is the attacker. It knows every signing key, sees every message
+   on the one public channel `c`, keeps all of it forever and may answer
+   anything it likes. Nothing here depends on the server being honest. *)
+
+free c: channel.
+
+type skey.
+type pkey.
+
+fun pk(skey): pkey.
+
+(* RSA signatures (RFC 9474, RSABSSA-SHA384-PSS-Deterministic).
+   lib/src/blank.rs `verify`: a signature checks against a public key and a message. *)
+fun sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; checksign(sign(m, k), m, pk(k)) = true.
+
+(* Blinding (lib/src/blank.rs `Blank::build` / `Blank::finish`). The client
+   blinds message m with factor r against a public key; the server signs the
+   blinded value; the client unblinds the answer into a signature on m.
+   Without r nothing undoes the blinding. *)
+fun blind(bitstring, bitstring, pkey): bitstring.
+reduc forall m: bitstring, r: bitstring, k: skey;
+  unblind(sign(blind(m, r, pk(k)), k), r, pk(k)) = sign(m, k).
+
+(* Hashes and HMAC: one-way (lib/src/seed.rs, lib/src/lib.rs `sha256_hex`). *)
+fun H(bitstring): bitstring.
+fun hmac(bitstring, bitstring): bitstring.
+
+(* Labels mixed into derivations (lib/src/seed.rs). *)
+const t_login, t_wallet, t_voucher, t_blinding, t_session, t_change: bitstring.
+(* Public operation numbers and minutes: the server may know them all. *)
+const op1, op2, minute1, minute2: bitstring.
+
+(* The server's keys are public: it is the attacker. Clients use the pinned
+   public key (lib/src/keyset.rs `Pins`), never one handed to them later. *)
+free sk_paid: skey.
+free sk_pass: skey.
+letfun pinned = pk(sk_paid).
+
+(* Two accounts the server knows by name, and the chats it will see. *)
+free acct_a, acct_b: bitstring.  (* p0; the others name each pair's accounts afresh *)
+free chat1, chat2, chat3, chat4: bitstring.
+
+(* lib/src/seed.rs `account_keys`: one master secret per account code gives
+   the login key (sent to the server) and the wallet seed (never sent). *)
+letfun login_key(master: bitstring) = hmac(master, t_login).
+letfun wallet_seed(master: bitstring) = hmac(master, t_wallet).
+
+(* lib/src/blank.rs `Blank::seeded`: message and blinding of the j-th blank of
+   an operation, from the seed. *)
+letfun msg_of(s: bitstring, op: bitstring) = hmac(s, (t_voucher, op)).
+letfun blinding_of(s: bitstring, op: bitstring) = hmac(s, (t_blinding, op)).
+(* lib/src/seed.rs `Seed::session_secret`. *)
+letfun secret_of(s: bitstring, minute: bitstring) = hmac(s, (t_session, minute)).
+
+(* POST /u/withdraw: signed in with the login key, the account sends a blank
+   and gets back a blind signature, which the client unblinds and checks
+   against the pinned key before keeping the voucher (`Blank::finish`). The
+   voucher (message, signature) goes to the device's own wallet `w`. *)
+let Withdraw(acct: bitstring, master: bitstring, w: channel) =
+  let s = wallet_seed(master) in
+  let m = msg_of(s, op1) in
+  let r = blinding_of(s, op1) in
+  out(c, (acct, login_key(master), blind(m, r, pinned)));
+  in(c, bs: bitstring);
+  let v = unblind(bs, r, pinned) in
+  if checksign(v, m, pinned) = true then
+  out(w, (s, m, v)).
+
+(* POST /u/sessions with the voucher and SHA-256 of a fresh session secret,
+   then a model request carrying the secret as its API key. Nothing else
+   identifies the client. *)
+let Chat(s: bitstring, m: bitstring, v: bitstring, minute: bitstring, chat: bitstring) =
+  let sec = secret_of(s, minute) in
+  out(c, (m, v, H(sec)));
+  out(c, (sec, chat)).
+
+(* POST /u/sessions/close: the session's secret authorises it; the client
+   sends a fresh blank (seeded from operation op2) and unblinds the change. *)
+let ChatThenClose(s: bitstring, m: bitstring, v: bitstring, minute: bitstring, chat: bitstring, w: channel) =
+  let sec = secret_of(s, minute) in
+  out(c, (m, v, H(sec)));
+  out(c, (sec, chat));
+  let m2 = msg_of(s, op2) in
+  let r2 = blinding_of(s, op2) in
+  out(c, (sec, blind(m2, r2, pinned)));
+  in(c, bs: bitstring);
+  let v2 = unblind(bs, r2, pinned) in
+  if checksign(v2, m2, pinned) = true then
+  out(w, (s, m2, v2)).
+
+(* Passes (lib/src/pass.rs): a partially blind signature under a key derived
+   from the pinned pass key and the public metadata (label and month). *)
+fun dk(skey, bitstring): skey.
+fun pkd(pkey, bitstring): pkey.
+equation forall k: skey, md: bitstring; pkd(pk(k), md) = pk(dk(k, md)).
+const label_pro, label_free, month: bitstring.
+const t_pass: bitstring.
+letfun pass_meta(label: bitstring) = (label, month).
+letfun pass_msg(s: bitstring) = hmac(s, (t_pass, op1)).
+letfun pass_blinding(s: bitstring) = hmac(s, (t_pass, t_blinding, op1)).
+
+(* POST /u/passes: signed in, the account asks for a pass with a label. *)
+let GetPass(acct: bitstring, master: bitstring, label: bitstring, w: channel) =
+  let s = wallet_seed(master) in
+  let key = pkd(pk(sk_pass), pass_meta(label)) in
+  let p = pass_msg(s) in
+  let r = pass_blinding(s) in
+  out(c, (acct, login_key(master), label, month, blind(p, r, key)));
+  in(c, bs: bitstring);
+  let sig = unblind(bs, r, key) in
+  if checksign(sig, p, key) = true then
+  out(w, (p, sig, label)).

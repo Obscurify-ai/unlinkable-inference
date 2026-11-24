@@ -1,0 +1,17 @@
+(* P0. The login key the server sees never gives away the wallet seed, the
+   voucher messages, their blinding or the session secrets: everything the
+   wallet derives stays on the device. The client runs a full round
+   (withdraw, chat, close for change) in front of the server. *)
+
+free master_a: bitstring [private].
+free wa, ca: channel [private].
+
+query attacker(hmac(master_a, t_wallet)).
+query attacker(hmac(hmac(master_a, t_wallet), (t_blinding, op1))).
+query attacker(hmac(hmac(master_a, t_wallet), (t_blinding, op2))).
+query attacker(hmac(hmac(master_a, t_wallet), (t_session, minute2))).
+
+process
+  ( Withdraw(acct_a, master_a, wa)
+  | in(wa, (s: bitstring, m: bitstring, v: bitstring));
+    ChatThenClose(s, m, v, minute1, chat1, ca) )

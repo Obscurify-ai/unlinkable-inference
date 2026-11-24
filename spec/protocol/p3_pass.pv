@@ -1,0 +1,30 @@
+(* P3. A pass says "this session's holder gets label X this month" and
+   nothing about which account.
+
+   Both accounts get the same label (`pro`) and each takes a pass while signed
+   in. Later two chats each present a pass. On the left A's pass goes with
+   chat1; on the right B's does. ProVerif proves the server cannot tell.
+   (The crowd is everyone given that label: an account with a label nobody
+   else has is alone in its crowd. See THREAT_MODEL.md, Passes show their
+   label.) *)
+
+let PresentPass(p: bitstring, sig: bitstring, label: bitstring, sec: bitstring, chat: bitstring) =
+  out(c, (sec, p, sig, label, month));
+  out(c, (sec, chat)).
+
+(* `!`: any number of such pairs of accounts at once, their steps interleaved in
+   any order the server likes; each pair's devices talk to it over their own
+   private wallet channels. *)
+process
+  ! ( new wa: channel; new wb: channel;
+    new master_a: bitstring; new master_b: bitstring;
+    (* each pair's accounts have their own names, which the server knows *)
+    new acct_a: bitstring; new acct_b: bitstring; out(c, (acct_a, acct_b));
+    new sec1: bitstring; new sec2: bitstring;
+    ( GetPass(acct_a, master_a, label_pro, wa)
+    | GetPass(acct_b, master_b, label_pro, wb)
+    | in(wa, (pa: bitstring, siga: bitstring, la: bitstring));
+      in(wb, (pb: bitstring, sigb: bitstring, lb: bitstring));
+      phase 1;
+      ( PresentPass(choice[pa, pb], choice[siga, sigb], choice[la, lb], sec1, chat1)
+      | PresentPass(choice[pb, pa], choice[sigb, siga], choice[lb, la], sec2, chat2) ) ) )

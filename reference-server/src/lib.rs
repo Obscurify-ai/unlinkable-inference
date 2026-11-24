@@ -465,9 +465,8 @@ impl Backend for MemoryBackend {
                 ))
             };
         }
-        let balance = row.balance_nano.max(0);
         // Rounded up to the next millicent: never more than the tokens.
-        let millicents = (balance + NANO_PER_MILLICENT - 1) / NANO_PER_MILLICENT;
+        let millicents = unlinkable_inference::denominations::change_millicents(row.balance_nano);
         let answer = sign(row.family, millicents)?;
         db.signed_change.push((unix(), blinded_hashes(&answer)));
         let row = db.sessions.get_mut(secret_hash).expect("present");

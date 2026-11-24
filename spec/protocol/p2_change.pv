@@ -1,0 +1,28 @@
+(* P2. The server cannot tell which chats go together.
+
+   Worst case: the server even knows that A paid chat1 and B paid chat2. Both
+   sessions close and their change comes back in blinded vouchers. Later
+   chat3 and chat4 are paid with that change. On the left A's change pays
+   chat3; on the right B's does. ProVerif proves the server cannot tell, so
+   it cannot say that chat3 and chat1 came from the same person. *)
+
+(* `!`: any number of such pairs of accounts at once, their steps interleaved in
+   any order the server likes; each pair's devices talk to it over their own
+   private wallet channels. *)
+process
+  ! ( new wa: channel; new wb: channel; new ca: channel; new cb: channel;
+    new master_a: bitstring; new master_b: bitstring;
+    (* each pair's accounts have their own names, which the server knows *)
+    new acct_a: bitstring; new acct_b: bitstring; out(c, (acct_a, acct_b));
+    ( Withdraw(acct_a, master_a, wa)
+    | Withdraw(acct_b, master_b, wb)
+    | in(wa, (sa: bitstring, ma: bitstring, va: bitstring));
+      in(wb, (sb: bitstring, mb: bitstring, vb: bitstring));
+      phase 1;
+      ( ChatThenClose(sa, ma, va, minute1, chat1, ca)
+      | ChatThenClose(sb, mb, vb, minute1, chat2, cb)
+      | in(ca, (sa2: bitstring, ma2: bitstring, va2: bitstring));
+        in(cb, (sb2: bitstring, mb2: bitstring, vb2: bitstring));
+        phase 2;
+        ( Chat(choice[sa2, sb2], choice[ma2, mb2], choice[va2, vb2], minute2, chat3)
+        | Chat(choice[sb2, sa2], choice[mb2, ma2], choice[vb2, va2], minute2, chat4) ) ) ) )
