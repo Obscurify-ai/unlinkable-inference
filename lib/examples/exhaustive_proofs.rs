@@ -115,12 +115,53 @@ fn change_is_exactly_what_was_asked() -> Result<String, String> {
     Ok(format!("{cases} cases: up to 6 blanks, up to 4 whole and 3 dust parts, values compared only for equality"))
 }
 
+/// M9 (the server's own function): `pick_change`, given the blanks a seeded wallet really sends
+/// when it closes ($1,000 of whole-cent blanks and the dust set), picks change worth exactly the
+/// balance, never one blank twice, for every balance to the millicent up to $1,000.
+fn real_close_change_is_exact() -> Result<String, String> {
+    let blanks: Vec<(i64, bool)> = blanks_for_any_amount_up_to(100_000)
+        .into_iter()
+        .map(|v| (v, false))
+        .chain(dust_blanks_for_any().into_iter().map(|v| (v, true)))
+        .collect();
+    let value = |&(v, dust): &(i64, bool)| if dust { v } else { v * MILLICENTS_PER_CENT };
+    const TOP: i64 = 100_000 * MILLICENTS_PER_CENT;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) as i64;
+    let failure = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let blanks = &blanks;
+                scope.spawn(move || {
+                    let mut mc = t;
+                    while mc <= TOP {
+                        match pick_change(blanks, mc) {
+                            Some(p) if distinct(&p, blanks.len()) && p.iter().map(|&i| value(&blanks[i])).sum::<i64>() == mc => {}
+                            other => return Some(format!("{mc} millicents: picked {other:?}")),
+                        }
+                        mc += threads;
+                    }
+                    None
+                })
+            })
+            .collect();
+        handles.into_iter().find_map(|h| h.join().unwrap())
+    });
+    match failure {
+        Some(f) => Err(format!("the real close blanks give the wrong change for {f}")),
+        None => Ok("pick_change with a seeded wallet's real close blanks: every balance to the millicent up to $1,000".into()),
+    }
+}
+
 type Check = fn() -> Result<String, String>;
 
 fn main() {
     let mut failed = false;
-    let checks: [(&str, Check); 3] =
-        [("M7", split_is_exact), ("M8", change_fits), ("M9", change_is_exactly_what_was_asked)];
+    let checks: [(&str, Check); 4] = [
+        ("M7", split_is_exact),
+        ("M8", change_fits),
+        ("M9", change_is_exactly_what_was_asked),
+        ("M9", real_close_change_is_exact),
+    ];
     for (rule, check) in checks {
         match check() {
             Ok(what) => println!("ok {rule}: {what}"),

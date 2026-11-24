@@ -1,17 +1,24 @@
-(* P0. The login key the server sees never gives away the wallet seed, the
-   voucher messages, their blinding or the session secrets: everything the
-   wallet derives stays on the device. The client runs a full round
-   (withdraw, chat, close for change) in front of the server. *)
+(* P0 (rule P4). The login key the server sees never gives away the wallet
+   seed, the blinding of its vouchers or change, or the secret of a session
+   not yet opened: everything the wallet derives stays on the device. The
+   client runs a full round (withdraw, chat, close for change) in front of
+   the server. The queries ask about the very values the client computes
+   (`wallet_seed`, `blinding_of`, `secret_of` in common.pvl), so a change to
+   how they are derived changes what is proved. *)
 
 free master_a: bitstring [private].
 free wa, ca: channel [private].
 
-query attacker(hmac(master_a, t_wallet)).
-query attacker(hmac(hmac(master_a, t_wallet), (t_blinding, op1))).
-query attacker(hmac(hmac(master_a, t_wallet), (t_blinding, op2))).
-query attacker(hmac(hmac(master_a, t_wallet), (t_session, minute2))).
+query secret seed_a.
+query secret blinding_withdraw.
+query secret blinding_change.
+query secret next_session.
 
 process
+  let seed_a = wallet_seed(master_a) in
+  let blinding_withdraw = blinding_of(seed_a, op1) in
+  let blinding_change = blinding_of(seed_a, op2) in
+  let next_session = secret_of(seed_a, minute2) in
   ( Withdraw(acct_a, master_a, wa)
   | in(wa, (s: bitstring, m: bitstring, v: bitstring));
     ChatThenClose(s, m, v, minute1, chat1, ca) )

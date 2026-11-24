@@ -56,6 +56,21 @@ MUTANTS = [
      "letfun wallet_seed(master: bitstring) = hmac(master, t_wallet).",
      "letfun wallet_seed(master: bitstring) = hmac(master, t_login).",
      ("proverif", "p2_change")),
+    ("seed-is-login-key-p4", "P4: the wallet seed is the login key the server sees",
+     "spec/protocol/common.pvl",
+     "letfun wallet_seed(master: bitstring) = hmac(master, t_wallet).",
+     "letfun wallet_seed(master: bitstring) = hmac(master, t_login).",
+     ("proverif", "p0_seed")),
+    ("session-secret-from-time", "P4: a session secret is made from the minute alone",
+     "spec/protocol/common.pvl",
+     "letfun secret_of(s: bitstring, minute: bitstring) = hmac(s, (t_session, minute)).",
+     "letfun secret_of(s: bitstring, minute: bitstring) = H((t_session, minute)).",
+     ("proverif", "p0_seed")),
+    ("change-mod-wrong", "M9: pick_change splits the balance at 100 millicents instead of 1000",
+     "lib/src/denominations.rs",
+     "        &split_dust(millicents % MILLICENTS_PER_CENT),",
+     "        &split_dust(millicents % 100),",
+     ("exhaustive", "M9")),
     ("change-reuses-message", "P2: change is made on the message of the voucher that paid",
      "spec/protocol/common.pvl",
      "  let m2 = msg_of(s, op2) in", "  let m2 = msg_of(s, op1) in",
@@ -156,7 +171,8 @@ def scratch_copy():
         if os.path.isfile(src):
             dst = os.path.join(tmp, f)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
+            # Fresh timestamps: cargo must rebuild every mutant, never reuse another one's build.
+            shutil.copy(src, dst)
     return tmp
 
 
@@ -176,7 +192,8 @@ def run(mutant):
         elif kind == "exhaustive":
             status, detail = exhaustive(tmp, target, target_dir=os.path.join(ROOT, "target", "mutants"))
         else:
-            status, detail = kani(tmp, target, target_dir=os.path.join(ROOT, "target"))
+            # Never the real tree's build directory: a mutant's build must not stand in for the real code.
+            status, detail = kani(tmp, target, target_dir=os.path.join(ROOT, "target", "mutants-kani"))
         # Caught only when the proof ran and found the break: a tool that failed to run caught nothing.
         return status == "fail", detail
     finally:

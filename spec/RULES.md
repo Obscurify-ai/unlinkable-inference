@@ -38,7 +38,8 @@ accounts that get the same label.
 
 **P4. Signing in gives nothing away.**
 The login key the server sees never reveals the wallet's seed, how a voucher
-was blinded, or the secret of a session not yet opened.
+or its change was blinded, or the secret of a session not yet opened, even
+after a whole round of withdrawing, chatting and closing in front of it.
 *ProVerif, `protocol/p0_seed.pv`.*
 
 **P5. The server's storage only ever gets hashes.**
@@ -85,13 +86,16 @@ session can hold every possible change, to the millicent: any amount up to
 $1,000 for a wallet made from an account code, and for other wallets, any
 amount up to a limit of their choosing, proved for limits up to $100.
 
-**M9. Change is exactly what the session holds.** Whatever blanks a device
-sends, the server picks, for each part of the change, a different blank of
-exactly that value: never a millicent more, never one blank twice. Tried for
-every list of up to 6 blanks against every change of up to 7 parts (270
-million cases); the picking only compares values for equality, so small
-values stand for all values. (The picking only; the signing that follows
-signs what was picked.)
+**M9. Change is exactly what the session holds.** The server's change
+picking, given the blanks a wallet made from an account code really sends,
+finds change worth exactly the balance, never one blank twice: every balance
+to the millicent up to $1,000. For blanks a client makes up, it never picks
+more than asked or one blank twice: tried for every list of up to 6 blanks
+against every change of up to 7 parts (270 million cases), with values from
+1 to 3. Real closes send dozens of blanks; that the picking only compares
+values for equality, so small values stand for all values, is an argument
+from reading the code, not a machine check. (The picking only; the signing
+that follows signs what was picked.)
 
 **M10. Rounding is in the customer's favour, by less than 1/1000 of a cent.**
 For every balance up to $1,099.51 (2^40 nanodollars); sessions hold far less. This is the rounding in this library and its
