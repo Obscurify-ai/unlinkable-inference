@@ -954,6 +954,43 @@ async fn a_device_that_loses_everything_gets_it_all_back_from_the_account_number
     assert_eq!(hashes, vec![unlinkable_inference::sha256_hex(&s3.secret)], "only the session whose change is still held");
 }
 
+/// A conversation whose reply the server holds keeps its session while it may still be read, but
+/// its idle time isn't renewed by other conversations looking for change: once it has been quiet
+/// for `idle_secs` it closes and its money comes back, however many new chats came meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_reply_keeps_its_session_only_until_it_goes_idle() {
+    use unlinkable_inference::manager::Manager;
+    let stack = start_stack().await;
+    let key = new_account(&stack.server, 20).await;
+    let seed = unlinkable_inference::seed::account_keys("7730 1945 2286 0419").unwrap().seed;
+    let mut m = Manager::connect(&stack.server, seed, None).await.unwrap();
+    m.api_key = Some(key);
+    m.start().await.unwrap();
+    let had = m.summary().0;
+    assert!(had > 0, "topped up at start");
+    // All of it goes into one conversation's session, and the account is out of reach from here on.
+    m.policy.funding_cents = had;
+    m.api_key = None;
+    let a = m.session("chat-a").await.unwrap();
+    assert_eq!(m.summary().0, 0, "the wallet is empty");
+    m.note_reply("reply-1", &a);
+    let open = |m: &Manager| m.wallet().sessions().iter().any(|s| s.secret == a);
+
+    // Quiet for a while; new conversations look for change, and the held reply keeps its session.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    m.policy.quiet_secs = 2;
+    m.policy.funding_cents = 10;
+    let _ = m.session("chat-b").await;
+    let _ = m.session("chat-c").await;
+    assert!(open(&m), "a held reply's session isn't taken for change");
+
+    // Idle past `idle_secs` since it was last used: it closes, and its money is back in the wallet.
+    m.policy.idle_secs = 3;
+    m.tick().await;
+    assert!(!open(&m), "a quiet session with a held reply still closes once idle");
+    assert!(m.summary().0 > 0, "and its change is in the wallet again");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_app_using_the_manager_gives_each_conversation_its_own_session_and_loses_nothing() {
     use unlinkable_inference::manager::Manager;

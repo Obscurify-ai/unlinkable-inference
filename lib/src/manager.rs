@@ -322,18 +322,21 @@ impl Manager {
     /// balance spread over open conversations comes back to fund the one in use.
     async fn free_quiet(&mut self, keep: Option<&str>) {
         let now = unix_now();
+        // A held reply still needs its session to be read: it is left alone here, and its idle
+        // time stands, so `tick` closes it once it has been quiet for `idle_secs`.
         let quiet: Vec<String> = self
             .chats
             .iter()
-            .filter(|(_, (secret, used))| Some(secret.as_str()) != keep && now.saturating_sub(*used) >= self.policy.quiet_secs && self.has_money(secret))
+            .filter(|(_, (secret, used))| {
+                Some(secret.as_str()) != keep
+                    && now.saturating_sub(*used) >= self.policy.quiet_secs
+                    && self.has_money(secret)
+                    && !self.replies.values().any(|s| s == secret)
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for chat in quiet {
             if let Some((secret, _)) = self.chats.remove(&chat) {
-                if self.replies.values().any(|s| *s == secret) {
-                    self.chats.insert(chat, (secret, now));
-                    continue; // a held reply still needs it
-                }
                 let _ = self.client.close(&mut self.wallet, &Session { secret, family: Family::Paid }).await;
             }
         }
