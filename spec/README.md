@@ -14,7 +14,12 @@ here proves it.
 spec/check.py              # everything: approval, models, Rust proofs
 spec/check.py --no-kani    # models only, a minute
 spec/mutants.py            # break things on purpose; every break must be caught
+spec/status.py             # the rules, approval and last results as JSON (for the admin page)
 ```
+
+`check.py` and `mutants.py` save their results in `target/spec-status/`, stamped
+with a fingerprint of every file in the repo; `status.py` marks them stale once
+anything changes.
 
 Needs `proverif` (2.05), Java 11+ with `tla2tools.jar` (`TLA_JAR`, default
 `~/.local/share/tla/tla2tools.jar`; `TLA_JAVA` for the java command), and
@@ -38,5 +43,9 @@ function it stands for. What they take as given, and where that is held:
 ## Changing a rule
 
 The rules are Tony's. `check.py` fails when anything in this directory or
-`lib/src/proofs.rs` differs from `APPROVED`. Send him `spec/approve.py --show`,
-and only after he says yes run `spec/approve.py --yes "how he said it"`.
+`lib/src/proofs.rs` differs from `APPROVED`. He reads and approves them on the
+Rules page of the Obscurify admin panel (a server started with `RULES_SPEC_DIR`
+pointing here), which calls `spec/approve.py --expect FINGERPRINT --yes ...` so
+the approval names exactly the text he saw. Otherwise send him
+`spec/approve.py --show`, and only after he says yes run
+`spec/approve.py --yes "how he said it"`.

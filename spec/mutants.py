@@ -16,6 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC = os.path.join(ROOT, "spec")
 sys.path.insert(0, SPEC)
 from runners import proverif, tlc, kani, exhaustive  # noqa: E402
+from check import code_stamp, save_status  # noqa: E402
 
 TIMING_PROCESS = """process
   ! ( new wa: channel; new wb: channel;
@@ -208,12 +209,16 @@ def main(args):
     skip_kani = "--no-kani" in args
     args = [a for a in args if a != "--no-kani"]
     chosen = [m for m in MUTANTS if (not args or m[0] in args) and not (skip_kani and m[5][0] == "kani")]
-    missed = 0
+    stamp = code_stamp()
+    missed, ran = 0, []
     for m in chosen:
         caught, detail = run(m)
         print(f"{'caught' if caught else 'MISSED'}  {m[0]:28} {m[1]}\n        {detail}", flush=True)
         missed += not caught
+        ran.append({"name": m[0], "breaks": m[1], "caught": caught, "detail": detail})
     print(f"\n{len(chosen) - missed} of {len(chosen)} breaks caught.")
+    if not args and code_stamp() == stamp:
+        save_status("mutants.json", {"code_stamp": stamp, "kani": not skip_kani, "total": len(MUTANTS), "mutants": ran})
     return 1 if missed else 0
 
 

@@ -8,18 +8,22 @@
 Exit 0 only when every proof holds and nothing that states a rule changed since
 it was approved.
 """
-import hashlib, os, subprocess, sys
+import hashlib, json, os, subprocess, sys, time
 
 SPEC = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SPEC)
 sys.path.insert(0, SPEC)
 from runners import proverif, tlc, kani, exhaustive  # noqa: E402
 
-MODELS = ["p0_seed", "p1_payment", "p2_change", "p3_pass"]
-HARNESSES = [
-    "change_rounds_up_by_less_than_a_millicent",
-    "withdrawals_come_in_fixed_sizes",
-]
+MODELS = {"p0_seed": ["P4"], "p1_payment": ["P1"], "p2_change": ["P2"], "p3_pass": ["P3"]}
+LEDGER_RULES = ["M1", "M2", "M3", "M4", "M5", "M6"]
+EXHAUSTIVE_RULES = ["M7", "M8", "M9"]
+HARNESSES = {
+    "change_rounds_up_by_less_than_a_millicent": ["M10"],
+    "withdrawals_come_in_fixed_sizes": ["M11"],
+}
+# Where the last run's results go: outside the locked files and outside git.
+STATUS_DIR = os.path.join(ROOT, "target", "spec-status")
 
 
 def locked_files():
@@ -37,6 +41,34 @@ def locked_files():
 
 def fingerprints():
     return {f: hashlib.sha256(open(os.path.join(ROOT, f), "rb").read()).hexdigest() for f in locked_files()}
+
+
+def digest(prints=None):
+    """One fingerprint for the rules as they stand: what an approval approves."""
+    prints = fingerprints() if prints is None else prints
+    return hashlib.sha256(json.dumps(sorted(prints.items())).encode()).hexdigest()
+
+
+def code_stamp():
+    """Fingerprint of every file in the repo but the approval itself: results are current
+    only while this is unchanged."""
+    files = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], cwd=ROOT,
+                           capture_output=True, text=True, check=True).stdout.split()
+    h = hashlib.sha256()
+    for f in sorted(files):
+        path = os.path.join(ROOT, f)
+        if f == "spec/APPROVED" or not os.path.isfile(path):
+            continue
+        h.update(f.encode() + b"\0" + open(path, "rb").read() + b"\0")
+    return h.hexdigest()
+
+
+def save_status(name, data):
+    os.makedirs(STATUS_DIR, exist_ok=True)
+    data = {"ran_at": int(time.time()), **data}
+    path = os.path.join(STATUS_DIR, name)
+    open(path + ".tmp", "w").write(json.dumps(data, indent=1))
+    os.replace(path + ".tmp", path)
 
 
 def approval():
@@ -57,36 +89,34 @@ def approval():
 
 
 def main(args):
+    stamp = code_stamp()
     results = []
+
+    def record(name, rules, status, detail, kind):
+        ok = status == "pass"
+        results.append({"name": name, "rules": rules, "status": status, "detail": detail, "kind": kind})
+        print(f"{'ok ' if ok else 'NO '} {kind:10} {detail}", flush=True)
+
     ok, detail = approval()
-    results.append(("approval", ok, detail))
     print(f"{'ok ' if ok else 'NO '} approval   {detail}", flush=True)
-    for m in MODELS:
-        ok, detail = proverif(SPEC, m)
-        ok = ok == "pass"
-        results.append((m, ok, detail))
-        print(f"{'ok ' if ok else 'NO '} protocol   {detail}", flush=True)
-    ok, detail = tlc(SPEC)
-    ok = ok == "pass"
-    results.append(("ledger", ok, detail))
-    print(f"{'ok ' if ok else 'NO '} ledger     {detail}", flush=True)
-    ok, detail = exhaustive(ROOT)
-    ok = ok == "pass"
-    results.append(("exhaustive", ok, detail))
-    print(f"{'ok ' if ok else 'NO '} rust       {detail}", flush=True)
+    for m, rules in MODELS.items():
+        record(m, rules, *proverif(SPEC, m), "protocol")
+    record("ledger", LEDGER_RULES, *tlc(SPEC), "ledger")
+    record("exhaustive", EXHAUSTIVE_RULES, *exhaustive(ROOT), "rust")
     if "--no-kani" not in args:
-        for h in HARNESSES:
-            ok, detail = kani(ROOT, h)
-            ok = ok == "pass"
-            results.append((h, ok, detail))
-            print(f"{'ok ' if ok else 'NO '} rust       {detail}", flush=True)
+        for h, rules in HARNESSES.items():
+            record(h, rules, *kani(ROOT, h), "rust")
+    if code_stamp() == stamp:
+        save_status("check.json", {"code_stamp": stamp, "kani": "--no-kani" not in args, "checks": results})
+    else:
+        print("The files changed while the checks ran: results not saved.")
+    failed = [r for r in results if r["status"] != "pass"] + ([] if ok else ["approval"])
     if "--mutants" in args:
         code = subprocess.run([sys.executable, os.path.join(SPEC, "mutants.py")]).returncode
-        results.append(("mutants", code == 0, ""))
-    failed = [r for r in results if not r[1]]
-    print(f"\n{len(results) - len(failed)} of {len(results)} checks pass.")
+        failed += [] if code == 0 else ["mutants"]
+    total = len(results) + 1 + ("--mutants" in args)
+    print(f"\n{total - len(failed)} of {total} checks pass.")
     return 1 if failed else 0
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
