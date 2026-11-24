@@ -62,9 +62,14 @@ pub fn blanks_for_any_amount_up_to(max_cents: i64) -> Vec<i64> {
 /// Which blanks to sign for `cents`: indexes into `blanks` (by denomination)
 /// that add up to exactly the greedy split. `None` if the blanks cannot hold it.
 pub fn pick_blanks(blanks: &[i64], cents: i64) -> Option<Vec<usize>> {
+    pick_parts(blanks, &split(cents))
+}
+
+/// Indexes of distinct `blanks` with the values `parts`, in order. `None` if there aren't enough.
+pub fn pick_parts(blanks: &[i64], parts: &[i64]) -> Option<Vec<usize>> {
     let mut used = vec![false; blanks.len()];
-    let mut picked = Vec::new();
-    for part in split(cents) {
+    let mut picked = Vec::with_capacity(parts.len());
+    for &part in parts {
         let i = (0..blanks.len()).find(|&i| !used[i] && blanks[i] == part)?;
         used[i] = true;
         picked.push(i);
@@ -97,14 +102,7 @@ pub fn dust_blanks_for_any() -> Vec<i64> {
 
 /// Like [`pick_blanks`] for dust.
 pub fn pick_dust_blanks(blanks: &[i64], millicents: i64) -> Option<Vec<usize>> {
-    let mut used = vec![false; blanks.len()];
-    let mut picked = Vec::new();
-    for part in split_dust(millicents) {
-        let i = (0..blanks.len()).find(|&i| !used[i] && blanks[i] == part)?;
-        used[i] = true;
-        picked.push(i);
-    }
-    Some(picked)
+    pick_parts(blanks, &split_dust(millicents))
 }
 
 pub const MILLICENTS_PER_CENT: i64 = 1000;
@@ -129,17 +127,19 @@ pub fn pick_change(blanks: &[(i64, bool)], millicents: i64) -> Option<Vec<usize>
     if millicents < 0 {
         return None;
     }
-    let whole: Vec<usize> = (0..blanks.len()).filter(|&i| !blanks[i].1).collect();
+    pick_change_parts(
+        blanks,
+        &split(millicents / MILLICENTS_PER_CENT),
+        &split_dust(millicents % MILLICENTS_PER_CENT),
+    )
+}
+
+/// [`pick_change`] for change already split: `whole` in cents, `dust` in millicents.
+pub fn pick_change_parts(blanks: &[(i64, bool)], whole: &[i64], dust: &[i64]) -> Option<Vec<usize>> {
+    let normal: Vec<usize> = (0..blanks.len()).filter(|&i| !blanks[i].1).collect();
     let small: Vec<usize> = (0..blanks.len()).filter(|&i| blanks[i].1).collect();
     let values = |idx: &[usize]| idx.iter().map(|&i| blanks[i].0).collect::<Vec<_>>();
-    let mut picked: Vec<usize> = pick_blanks(&values(&whole), millicents / MILLICENTS_PER_CENT)?
-        .into_iter()
-        .map(|k| whole[k])
-        .collect();
-    picked.extend(
-        pick_dust_blanks(&values(&small), millicents % MILLICENTS_PER_CENT)?
-            .into_iter()
-            .map(|k| small[k]),
-    );
+    let mut picked: Vec<usize> = pick_parts(&values(&normal), whole)?.into_iter().map(|k| normal[k]).collect();
+    picked.extend(pick_parts(&values(&small), dust)?.into_iter().map(|k| small[k]));
     Some(picked)
 }

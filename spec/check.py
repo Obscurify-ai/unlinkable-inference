@@ -17,7 +17,7 @@ from runners import proverif, tlc, kani, exhaustive  # noqa: E402
 
 MODELS = ["p0_seed", "p1_payment", "p2_change", "p3_pass"]
 HARNESSES = [
-    "change_signed_is_exactly_the_balance", "change_rounds_up_by_less_than_a_millicent",
+    "change_rounds_up_by_less_than_a_millicent",
     "withdrawals_come_in_fixed_sizes",
 ]
 

@@ -7,8 +7,8 @@ here proves it.
 |---|---|---|---|
 | P1 to P4 | [ProVerif](https://bblanche.gitlabpages.inria.fr/proverif/) | `protocol/` | The protocol against a server that holds every key and sees everything, for any number of pairs of accounts, each withdrawing and chatting once. |
 | M1 to M6 | [TLA+](https://lamport.azurewebsites.net/tla/tla.html) (TLC) | `ledger/` | The money rules every storage layer must keep, in every order of requests, with retries, lost answers and two devices sharing a wallet, in a small world (`Ledger.cfg`). |
-| M7, M8 | Exhaustion | `../lib/examples/exhaustive_proofs.rs` | The Rust code that splits amounts and builds blanks, for every amount in range, one by one. |
-| M9 to M11 | [Kani](https://model-checking.github.io/kani/) | `../lib/src/proofs.rs` | The Rust code that picks, rounds and limits amounts, for every input in range at once. |
+| M7 to M9 | Exhaustion | `../lib/examples/exhaustive_proofs.rs` | The Rust code that splits amounts, builds blanks and picks change, for every case in range, one by one. |
+| M10, M11 | [Kani](https://model-checking.github.io/kani/) | `../lib/src/proofs.rs` | The Rust code that rounds change and limits withdrawals, for every input in range at once. |
 
 ```sh
 spec/check.py              # everything: approval, models, Rust proofs

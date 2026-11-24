@@ -67,9 +67,61 @@ fn change_fits() -> Result<String, String> {
     Ok("up to $1,000 for seeded wallets, every limit up to $100 for others, every amount below a cent".into())
 }
 
+/// Every list of up to `max_len` items drawn from `options`.
+fn lists<T: Copy>(options: &[T], max_len: usize) -> Vec<Vec<T>> {
+    let mut all = vec![Vec::new()];
+    let mut layer = vec![Vec::new()];
+    for _ in 0..max_len {
+        layer = layer
+            .iter()
+            .flat_map(|l: &Vec<T>| options.iter().map(move |&o| [l.clone(), vec![o]].concat()))
+            .collect();
+        all.extend(layer.iter().cloned());
+    }
+    all
+}
+
+/// M9: whatever blanks a client sends, the server picks, for each part of the change, a different
+/// blank of exactly that value and kind. The picking only compares values for equality, so values
+/// from {1, 2, 3} make every choice it can face with up to three distinct values; tried for every
+/// list of up to 6 blanks against every change of up to 4 whole and 3 dust parts.
+fn change_is_exactly_what_was_asked() -> Result<String, String> {
+    let kinds: Vec<(i64, bool)> = [1, 2, 3].iter().flat_map(|&v| [(v, false), (v, true)]).collect();
+    let blank_lists = lists(&kinds, 6);
+    let wholes = lists(&[1i64, 2, 3], 4);
+    let dusts = lists(&[1i64, 2, 3], 3);
+    let mut cases = 0u64;
+    for blanks in &blank_lists {
+        for whole in &wholes {
+            for dust in &dusts {
+                cases += 1;
+                let Some(picked) = pick_change_parts(blanks, whole, dust) else {
+                    // Refusing is fine only when the blanks really can't hold it.
+                    let can = |v: i64, d: bool, need: usize| blanks.iter().filter(|&&b| b == (v, d)).count() >= need;
+                    let count = |l: &[i64], v: i64| l.iter().filter(|&&x| x == v).count();
+                    if [1, 2, 3].iter().all(|&v| can(v, false, count(whole, v)) && can(v, true, count(dust, v))) {
+                        return Err(format!("refused {whole:?} + dust {dust:?} from {blanks:?}, which hold it"));
+                    }
+                    continue;
+                };
+                let asked: Vec<(i64, bool)> = whole.iter().map(|&v| (v, false)).chain(dust.iter().map(|&v| (v, true))).collect();
+                let got: Vec<(i64, bool)> = picked.iter().map(|&i| blanks[i]).collect();
+                if !distinct(&picked, blanks.len()) || got != asked {
+                    return Err(format!("asked {asked:?} from {blanks:?}, picked {picked:?}"));
+                }
+            }
+        }
+    }
+    Ok(format!("{cases} cases: up to 6 blanks, up to 4 whole and 3 dust parts, values compared only for equality"))
+}
+
+type Check = fn() -> Result<String, String>;
+
 fn main() {
     let mut failed = false;
-    for (rule, check) in [("M7", split_is_exact as fn() -> Result<String, String>), ("M8", change_fits)] {
+    let checks: [(&str, Check); 3] =
+        [("M7", split_is_exact), ("M8", change_fits), ("M9", change_is_exactly_what_was_asked)];
+    for (rule, check) in checks {
         match check() {
             Ok(what) => println!("ok {rule}: {what}"),
             Err(why) => {

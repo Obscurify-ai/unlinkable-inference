@@ -73,8 +73,8 @@ Forging a signature is assumed impossible (RSA, RFC 9474).
 **M6. Promotional credit never turns into paid money.**
 
 M7 to M11 are proved on the Rust code itself, for every input in the range
-given: M7 and M8 by trying every amount in it, one by one
-(`lib/examples/exhaustive_proofs.rs`); M9 to M11 by Kani, which checks all
+given: M7 to M9 by trying every case in it, one by one
+(`lib/examples/exhaustive_proofs.rs`); M10 and M11 by Kani, which checks all
 inputs at once as a formula (`lib/src/proofs.rs`).
 
 **M7. Any amount splits into vouchers worth exactly that amount.** Every
@@ -86,12 +86,15 @@ $1,000 for a wallet made from an account code, and for other wallets, any
 amount up to a limit of their choosing, proved for limits up to $100.
 
 **M9. Change is exactly what the session holds.** Whatever blanks a device
-sends, the server picks change worth exactly the balance, never more, and
-never one blank twice. Proved for any 4 blanks of any value and balances up
-to $100. (The picking only; the signing that follows signs what was picked.)
+sends, the server picks, for each part of the change, a different blank of
+exactly that value: never a millicent more, never one blank twice. Tried for
+every list of up to 6 blanks against every change of up to 7 parts (270
+million cases); the picking only compares values for equality, so small
+values stand for all values. (The picking only; the signing that follows
+signs what was picked.)
 
 **M10. Rounding is in the customer's favour, by less than 1/1000 of a cent.**
-For every possible balance. This is the rounding in this library and its
+For every balance up to $1,099.51 (2^40 nanodollars); sessions hold far less. This is the rounding in this library and its
 reference server; Obscurify's server rounds with its own code, not covered.
 
 **M11. Withdrawals come in fixed sizes.** $1, $5, $20, $50, $100, or 1¢ to
