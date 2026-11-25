@@ -1,5 +1,7 @@
 # Unlinkable inference
 
+[![proofs](https://github.com/Obscurify-ai/unlinkable-inference/actions/workflows/proofs.yml/badge.svg)](https://github.com/Obscurify-ai/unlinkable-inference/actions/workflows/proofs.yml) **All 16 rules [machine-checked](#proved-not-just-tested)**
+
 Use AI models without the server being able to tell which account or payment
 a chat came from, or which other chats it goes with. The server still reads
 the prompt, and sees your IP address unless you hide it with Tor or a VPN.
@@ -8,15 +10,37 @@ the prompt, and sees your IP address unless you hide it with Tor or a VPN.
 
 ## Proved, not just tested
 
-[spec/RULES.md](spec/RULES.md) states what this library promises, in plain
-words: the server can't tell which account paid for a chat or which chats go
-together, a pass shows a label and never an account, storage only ever gets
-hashes, and no money is made or lost. Each rule is checked by a machine:
-ProVerif for the privacy rules, TLA+ for the money rules, and Kani, exhaustive
-runs and Rust's type checker on the code itself. `python3 spec/check.py` runs
-every proof again, and `spec/mutants.py` breaks the design and the code on
-purpose to show each proof catches it. The same file lists what the proofs do
-not cover. [spec/README.md](spec/README.md) says how to install the tools.
+Every promise below is checked by a machine on every push, not just by tests.
+The full wording, the conditions and what the proofs leave out are in
+**[spec/RULES.md](spec/RULES.md)**.
+
+| | The promise | Proved with |
+|---|---|---|
+| P1 | The server can't tell which account paid for a chat | [ProVerif](spec/protocol/p1_payment.pv) |
+| P2 | The server can't tell which chats go together | [ProVerif](spec/protocol/p2_change.pv) |
+| P3 | A pass shows a label and month, never an account | [ProVerif](spec/protocol/p3_pass.pv) |
+| P4 | Signing in gives nothing away | [ProVerif](spec/protocol/p0_seed.pv) |
+| P5 | Storage only ever gets hashes, never a secret, voucher or pass | Rust's type checker ([stored.rs](lib/src/server/stored.rs)) |
+| M1 | No money is made or lost | [TLA+](spec/ledger/Ledger.tla) |
+| M2 | You never pay more than your requests cost | [TLA+](spec/ledger/Ledger.tla) |
+| M3 | A voucher is spent once, and only one the server signed | [TLA+](spec/ledger/Ledger.tla) |
+| M4 | An account never goes below zero | [TLA+](spec/ledger/Ledger.tla) |
+| M5 | A lost answer never loses money | [TLA+](spec/ledger/Ledger.tla) |
+| M6 | Promotional credit never turns into paid money | [TLA+](spec/ledger/Ledger.tla) |
+| M7 | Any amount splits into vouchers worth exactly that | every case in range ([exhaustive run](lib/examples/exhaustive_proofs.rs)) |
+| M8 | The change always fits | every case in range ([exhaustive run](lib/examples/exhaustive_proofs.rs)) |
+| M9 | Change is exactly what the session holds | every case in range ([exhaustive run](lib/examples/exhaustive_proofs.rs)) |
+| M10 | Rounding favours you, by under 1/1000 of a cent | [Kani](lib/src/proofs.rs) |
+| M11 | Withdrawals come in fixed sizes | [Kani](lib/src/proofs.rs) |
+
+ProVerif proves the privacy rules against a server that can try anything;
+TLA+ checks every order the money events can happen in (437,085 states); Kani,
+exhaustive runs and the type checker prove properties of the code itself.
+`spec/mutants.py` then breaks the design and the code 29 ways on purpose, and
+every proof catches its break, so none of them passes by proving nothing.
+Run it all yourself with `python3 spec/check.py`; [spec/README.md](spec/README.md)
+says how to install the tools. The rules can only change when the maintainer
+approves them ([spec/APPROVED](spec/APPROVED)).
 
 How it works, in one paragraph: your device holds a wallet of blind-signed
 vouchers (Chaumian e-cash: David Chaum's blind signatures, 1982). Each conversation opens a session paid with a few of them and uses a

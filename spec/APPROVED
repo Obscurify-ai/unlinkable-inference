@@ -1,6 +1,6 @@
 # Approved on 2026-11-25: approved by the maintainer after reading the rules
 # SHA-256 of every file that states a rule or decides whether one holds.
-31908fb09016a02abe89186de91bb666a4f726b29fdbd4c077a4c1b385fa604f  .github/workflows/proofs.yml
+f25ba729a6431b1dee9d4716ae8aa018305194cea8b6b1ca1f314c31b21734de  .github/workflows/proofs.yml
 b7bc5f76a3afc84c7f95b0fcf9fb5185a5ea59331fd8789f5af2d9e866b2d5fc  lib/examples/exhaustive_proofs.rs
 1b43a01653546c652bbc285076f1f9d120450896dc9cad3a5d3d1730f154a324  lib/src/proofs.rs
 886e5daf58f3b47edfccbbcbfa82195f8fb7a7d0d5686bc9ce727c2cb4f274bd  lib/src/server/stored.rs
