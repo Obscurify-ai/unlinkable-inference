@@ -15,7 +15,7 @@ import os, shutil, subprocess, sys, tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC = os.path.join(ROOT, "spec")
 sys.path.insert(0, SPEC)
-from runners import proverif, tlc, kani, exhaustive  # noqa: E402
+from runners import proverif, tlc, kani, exhaustive, types  # noqa: E402
 from check import code_stamp, save_status  # noqa: E402
 
 TIMING_PROCESS = """process
@@ -82,6 +82,19 @@ MUTANTS = [
      "  let key = pkd(pk(sk_pass), (pass_meta(label), acct)) in",
      ("proverif", "p3_pass")),
 
+    ("secret-stored-as-is", "P5: storage is handed the session secret itself, not its hash",
+     "lib/src/server.rs",
+     "    Ok(SecretHash::of(&token))", "    Ok(SecretHash(token))",
+     ("types", "P5")),
+    ("voucher-stored-as-is", "P5: storage is handed the voucher itself, not its hash",
+     "lib/src/server.rs",
+     "            let hash = SpentHash::of_voucher(&voucher);", "            let hash = code.clone();",
+     ("types", "P5")),
+    ("secret-as-account-key", "P5: a withdrawal hands storage whatever key it was sent, unchecked",
+     "lib/src/server.rs",
+     "        let token = account_token(&headers)?;\n        if !withdrawable_amount",
+     "        let token = bearer(&headers).unwrap_or_default();\n        if !withdrawable_amount",
+     ("types", "P5")),
     # --- money: the ledger model ---------------------------------------------------------
     ("partial-spend", "M1: a refused open still spends the vouchers that were unspent",
      "spec/ledger/Ledger.tla",
@@ -190,6 +203,8 @@ def run(mutant):
             status, detail = proverif(os.path.join(tmp, "spec"), target)
         elif kind == "tlc":
             status, detail = tlc(os.path.join(tmp, "spec"), only=target)
+        elif kind == "types":
+            status, detail = types(tmp, target_dir=os.path.join(ROOT, "target", "mutants"))
         elif kind == "exhaustive":
             status, detail = exhaustive(tmp, target, target_dir=os.path.join(ROOT, "target", "mutants"))
         else:

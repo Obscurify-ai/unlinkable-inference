@@ -1,12 +1,12 @@
 # The rules
 
 What unlinkable-inference promises, in plain words, and how each promise is
-proved. Tony approves this file. `spec/check.py` checks every rule.
+proved. The maintainer approves this file. `spec/check.py` checks every rule.
 
 There are two kinds of proof here, and they are not equally strong:
 
-- **Proofs about the Rust code** (M7 to M11). If someone changes that code
-  and breaks the rule, the proof fails.
+- **Proofs about the Rust code** (P5, M7 to M11). If someone changes that
+  code and breaks the rule, the proof fails.
 - **Proofs about a model of the design** (ProVerif, P1 to P4; TLA+, M1 to
   M6). They show the design is right. Each step of a model names the code it
   stands for, but if the code drifts away from the model, these proofs still
@@ -43,11 +43,13 @@ after a whole round of withdrawing, chatting and closing in front of it.
 *ProVerif, `protocol/p0_seed.pv`.*
 
 **P5. The server's storage only ever gets hashes.**
-The storage layer is handed the hash of each voucher and session secret,
-never the voucher or the secret itself.
-*Not a proof: the types in `lib/src/server.rs` (`Spend`, `secret_hash`), and
-the end-to-end test `a_chat_cannot_be_tied_to_the_account_that_paid_for_it`,
-which reads the reference server's whole store and finds nothing linking.*
+Sessions, vouchers and passes reach storage only as their SHA-256 hashes, so
+a leaked database can't spend a voucher, use a pass or take over a session.
+Everything the server hands storage has a type that only
+`lib/src/server/stored.rs` can make, and that file either hashes what it is
+given or refuses it if it holds a session secret, voucher or pass as they are
+sent. Accounts are named by their API key.
+*Rust's type checker; `stored.rs` is locked with these rules.*
 
 ## Money
 
@@ -106,9 +108,13 @@ reference server; Obscurify's server rounds with its own code, not covered.
 
 ## What these proofs do not cover
 
-- **Timing.** A withdrawal a second before a chat points at the account.
-  P1 and P2 assume the wallet was stocked earlier; `mutants.py` shows the
-  proof fails without that.
+- **Timing.** The server sees when each account withdraws and when each
+  chat opens. A chat that opens a second after the only withdrawal is linked
+  to that account by the timing alone. The wallet refills ahead of time, at
+  random moments, so this is rare; but by default a chat the wallet can't pay
+  asks the account at once (`Policy::fund_now = false` makes it wait for a
+  random refill instead). P1 and P2 assume the wallet was stocked earlier;
+  `mutants.py` shows the proof fails without that.
 - **The address and the words.** Hide the address with Tor or a VPN. A
   prompt that names you names you.
 - **Amounts and denominations.** The privacy models give every voucher the
@@ -132,8 +138,8 @@ counts as caught when the tool ran and found it.
 ## Changing these rules
 
 `APPROVED` holds the fingerprint of this file and of everything that states
-or checks a rule. `check.py` fails if any of them changed since Tony
-approved them. A change goes to Tony in plain words; once he says yes,
+or checks a rule. `check.py` fails if any of them changed since they were
+approved. A change goes to the maintainer in plain words; once they say yes,
 `approve.py` records it. This is a tripwire, not a lock: any agent on the
 machine could rerun `approve.py`. What it guarantees is that a changed rule
 can't pass quietly.

@@ -13,14 +13,16 @@
 //! `needs_pass` with that label, then sends the request again: when that said
 //! no (none to show), once only, in case the server serves it another way.
 //!
-//! **Nothing a conversation does makes a request with the account's key.** A withdrawal a
+//! **A conversation asks the account only when the wallet can't pay it.** A withdrawal a
 //! second before a session opens (or tops up) ties the two together by timing alone, whatever
-//! the amounts. So the account is asked only at moments of its own: `start` (the app opening,
-//! a sign-in), `money_added`, and at random times (`contact_min_secs`..`contact_max_secs` apart)
-//! from `tick`. When a conversation needs money or a pass the wallet doesn't hold, the call fails
-//! with [`Refilling`]: the app holds the request ("the private wallet is refilling") until
-//! `refilling()` is `None` again, and the next contact is brought forward to a random moment
-//! `wait_min_secs`..`wait_max_secs` away, never to now.
+//! the amounts. So the wallet is stocked at moments of the account's own: `start` (the app
+//! opening, a sign-in), `money_added`, and at random times (`contact_min_secs`..`contact_max_secs`
+//! apart) from `tick`. When a conversation needs money or a pass the wallet doesn't hold, by
+//! default ([`Policy::fund_now`]) the account is asked at once, and those two requests are
+//! seconds apart. With `fund_now` false the call fails with [`Refilling`] instead: the app holds
+//! the request ("the private wallet is refilling") until `refilling()` is `None` again, and the
+//! next contact is brought forward to a random moment `wait_min_secs`..`wait_max_secs` away,
+//! never to now.
 
 use crate::net::{Client, Session, Transport};
 use crate::seed::Seed;

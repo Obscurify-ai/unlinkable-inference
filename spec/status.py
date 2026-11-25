@@ -5,7 +5,7 @@
 
 The rules come straight from RULES.md, every word of it, split into its sections,
 rules and notes. With them: the fingerprint an approval must name (approve.py
---expect), whether and when Tony approved, what changed since, and the results of
+--expect), whether and when the maintainer approved, what changed since, and the results of
 the last check.py and mutants.py runs, marked stale if any file changed after them.
 """
 import json, os, re, sys, time

@@ -8,6 +8,9 @@
 //! same code runs in the reference server and in a production server.
 
 pub mod signer;
+pub mod stored;
+
+pub use stored::{AccountKey, Checked, Digest, IssuedRecord, Label, Nonce, Period, SecretHash, SpentHash};
 
 
 use async_trait::async_trait;
@@ -23,7 +26,7 @@ use std::sync::Arc;
 use crate::{
     denominations::{pick_change, MILLICENTS_PER_CENT},
     keyset::{Keyset, PassKeyInfo, VoucherKeyInfo, SCHEME},
-    pass::{current_period, valid_label, Pass},
+    pass::{current_period, Pass},
     protocol::*,
     Family, Voucher,
 };
@@ -31,15 +34,15 @@ use crate::{
 /// A pass a session presents.
 #[derive(Debug, Clone)]
 pub struct PassUse {
-    pub hash: String,
-    pub label: String,
-    pub period: String,
+    pub hash: SpentHash,
+    pub label: Label,
+    pub period: Period,
 }
 
 /// One voucher being spent: the hash of its message and its value.
 #[derive(Debug, Clone)]
 pub struct Spend {
-    pub hash: String,
+    pub hash: SpentHash,
     /// Value in millicents (1/1000 of a cent)
     pub millicents: i64,
 }
@@ -160,25 +163,15 @@ impl IntoResponse for GatewayError {
     }
 }
 
-/// A withdrawal or pass request made with a nonce (a seeded wallet): kept
-/// with its answer, linked to the account, until the account says it is done.
-#[derive(Debug, Clone)]
-pub struct IssuedRecord {
-    /// "withdraw" or "pass" ("passes": asked for by a 0.1 client)
-    pub kind: &'static str,
-    pub nonce: String,
-    pub request: serde_json::Value,
-}
-
 /// Signs change: given the family and the millicents the session holds
 /// (its balance rounded up to the next millicent, in the customer's favour),
 /// sign/// the blanks that add up to it.
 pub type SignChange =
-    Box<dyn FnOnce(Family, i64) -> Result<ChangeResponse, GatewayError> + Send>;
+    Box<dyn FnOnce(Family, i64) -> Result<Checked<ChangeResponse>, GatewayError> + Send>;
 
 /// Signs a request's blanks. Signing is the expensive part of a request, so the backend calls it
 /// only once everything else is in order: a refused request costs the server nothing.
-pub type Sign<T> = Box<dyn FnOnce() -> Result<T, GatewayError> + Send>;
+pub type Sign<T> = Box<dyn FnOnce() -> Result<Checked<T>, GatewayError> + Send>;
 
 /// Storage and money. Every method that spends vouchers or moves balance
 /// must do it atomically, and must answer a repeat of a request (same
@@ -208,7 +201,7 @@ pub trait Backend: Send + Sync + 'static {
     /// of each other's vouchers and derive the same secrets.
     async fn open_session(
         &self,
-        secret_hash: &str,
+        secret_hash: &SecretHash,
         family: Family,
         spends: &[Spend],
         pass: Option<&PassUse>,
@@ -217,7 +210,7 @@ pub trait Backend: Send + Sync + 'static {
     /// label stands for (the gateway has checked the signature and month). A
     /// pass used before answers 409 `pass_spent`, except by this same session
     /// (a retry), which changes nothing and succeeds.
-    async fn present_pass(&self, secret_hash: &str, pass: &PassUse) -> Result<SessionStatus, GatewayError> {
+    async fn present_pass(&self, secret_hash: &SecretHash, pass: &PassUse) -> Result<SessionStatus, GatewayError> {
         let _ = (secret_hash, pass);
         Err(GatewayError::unavailable())
     }
@@ -225,8 +218,8 @@ pub trait Backend: Send + Sync + 'static {
     /// for, and how many of each are left this month.
     async fn pass_allowance(
         &self,
-        account_token: &str,
-        period: &str,
+        account_token: &AccountKey,
+        period: &Period,
     ) -> Result<PassAllowance, GatewayError> {
         let _ = (account_token, period);
         Err(GatewayError::unavailable())
@@ -237,11 +230,11 @@ pub trait Backend: Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     async fn record_passes(
         &self,
-        account_token: &str,
-        label: &str,
-        period: &str,
+        account_token: &AccountKey,
+        label: &Label,
+        period: &Period,
         count: i64,
-        request_digest: &str,
+        request_digest: &Digest,
         sign: Sign<PassResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<PassResponse, GatewayError> {
@@ -254,34 +247,34 @@ pub trait Backend: Send + Sync + 'static {
     async fn unclaimed(&self) -> Result<Vec<UnclaimedSession>, GatewayError>;
     /// Forget a closed session (its holder has spent all its change). An
     /// open session is left alone.
-    async fn session_done(&self, secret_hash: &str) -> Result<(), GatewayError>;
+    async fn session_done(&self, secret_hash: &SecretHash) -> Result<(), GatewayError>;
     /// The account's [`IssuedRecord`]s not yet marked done, with answers.
-    async fn issued(&self, account_token: &str) -> Result<Vec<Issued>, GatewayError>;
-    async fn issued_done(&self, account_token: &str, nonces: &[String]) -> Result<(), GatewayError>;
+    async fn issued(&self, account_token: &AccountKey) -> Result<Vec<Issued>, GatewayError>;
+    async fn issued_done(&self, account_token: &AccountKey, nonces: &[Nonce]) -> Result<(), GatewayError>;
     /// Hashes of vouchers and passes spent at or after `since` (Unix seconds).
     async fn spent_since(&self, since: u64) -> Result<Vec<String>, GatewayError>;
     async fn topup(
         &self,
-        secret_hash: &str,
+        secret_hash: &SecretHash,
         family: Family,
         spends: &[Spend],
     ) -> Result<SessionStatus, GatewayError>;
-    async fn status(&self, secret_hash: &str) -> Result<SessionStatus, GatewayError>;
+    async fn status(&self, secret_hash: &SecretHash) -> Result<SessionStatus, GatewayError>;
     /// Close: lock the session, call `sign` with its balance in millicents,
     /// rounded up (never down: a session must not cost more than its
     /// tokens), store the answer
     /// under `request_digest`, and end the session.
     async fn close_session(
         &self,
-        secret_hash: &str,
-        request_digest: &str,
+        secret_hash: &SecretHash,
+        request_digest: &Digest,
         sign: SignChange,
     ) -> Result<ChangeResponse, GatewayError>;
     /// Spend `spends`, `sign`, and record the answer under `request_digest`, atomically; a
     /// repeat with the same digest gets the stored answer, without signing.
     async fn exchange(
         &self,
-        request_digest: &str,
+        request_digest: &Digest,
         spends: &[Spend],
         sign: Sign<ChangeResponse>,
     ) -> Result<ChangeResponse, GatewayError>;
@@ -290,9 +283,9 @@ pub trait Backend: Send + Sync + 'static {
     /// repeat with the same digest gets the stored answer, without signing.
     async fn withdraw(
         &self,
-        account_token: &str,
+        account_token: &AccountKey,
         cents: i64,
-        request_digest: &str,
+        request_digest: &Digest,
         sign: Sign<ChangeResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<ChangeResponse, GatewayError>;
@@ -365,7 +358,7 @@ impl Gateway {
                     "Paid and promotional vouchers cannot fund the same session.",
                 ));
             }
-            let hash = voucher.spent_hash();
+            let hash = SpentHash::of_voucher(&voucher);
             if !seen.insert(hash.clone()) {
                 return Err(GatewayError::bad_request(format!("Voucher {i} appears twice.")));
             }
@@ -385,7 +378,7 @@ impl Gateway {
         blanks: &[BlindedVoucher],
         family: Family,
         millicents: i64,
-    ) -> Result<ChangeResponse, GatewayError> {
+    ) -> Result<Checked<ChangeResponse>, GatewayError> {
         let cents = millicents / MILLICENTS_PER_CENT;
         let dust = millicents % MILLICENTS_PER_CENT;
         // The pure part, proved in lib/src/proofs.rs: what is picked adds up to exactly `millicents`.
@@ -404,7 +397,7 @@ impl Gateway {
         blanks: &[BlindedVoucher],
         family: Family,
         millicents: i64,
-    ) -> Result<ChangeResponse, GatewayError> {
+    ) -> Result<Checked<ChangeResponse>, GatewayError> {
         let sum: i64 = blanks.iter().map(blank_millicents).sum();
         if sum != millicents {
             return Err(GatewayError::bad_request(format!(
@@ -419,7 +412,7 @@ impl Gateway {
         blanks: &[BlindedVoucher],
         picked: Vec<usize>,
         family: Family,
-    ) -> Result<ChangeResponse, GatewayError> {
+    ) -> Result<Checked<ChangeResponse>, GatewayError> {
         let mut signed = Vec::with_capacity(picked.len());
         let mut total = 0;
         for index in picked {
@@ -449,7 +442,7 @@ impl Gateway {
                 blind_signature: crate::b64(sig),
             });
         }
-        Ok(ChangeResponse {
+        Checked::new(ChangeResponse {
             change_cents: total / MILLICENTS_PER_CENT,
             dust_millicents: total % MILLICENTS_PER_CENT,
             family,
@@ -481,16 +474,16 @@ impl Gateway {
             return Err(GatewayError::bad_request("That pass has no valid signature."));
         }
         Ok(PassUse {
-            hash: pass.spent_hash(),
-            label: pass.label,
-            period: pass.period,
+            hash: SpentHash::of_pass(&pass),
+            label: Label::new(&pass.label).ok_or_else(|| GatewayError::bad_request("That pass has an invalid label."))?,
+            period: Period::new(&pass.period).ok_or_else(|| GatewayError::bad_request("That pass has an invalid month."))?,
         })
     }
 }
 
-fn account_token(headers: &HeaderMap) -> Result<String, GatewayError> {
+fn account_token(headers: &HeaderMap) -> Result<AccountKey, GatewayError> {
     bearer(headers)
-        .filter(|t| !t.starts_with(crate::SESSION_SECRET_PREFIX))
+        .and_then(|t| AccountKey::new(&t))
         .ok_or_else(|| {
             GatewayError::Status(
                 StatusCode::UNAUTHORIZED,
@@ -507,7 +500,7 @@ async fn pass_allowance(State(gw): Gw, headers: HeaderMap) -> Response {
             return Err(GatewayError::unavailable());
         }
         gw.backend
-            .pass_allowance(&account_token(&headers)?, &current_period())
+            .pass_allowance(&account_token(&headers)?, &this_month()?)
             .await
     };
     respond(run.await, &[])
@@ -523,18 +516,20 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
         if req.blinded.is_empty() || req.blinded.len() > 100 {
             return Err(GatewayError::bad_request("Ask for between 1 and 100 passes."));
         }
-        let label = req.label().to_string();
-        if !valid_label(&label) || req.period != current_period() {
-            return Err(GatewayError::bad_request("Ask for passes with one label, for this month."));
+        let wrong = || GatewayError::bad_request("Ask for passes with one label, for this month.");
+        let label = Label::new(req.label()).ok_or_else(wrong)?;
+        if req.period != current_period() {
+            return Err(wrong());
         }
+        let period = Period::new(&req.period).ok_or_else(wrong)?;
         let mut digest = format!("passes|{label}|{}", req.period);
         for b in &req.blinded {
             digest.push('|');
             digest.push_str(b);
         }
-        let digest = crate::sha256_hex(digest);
-        let allowance = gw.backend.pass_allowance(&token, &req.period).await?;
-        if !allowance.labels.iter().any(|l| l.label == label) && allowance.tier.as_deref() != Some(&label) {
+        let digest = Digest::of(digest);
+        let allowance = gw.backend.pass_allowance(&token, &period).await?;
+        if !allowance.labels.iter().any(|l| l.label == *label) && allowance.tier.as_deref() != Some(&*label) {
             return Err(GatewayError::Status(
                 StatusCode::FORBIDDEN,
                 "permission_error",
@@ -546,7 +541,7 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
         let kind = if req.tier.is_some() { "passes" } else { "pass" };
         let issued = issued_record(kind, req.nonce.as_deref(), &req)?;
         let count = req.blinded.len() as i64;
-        let (signer, period) = (gw.clone(), req.period.clone());
+        let signer = gw.clone();
         let sign: Sign<PassResponse> = Box::new(move || {
             let mut signatures = Vec::with_capacity(req.blinded.len());
             for b in &req.blinded {
@@ -558,7 +553,7 @@ async fn passes(State(gw): Gw, headers: HeaderMap, Json(req): Json<PassRequest>)
                     .map_err(|e| GatewayError::bad_request(format!("Cannot sign that pass: {e}")))?;
                 signatures.push(crate::b64(sig));
             }
-            Ok(PassResponse {
+            Checked::new(PassResponse {
                 label: req.label().to_string(),
                 tier: req.tier.clone(),
                 period: req.period.clone(),
@@ -584,13 +579,13 @@ async fn present_pass(State(gw): Gw, headers: HeaderMap, Json(req): Json<Present
 }
 
 /// Digest of a request's blanks, so a repeat is recognised.
-fn blanks_digest(kind: &str, blanks: &[BlindedVoucher]) -> String {
+fn blanks_digest(kind: &str, blanks: &[BlindedVoucher]) -> Digest {
     let mut text = kind.to_string();
     for b in blanks {
         text.push('|');
         text.push_str(&b.blinded_message);
     }
-    crate::sha256_hex(text)
+    Digest::of(text)
 }
 
 fn check_blank_count(blanks: &[BlindedVoucher]) -> Result<(), GatewayError> {
@@ -610,12 +605,17 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .then(|| token.trim().to_string())
 }
 
-fn session_hash(headers: &HeaderMap) -> Result<String, GatewayError> {
+fn session_hash(headers: &HeaderMap) -> Result<SecretHash, GatewayError> {
     let token = bearer(headers).ok_or_else(GatewayError::unauthorized)?;
     if !token.starts_with(crate::SESSION_SECRET_PREFIX) {
         return Err(GatewayError::unauthorized());
     }
-    Ok(crate::sha256_hex(token))
+    Ok(SecretHash::of(&token))
+}
+
+/// This month, as storage is given it.
+fn this_month() -> Result<Period, GatewayError> {
+    Period::new(&current_period()).ok_or_else(|| GatewayError::internal("the clock gave a bad month"))
 }
 
 async fn ensure_enabled(gw: &Gateway) -> Result<(), GatewayError> {
@@ -642,21 +642,20 @@ async fn keys(State(gw): Gw) -> Response {
 async fn open(State(gw): Gw, Json(req): Json<OpenSessionRequest>) -> Response {
     let run = async {
         ensure_enabled(&gw).await?;
-        if req.secret_hash.len() != 64 || !req.secret_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(GatewayError::bad_request("secret_hash must be SHA-256 hex."));
-        }
+        let secret_hash = SecretHash::from_hex(&req.secret_hash)
+            .ok_or_else(|| GatewayError::bad_request("secret_hash must be SHA-256 hex."))?;
         if req.vouchers.is_empty() {
             if let Some(label) = gw.backend.free_open_label().await {
                 let Some(code) = &req.pass else {
                     return Err(GatewayError::PassRequired(label));
                 };
                 let pass = gw.check_pass(code)?;
-                if pass.label != label {
+                if *pass.label != label {
                     return Err(GatewayError::PassRequired(label));
                 }
                 return gw
                     .backend
-                    .open_session(&req.secret_hash.to_ascii_lowercase(), Family::Paid, &[], Some(&pass))
+                    .open_session(&secret_hash, Family::Paid, &[], Some(&pass))
                     .await;
             }
         }
@@ -674,7 +673,7 @@ async fn open(State(gw): Gw, Json(req): Json<OpenSessionRequest>) -> Response {
         };
         gw.backend
             .open_session(
-                &req.secret_hash.to_ascii_lowercase(),
+                &secret_hash,
                 family,
                 &spends,
                 pass.as_ref(),
@@ -745,7 +744,7 @@ async fn exchange(State(gw): Gw, Json(req): Json<ExchangeRequest>) -> Response {
 /// opened without vouchers). A repeat open with the same secret is a retry only when this matches.
 pub fn open_digest(spends: &[Spend], pass: Option<&PassUse>) -> String {
     if let (true, Some(pass)) = (spends.is_empty(), pass) {
-        return crate::sha256_hex(format!("pass|{}", pass.hash));
+        return crate::sha256_hex(format!("pass|{}", &*pass.hash));
     }
     let mut hashes: Vec<&str> = spends.iter().map(|s| s.hash.as_str()).collect();
     hashes.sort_unstable();
@@ -757,13 +756,7 @@ pub use crate::denominations::withdrawable_amount;
 async fn withdraw(State(gw): Gw, headers: HeaderMap, Json(req): Json<WithdrawRequest>) -> Response {
     let run = async {
         ensure_enabled(&gw).await?;
-        let token = bearer(&headers).ok_or_else(|| {
-            GatewayError::Status(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "Send the account's API key.".into(),
-            )
-        })?;
+        let token = account_token(&headers)?;
         if !withdrawable_amount(req.amount_cents) {
             return Err(GatewayError::bad_request(
                 "Withdrawals are $1, $5, $20, $50 or $100, or any amount under $1.",
@@ -792,14 +785,8 @@ fn issued_record(
     request: &impl serde::Serialize,
 ) -> Result<Option<IssuedRecord>, GatewayError> {
     let Some(nonce) = nonce else { return Ok(None) };
-    if nonce.is_empty() || nonce.len() > 64 {
-        return Err(GatewayError::bad_request("Invalid nonce."));
-    }
-    Ok(Some(IssuedRecord {
-        kind,
-        nonce: nonce.to_string(),
-        request: serde_json::to_value(request).map_err(|e| GatewayError::internal(e.to_string()))?,
-    }))
+    let nonce = Nonce::new(nonce).ok_or_else(|| GatewayError::bad_request("Invalid nonce."))?;
+    IssuedRecord::new(kind, nonce, request).map(Some)
 }
 
 async fn unclaimed(State(gw): Gw) -> Response {
@@ -837,7 +824,12 @@ async fn issued_done(State(gw): Gw, headers: HeaderMap, Json(req): Json<DoneRequ
         if req.nonces.len() > 1000 {
             return Err(GatewayError::bad_request("At most 1000 at a time."));
         }
-        gw.backend.issued_done(&account_token(&headers)?, &req.nonces).await?;
+        let nonces = req
+            .nonces
+            .iter()
+            .map(|n| Nonce::new(n).ok_or_else(|| GatewayError::bad_request("Invalid nonce.")))
+            .collect::<Result<Vec<_>, _>>()?;
+        gw.backend.issued_done(&account_token(&headers)?, &nonces).await?;
         Ok(serde_json::json!({"done": req.nonces.len()}))
     };
     respond(run.await, &[])

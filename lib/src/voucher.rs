@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 
 pub const VOUCHER_MESSAGE_LEN: usize = 32;
 const PREFIX: &str = "obv1";
+/// How a voucher starts when it is sent: nothing the server stores may hold this.
+pub(crate) const SENT_PREFIX: &str = "obv1.";
 /// Dust vouchers: values in millicents, below a cent.
 const DUST_PREFIX: &str = "obd1";
+pub(crate) const SENT_DUST_PREFIX: &str = "obd1.";
 
 /// Which key family signed a voucher. Paid vouchers come from money; promo
 /// vouchers from promotional credit. They never mix: change comes back in the

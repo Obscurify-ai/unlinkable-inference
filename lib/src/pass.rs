@@ -20,6 +20,8 @@ use blind_rsa_signatures::{BlindMessage, BlindSignature, BlindingResult, Default
 use serde::{Deserialize, Serialize};
 
 const PREFIX: &str = "obp1";
+/// How a pass starts when it is sent: nothing the server stores may hold this.
+pub(crate) const SENT_PREFIX: &str = "obp1.";
 
 /// A label is 1 to 32 of `a-z`, `0-9`, `_` and `-`.
 pub fn valid_label(label: &str) -> bool {

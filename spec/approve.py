@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Record that Tony approved the rules as they stand.
+"""Record that the maintainer approved the rules as they stand.
 
-  spec/approve.py --show          what changed since the last approval (send this to Tony)
-  spec/approve.py --yes "NOTE"    record his approval; NOTE says how he gave it
+  spec/approve.py --show          what changed since the last approval (send this to the maintainer)
+  spec/approve.py --yes "NOTE"    record the approval; NOTE says how it was given
   spec/approve.py --expect DIGEST --yes "NOTE"
-                                  the same, but only if the rules are still the ones he
-                                  read (DIGEST from spec/status.py, shown with them)
+                                  the same, but only if the rules are still the ones
+                                  that were read (DIGEST from spec/status.py, shown with them)
 
-Only run --yes after Tony has said yes to the change himself. An agent's own
-judgement is never an approval: the point of the lock is that the rules are his.
+Only run --yes after the maintainer has said yes to the change. An agent's own
+judgement is never an approval: the point of the lock is that the rules are the maintainer's.
 """
 import datetime, os, subprocess, sys
 
@@ -51,7 +51,7 @@ def approve(note, expect=None):
         print("Not recorded: the rules changed since they were shown. Show them again.")
         return 3
     date = datetime.date.today().isoformat()
-    lines = [f"# Approved by Tony on {date}: {note}",
+    lines = [f"# Approved on {date}: {note}",
              "# SHA-256 of every file that states a rule or decides whether one holds."]
     lines += [f"{d}  {name}" for name, d in sorted(prints.items())]
     open(os.path.join(SPEC, "APPROVED"), "w").write("\n".join(lines) + "\n")

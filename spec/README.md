@@ -6,6 +6,7 @@ here proves it.
 | Rules | Tool | Files | What it checks |
 |---|---|---|---|
 | P1 to P4 | [ProVerif](https://bblanche.gitlabpages.inria.fr/proverif/) | `protocol/` | The protocol against a server that holds every key and sees everything, for any number of pairs of accounts, each withdrawing and chatting once. |
+| P5 | Rust's type checker | `../lib/src/server/stored.rs` | Everything the server hands storage has a type only that file can make, and it hashes or refuses secrets. |
 | M1 to M6 | [TLA+](https://lamport.azurewebsites.net/tla/tla.html) (TLC) | `ledger/` | The money rules every storage layer must keep, in every order of requests, with retries, lost answers and two devices sharing a wallet, in a small world (`Ledger.cfg`). |
 | M7 to M9 | Exhaustion | `../lib/examples/exhaustive_proofs.rs` | The Rust code that splits amounts, builds blanks and picks change, for every case in range, one by one. |
 | M10, M11 | [Kani](https://model-checking.github.io/kani/) | `../lib/src/proofs.rs` | The Rust code that rounds change and limits withdrawals, for every input in range at once. |
@@ -42,10 +43,10 @@ function it stands for. What they take as given, and where that is held:
 
 ## Changing a rule
 
-The rules are Tony's. `check.py` fails when anything in this directory or
-`lib/src/proofs.rs` differs from `APPROVED`. He reads and approves them on the
-Rules page of the Obscurify admin panel (a server started with `RULES_SPEC_DIR`
-pointing here), which calls `spec/approve.py --expect FINGERPRINT --yes ...` so
-the approval names exactly the text he saw. Otherwise send him
-`spec/approve.py --show`, and only after he says yes run
-`spec/approve.py --yes "how he said it"`.
+The rules belong to the maintainer. `check.py` fails when anything in this directory,
+`lib/src/proofs.rs`, `lib/examples/exhaustive_proofs.rs`, `lib/src/server/stored.rs` or the
+proofs workflow differs from `APPROVED`. The maintainer reads and approves them on the Rules
+page of the Obscurify admin panel (a server started with `RULES_SPEC_DIR` pointing here), which
+calls `spec/approve.py --expect FINGERPRINT --yes ...` so the approval names exactly the text
+that was shown. Otherwise send the maintainer `spec/approve.py --show`, and only after a yes run
+`spec/approve.py --yes "how it was given"`.

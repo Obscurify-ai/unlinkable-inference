@@ -1509,6 +1509,11 @@ async fn nothing_is_signed_for_a_request_that_is_refused() {
     let before = signed();
     assert_eq!(post("sk-nobody".into(), body.clone()).await.status(), 401);
     assert_eq!(signed(), before, "an unknown key");
+    // A session secret or voucher sent as the account key never gets as far as storage (P5).
+    for not_a_key in [format!("{}abc", unlinkable_inference::SESSION_SECRET_PREFIX), "obv1.100.k.AAAA.BBBB".to_string()] {
+        assert_eq!(post(not_a_key, body.clone()).await.status(), 401);
+    }
+    assert_eq!(signed(), before, "a secret as the account key");
     let first: Value = post(key.clone(), body.clone()).await.json().await.unwrap();
     assert_eq!(signed(), before + 2);
     let again: Value = post(key.clone(), body.clone()).await.json().await.unwrap();

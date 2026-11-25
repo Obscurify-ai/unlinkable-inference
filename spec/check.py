@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check every rule in spec/RULES.md, and that the rules are the ones Tony approved.
+"""Check every rule in spec/RULES.md, and that the rules are the ones the maintainer approved.
 
   spec/check.py              everything (Kani takes a while)
   spec/check.py --no-kani    everything but the Kani proofs (minutes instead of an hour)
@@ -13,7 +13,7 @@ import hashlib, json, os, subprocess, sys, time
 SPEC = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SPEC)
 sys.path.insert(0, SPEC)
-from runners import proverif, tlc, kani, exhaustive  # noqa: E402
+from runners import proverif, tlc, kani, exhaustive, types  # noqa: E402
 
 MODELS = {"p0_seed": ["P4"], "p1_payment": ["P1"], "p2_change": ["P2"], "p3_pass": ["P3"]}
 LEDGER_RULES = ["M1", "M2", "M3", "M4", "M5", "M6"]
@@ -35,7 +35,8 @@ def locked_files():
             if f == "APPROVED" or f.endswith(".pyc") or f.startswith("."):
                 continue
             out.append(os.path.relpath(os.path.join(dirpath, f), ROOT))
-    out += ["lib/src/proofs.rs", "lib/examples/exhaustive_proofs.rs", ".github/workflows/proofs.yml"]
+    out += ["lib/src/proofs.rs", "lib/examples/exhaustive_proofs.rs", "lib/src/server/stored.rs",
+            ".github/workflows/proofs.yml"]
     return sorted(out)
 
 
@@ -83,7 +84,7 @@ def approval():
     now = fingerprints()
     changed = sorted(f for f in set(now) | set(approved) if now.get(f) != approved.get(f))
     if changed:
-        return False, "changed since Tony approved them: " + ", ".join(changed)
+        return False, "changed since they were approved: " + ", ".join(changed)
     first = open(path).readline().strip("# \n")
     return True, first
 
@@ -103,6 +104,7 @@ def main(args):
         record(m, rules, *proverif(SPEC, m), "protocol")
     record("ledger", LEDGER_RULES, *tlc(SPEC), "ledger")
     record("exhaustive", EXHAUSTIVE_RULES, *exhaustive(ROOT), "rust")
+    record("types", ["P5"], *types(ROOT), "rust")
     if "--no-kani" not in args:
         for h, rules in HARNESSES.items():
             record(h, rules, *kani(ROOT, h), "rust")

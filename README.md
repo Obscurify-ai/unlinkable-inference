@@ -6,6 +6,18 @@ the prompt, and sees your IP address unless you hide it with Tor or a VPN.
 [THREAT_MODEL.md](THREAT_MODEL.md) says exactly what is and is not protected;
 [SPEC.md](SPEC.md) has the wire format.
 
+## Proved, not just tested
+
+[spec/RULES.md](spec/RULES.md) states what this library promises, in plain
+words: the server can't tell which account paid for a chat or which chats go
+together, a pass shows a label and never an account, storage only ever gets
+hashes, and no money is made or lost. Each rule is checked by a machine:
+ProVerif for the privacy rules, TLA+ for the money rules, and Kani, exhaustive
+runs and Rust's type checker on the code itself. `python3 spec/check.py` runs
+every proof again, and `spec/mutants.py` breaks the design and the code on
+purpose to show each proof catches it. The same file lists what the proofs do
+not cover. [spec/README.md](spec/README.md) says how to install the tools.
+
 How it works, in one paragraph: your device holds a wallet of blind-signed
 vouchers (Chaumian e-cash: David Chaum's blind signatures, 1982). Each conversation opens a session paid with a few of them and uses a
 random session secret instead of an API key. When the conversation goes quiet

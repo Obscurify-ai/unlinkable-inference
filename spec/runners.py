@@ -95,3 +95,24 @@ def exhaustive(root, rule=None, target_dir=None, timeout=1800):
     if code == 0 and oks:
         return "pass", "; ".join(oks)
     return "error", f"exhaustive proofs did not finish: {_last(out)}"
+
+
+# Errors that mean the type checker refused the code: a wrong type, or a private field or
+# constructor used from outside its file.
+TYPE_ERRORS = {"E0061", "E0277", "E0308", "E0423", "E0451", "E0603", "E0616", "E0624"}
+
+
+def types(root, target_dir=None, timeout=1800):
+    """P5: build the server; the types in lib/src/server/stored.rs do the rest."""
+    env = dict(os.environ)
+    if target_dir:
+        env["CARGO_TARGET_DIR"] = target_dir
+    cmd = ["cargo", "check", "-p", "unlinkable-inference", "--features", "server", "--message-format", "short"]
+    code, out = _run(cmd, root, timeout, env)
+    if code == 0:
+        return "pass", "server: everything storage is handed has a type only stored.rs can make"
+    found = set(re.findall(r"error\[(E\d+)\]", out))
+    if found and found <= TYPE_ERRORS:
+        first = next((l for l in out.splitlines() if "error[" in l), "")
+        return "fail", f"server: the type checker refused it: {first.split('error', 1)[-1].strip()}"
+    return "error", f"server: did not build for another reason: {_last(out)}"

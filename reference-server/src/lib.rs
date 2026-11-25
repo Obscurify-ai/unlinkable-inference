@@ -29,7 +29,8 @@ use unlinkable_inference::keyset::{PassKeyInfo, VoucherKeyInfo};
 use unlinkable_inference::{sha256_hex, Family};
 use unlinkable_inference::server::{
     signer::KeyStore,
-    Backend, Gateway, GatewayError, IssuedRecord, PassUse, Sign, SignChange, Signer, Spend,
+    AccountKey, Backend, Digest, Gateway, GatewayError, IssuedRecord, Label, Nonce, PassUse, Period, SecretHash, Sign,
+    SignChange, Signer, Spend,
 };
 
 /// Passes each account gets per month.
@@ -212,8 +213,8 @@ impl MemoryBackend {
     fn check_unspent(db: &Db, spends: &[Spend]) -> Result<(), GatewayError> {
         let spent: Vec<String> = spends
             .iter()
-            .filter(|s| db.spent.contains_key(&s.hash))
-            .map(|s| s.hash.clone())
+            .filter(|s| db.spent.contains_key(s.hash.as_str()))
+            .map(|s| s.hash.to_string())
             .collect();
         match spent.is_empty() {
             true => Ok(()),
@@ -225,7 +226,7 @@ impl MemoryBackend {
         Self::check_unspent(db, spends)?;
         let now = unix();
         for s in spends {
-            db.spent.insert(s.hash.clone(), now);
+            db.spent.insert(s.hash.to_string(), now);
         }
         Ok(spends.iter().map(|s| s.millicents).sum())
     }
@@ -267,7 +268,7 @@ impl MemoryBackend {
 
     /// Mark `pass` used by this session and give it what the label stands for.
     fn take_pass(db: &mut Db, secret_hash: &str, pass: &PassUse) -> Result<(), GatewayError> {
-        match db.spent_passes.get(&pass.hash) {
+        match db.spent_passes.get(pass.hash.as_str()) {
             Some((_, by)) if by == secret_hash => return Ok(()),
             Some(_) => {
                 return Err(GatewayError::Status(StatusCode::CONFLICT, "pass_spent", "That pass was used already.".into()))
@@ -275,13 +276,13 @@ impl MemoryBackend {
             None => {}
         }
         let row = db.sessions.get_mut(secret_hash).filter(|r| r.closed_at.is_none()).ok_or_else(GatewayError::unauthorized)?;
-        if !row.labels.contains(&pass.label) {
-            row.labels.push(pass.label.clone());
+        if !row.labels.iter().any(|l| *l == *pass.label) {
+            row.labels.push(pass.label.to_string());
         }
-        if pass.label == METERED {
+        if *pass.label == *METERED {
             row.metered_left += METERED_REQUESTS;
         }
-        db.spent_passes.insert(pass.hash.clone(), (unix(), secret_hash.to_string()));
+        db.spent_passes.insert(pass.hash.to_string(), (unix(), secret_hash.to_string()));
         Ok(())
     }
 
@@ -361,11 +362,12 @@ impl Backend for MemoryBackend {
 
     async fn open_session(
         &self,
-        secret_hash: &str,
+        secret_hash: &SecretHash,
         family: Family,
         spends: &[Spend],
         pass: Option<&PassUse>,
     ) -> Result<SessionStatus, GatewayError> {
+        let secret_hash = secret_hash.as_str();
         let mut db = self.db.lock().unwrap();
         let digest = unlinkable_inference::server::open_digest(spends, pass);
         if let Some(row) = db.sessions.get(secret_hash) {
@@ -377,7 +379,7 @@ impl Backend for MemoryBackend {
             }
             return Err(GatewayError::Status(StatusCode::CONFLICT, "secret_taken", "That session secret is taken; pick another.".into()));
         }
-        if pass.is_some_and(|p| db.spent_passes.contains_key(&p.hash)) {
+        if pass.is_some_and(|p| db.spent_passes.contains_key(p.hash.as_str())) {
             return Err(GatewayError::Status(StatusCode::CONFLICT, "pass_spent", "That pass was used already.".into()));
         }
         let cents = Self::spend(&mut db, spends)?;
@@ -402,7 +404,8 @@ impl Backend for MemoryBackend {
         Ok(self.status_of(&db.sessions[secret_hash]))
     }
 
-    async fn present_pass(&self, secret_hash: &str, pass: &PassUse) -> Result<SessionStatus, GatewayError> {
+    async fn present_pass(&self, secret_hash: &SecretHash, pass: &PassUse) -> Result<SessionStatus, GatewayError> {
+        let secret_hash = secret_hash.as_str();
         let mut db = self.db.lock().unwrap();
         Self::take_pass(&mut db, secret_hash, pass)?;
         let row = db.sessions.get(secret_hash).ok_or_else(GatewayError::unauthorized)?;
@@ -411,10 +414,11 @@ impl Backend for MemoryBackend {
 
     async fn topup(
         &self,
-        secret_hash: &str,
+        secret_hash: &SecretHash,
         family: Family,
         spends: &[Spend],
     ) -> Result<SessionStatus, GatewayError> {
+        let secret_hash = secret_hash.as_str();
         let mut db = self.db.lock().unwrap();
         match db.sessions.get(secret_hash) {
             Some(row) if row.closed_at.is_none() && row.family == family => {}
@@ -434,7 +438,8 @@ impl Backend for MemoryBackend {
         Ok(self.status_of(&row))
     }
 
-    async fn status(&self, secret_hash: &str) -> Result<SessionStatus, GatewayError> {
+    async fn status(&self, secret_hash: &SecretHash) -> Result<SessionStatus, GatewayError> {
+        let secret_hash = secret_hash.as_str();
         let db = self.db.lock().unwrap();
         let row = db
             .sessions
@@ -445,10 +450,12 @@ impl Backend for MemoryBackend {
 
     async fn close_session(
         &self,
-        secret_hash: &str,
-        request_digest: &str,
+        secret_hash: &SecretHash,
+        request_digest: &Digest,
         sign: SignChange,
     ) -> Result<ChangeResponse, GatewayError> {
+        let secret_hash = secret_hash.as_str();
+        let request_digest = request_digest.as_str();
         let mut db = self.db.lock().unwrap();
         let row = db
             .sessions
@@ -467,7 +474,7 @@ impl Backend for MemoryBackend {
         }
         // Rounded up to the next millicent: never more than the tokens.
         let millicents = unlinkable_inference::denominations::change_millicents(row.balance_nano);
-        let answer = sign(row.family, millicents)?;
+        let answer = sign(row.family, millicents)?.into_inner();
         db.signed_change.push((unix(), blinded_hashes(&answer)));
         let row = db.sessions.get_mut(secret_hash).expect("present");
         row.balance_nano = 0;
@@ -478,16 +485,17 @@ impl Backend for MemoryBackend {
 
     async fn exchange(
         &self,
-        request_digest: &str,
+        request_digest: &Digest,
         spends: &[Spend],
         sign: Sign<ChangeResponse>,
     ) -> Result<ChangeResponse, GatewayError> {
+        let request_digest = request_digest.as_str();
         let mut db = self.db.lock().unwrap();
         if let Some(previous) = db.answers.get(request_digest) {
             return Ok(previous.clone());
         }
         Self::check_unspent(&db, spends)?;
-        let answer = sign()?;
+        let answer = sign()?.into_inner();
         Self::spend(&mut db, spends)?;
         db.signed_change.push((unix(), blinded_hashes(&answer)));
         db.answers
@@ -497,9 +505,11 @@ impl Backend for MemoryBackend {
 
     async fn pass_allowance(
         &self,
-        account_token: &str,
-        period: &str,
+        account_token: &AccountKey,
+        period: &Period,
     ) -> Result<PassAllowance, GatewayError> {
+        let account_token = account_token.as_str();
+        let period = period.as_str();
         let db = self.db.lock().unwrap();
         let account = db
             .accounts
@@ -521,14 +531,18 @@ impl Backend for MemoryBackend {
 
     async fn record_passes(
         &self,
-        account_token: &str,
-        label: &str,
-        period: &str,
+        account_token: &AccountKey,
+        label: &Label,
+        period: &Period,
         count: i64,
-        request_digest: &str,
+        request_digest: &Digest,
         sign: Sign<PassResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<PassResponse, GatewayError> {
+        let request_digest = request_digest.as_str();
+        let account_token = account_token.as_str();
+        let period = period.as_str();
+        let label = label.as_str();
         let mut db = self.db.lock().unwrap();
         if let Some(previous) = db.pass_answers.get(request_digest) {
             return Ok(previous.clone());
@@ -548,7 +562,7 @@ impl Backend for MemoryBackend {
                 format!("{} passes left this month.", PASSES_PER_MONTH - *used),
             ));
         }
-        let mut answer = sign()?;
+        let mut answer = sign()?.into_inner();
         *used += count;
         answer.remaining = PASSES_PER_MONTH - *used;
         db.pass_answers
@@ -561,12 +575,14 @@ impl Backend for MemoryBackend {
 
     async fn withdraw(
         &self,
-        account_token: &str,
+        account_token: &AccountKey,
         cents: i64,
-        request_digest: &str,
+        request_digest: &Digest,
         sign: Sign<ChangeResponse>,
         issued: Option<&IssuedRecord>,
     ) -> Result<ChangeResponse, GatewayError> {
+        let request_digest = request_digest.as_str();
+        let account_token = account_token.as_str();
         let mut db = self.db.lock().unwrap();
         if let Some(previous) = db.answers.get(request_digest) {
             return Ok(previous.clone());
@@ -585,7 +601,7 @@ impl Backend for MemoryBackend {
                 account.balance_cents,
             ));
         }
-        let answer = sign()?;
+        let answer = sign()?.into_inner();
         account.balance_cents -= cents;
         db.withdrawals.push(WithdrawalRow {
             account: key.clone(),
@@ -614,7 +630,8 @@ impl Backend for MemoryBackend {
         Ok(list)
     }
 
-    async fn session_done(&self, secret_hash: &str) -> Result<(), GatewayError> {
+    async fn session_done(&self, secret_hash: &SecretHash) -> Result<(), GatewayError> {
+        let secret_hash = secret_hash.as_str();
         let mut db = self.db.lock().unwrap();
         if db.sessions.get(secret_hash).is_some_and(|s| s.closed_at.is_some()) {
             db.sessions.remove(secret_hash);
@@ -622,7 +639,8 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
-    async fn issued(&self, account_token: &str) -> Result<Vec<Issued>, GatewayError> {
+    async fn issued(&self, account_token: &AccountKey) -> Result<Vec<Issued>, GatewayError> {
+        let account_token = account_token.as_str();
         let key = sha256_hex(account_token);
         let db = self.db.lock().unwrap();
         if !db.accounts.contains_key(&key) {
@@ -631,13 +649,14 @@ impl Backend for MemoryBackend {
         Ok(db.issued.iter().filter(|(a, _)| *a == key).map(|(_, i)| i.clone()).collect())
     }
 
-    async fn issued_done(&self, account_token: &str, nonces: &[String]) -> Result<(), GatewayError> {
+    async fn issued_done(&self, account_token: &AccountKey, nonces: &[Nonce]) -> Result<(), GatewayError> {
+        let account_token = account_token.as_str();
         let key = sha256_hex(account_token);
         self.db
             .lock()
             .unwrap()
             .issued
-            .retain(|(a, i)| !(*a == key && nonces.contains(&i.nonce)));
+            .retain(|(a, i)| !(*a == key && nonces.iter().any(|n| n.as_str() == i.nonce)));
         Ok(())
     }
 
@@ -656,10 +675,10 @@ impl Backend for MemoryBackend {
 
 fn issued_row(i: &IssuedRecord, answer: &impl Serialize) -> Issued {
     Issued {
-        kind: i.kind.to_string(),
-        nonce: i.nonce.clone(),
+        kind: i.kind().to_string(),
+        nonce: i.nonce().to_string(),
         created: unix(),
-        request: i.request.clone(),
+        request: i.request().clone(),
         answer: serde_json::to_value(answer).expect("answer serialises"),
     }
 }
