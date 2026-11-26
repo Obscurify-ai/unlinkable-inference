@@ -39,16 +39,17 @@ jobs:
         id: mutants
         continue-on-error: true
         run: python3 spec/mutants.py
-      # The Rules page of the Obscurify admin panel reads this (spec/status.py).
+      # The Rules page of the Obscurify admin panel reads this (spec/status.py). Written
+      # outside the checkout: a new file in it would mark the results above out of date.
       - name: Results for the admin page
         if: always() && github.ref == 'refs/heads/main'
         run: |
-          mkdir -p site
-          python3 spec/status.py > site/status.json
+          mkdir -p "$RUNNER_TEMP/site"
+          python3 spec/status.py > "$RUNNER_TEMP/site/status.json"
       - if: always() && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v4
         with:
-          path: site
+          path: ${{ runner.temp }}/site
       - name: Pass only if every proof and break did, and the rules are approved
         if: steps.check.outcome == 'failure' || steps.mutants.outcome == 'failure'
         run: exit 1
