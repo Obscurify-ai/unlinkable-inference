@@ -16,6 +16,7 @@ spec/check.py              # everything: approval, models, Rust proofs
 spec/check.py --no-kani    # models only, a minute
 spec/mutants.py            # break things on purpose; every break must be caught
 spec/status.py             # the rules, approval and last results as JSON (for the admin page)
+spec/approval_relay.py URL # record the approval the admin page gives, if it names these rules
 ```
 
 `check.py` and `mutants.py` save their results in `target/spec-status/`, stamped
@@ -45,8 +46,20 @@ function it stands for. What they take as given, and where that is held:
 
 The rules belong to the maintainer. `check.py` fails when anything in this directory,
 `lib/src/proofs.rs`, `lib/examples/exhaustive_proofs.rs`, `lib/src/server/stored.rs` or the
-proofs workflow differs from `APPROVED`. The maintainer reads and approves them on the Rules
-page of the Obscurify admin panel (a server started with `RULES_SPEC_DIR` pointing here), which
-calls `spec/approve.py --expect FINGERPRINT --yes ...` so the approval names exactly the text
-that was shown. Otherwise send the maintainer `spec/approve.py --show`, and only after a yes run
-`spec/approve.py --yes "how it was given"`.
+proofs and approval workflows differs from `APPROVED`.
+
+The maintainer reads and approves them on the Rules page of the Obscurify admin panel:
+
+1. On every push to `main`, the proofs workflow runs every proof and every break, and
+   publishes `status.py`'s output (the rules word for word, their fingerprint, the approval
+   and the results) to GitHub Pages. The admin page shows that.
+2. Approve records the fingerprint that was on screen, and only if it is still the one
+   published. `https://obscurify.ai/rules/approval.json` then answers that fingerprint and
+   nothing else.
+3. The approval workflow (every 15 minutes, or run by hand) reads it with
+   `approval_relay.py`, which records it with `approve.py --expect` only if it is the
+   fingerprint of the rules on `main`, commits `APPROVED` and runs the proofs again.
+
+So the server holds no key to this repo, and an approval can only name the text it was
+given for. Without the page, send the maintainer `spec/approve.py --show`, and only after a
+yes run `spec/approve.py --yes "how it was given"`.

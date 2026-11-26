@@ -2,8 +2,14 @@ name: proofs
 on:
   push:
   pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: proofs-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  models:
+  proofs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -22,14 +28,38 @@ jobs:
           echo "$HOME/.opam/default/bin" >> "$GITHUB_PATH"
           curl -sSL -o "$HOME/tla2tools.jar" https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
           echo "TLA_JAR=$HOME/tla2tools.jar" >> "$GITHUB_ENV"
-      - name: Models, approval and every break caught
+          cargo install --locked kani-verifier
+          cargo kani setup
+      # Both run to the end even when something fails, so the results below are complete.
+      - name: Every proof, and the approval
+        id: check
+        continue-on-error: true
+        run: python3 spec/check.py
+      - name: Every break caught
+        id: mutants
+        continue-on-error: true
+        run: python3 spec/mutants.py
+      # The Rules page of the Obscurify admin panel reads this (spec/status.py).
+      - name: Results for the admin page
+        if: always() && github.ref == 'refs/heads/main'
         run: |
-          python3 spec/check.py --no-kani
-          python3 spec/mutants.py --no-kani
-  rust:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: model-checking/kani-github-action@v1
+          mkdir -p site
+          python3 spec/status.py > site/status.json
+      - if: always() && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v4
         with:
-          args: -p unlinkable-inference --no-default-features
+          path: site
+      - name: Pass only if every proof and break did, and the rules are approved
+        if: steps.check.outcome == 'failure' || steps.mutants.outcome == 'failure'
+        run: exit 1
+  publish:
+    needs: proofs
+    if: always() && github.ref == 'refs/heads/main' && needs.proofs.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/deploy-pages@v4

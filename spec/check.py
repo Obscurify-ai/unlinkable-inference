@@ -36,7 +36,7 @@ def locked_files():
                 continue
             out.append(os.path.relpath(os.path.join(dirpath, f), ROOT))
     out += ["lib/src/proofs.rs", "lib/examples/exhaustive_proofs.rs", "lib/src/server/stored.rs",
-            ".github/workflows/proofs.yml"]
+            ".github/workflows/proofs.yml", ".github/workflows/approval.yml"]
     return sorted(out)
 
 

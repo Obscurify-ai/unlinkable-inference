@@ -1,0 +1,33 @@
+name: approval
+# The maintainer approves the rules on the Rules page of the Obscurify admin panel, which
+# publishes only the fingerprint approved. This records it in spec/APPROVED, and only if
+# it is the fingerprint of the rules on main (spec/approval_relay.py).
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: approval
+jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Record an approval given on the admin page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out=$(python3 spec/approval_relay.py https://obscurify.ai/rules/approval.json | tail -1)
+          echo "$out"
+          [ "$out" = recorded ] || exit 0
+          git -c user.name=Obscurify -c user.email=contact@obscurify.ai commit -qm "Rules approved by the maintainer" spec/APPROVED
+          git push origin HEAD:main
+          # A push made with this token starts no workflow, so ask for the proofs (and the
+          # page's results) again.
+          gh workflow run proofs.yml --ref main

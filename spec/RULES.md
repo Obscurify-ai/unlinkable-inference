@@ -139,7 +139,8 @@ counts as caught when the tool ran and found it.
 
 `APPROVED` holds the fingerprint of this file and of everything that states
 or checks a rule. `check.py` fails if any of them changed since they were
-approved. A change goes to the maintainer in plain words; once they say yes,
-`approve.py` records it. This is a tripwire, not a lock: any agent on the
-machine could rerun `approve.py`. What it guarantees is that a changed rule
-can't pass quietly.
+approved. A change goes to the maintainer in plain words, on the Rules page
+of the Obscurify admin panel; once they approve it there, a workflow records
+it with `approve.py` (see `spec/README.md`). This is a tripwire, not a lock:
+anyone who can push to this repo could rerun `approve.py`. What it guarantees
+is that a changed rule can't pass quietly.
