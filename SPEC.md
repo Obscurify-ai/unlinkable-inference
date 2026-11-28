@@ -165,9 +165,12 @@ as SHA-256(message).
 **Getting them.** `GET /u/passes` (account API key) lists the labels the
 account can get this month and how many of each are left. `POST /u/passes`
 asks for some with one label; the server signs them if the account gets that
-label (403 otherwise, 429 `pass_limit` past the month's allowance). It learns
-how many passes of each label an account took, never which sessions used
-them. A repeat request with the same blinded messages gets the same answer.
+label (403 otherwise). A label that stands for access (a group of models the
+account's plan opens) should have no monthly count: an account that has the
+access never runs out of it, and `remaining` is then just a large number. A
+label that stands for an allowance (free tokens) may be counted; past it, 429
+`pass_limit`. The server learns at most how many passes of a label an account
+took, never which sessions used them. A repeat request with the same blinded messages gets the same answer.
 Clients keep a small stock of each label and refill it in the background, so
 the moment an account asks says nothing about any one conversation.
 
@@ -199,7 +202,7 @@ in `GET /u/passes` for them; their records in `GET /u/issued` keep the kind
 
 Addresses are shared (VPNs, Tor, mobile networks), so a limit per address stops people who did
 nothing. What these endpoints hand out is limited by itself: withdrawals by the account's
-balance, passes by its monthly allowance, sessions by the vouchers or pass they spend. The server
+balance, passes by the labels the account gets (and an allowance label by its count), sessions by the vouchers or pass they spend. The server
 module signs only after everything else about a request is in order, so refused requests cost
 little. Against floods, Obscurify counts requests per address only while one endpoint gets far
 more than its normal traffic from everyone together (in memory, nothing stored).
